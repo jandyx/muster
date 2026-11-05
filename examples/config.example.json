@@ -1,0 +1,31 @@
+{
+  "runsDir": "~/.muster/runs",
+  "workers": {
+    "codex": {
+      "type": "codex",
+      "codexHome": "~/.codex"
+    },
+    "codex-work": {
+      "type": "codex",
+      "codexHome": "~/.codex-homes/work",
+      "args": ["-m", "gpt-6-astra"]
+    },
+    "deepseek": {
+      "type": "claude",
+      "command": "~/.local/bin/deepseek-claude",
+      "args": ["--dangerously-skip-permissions"],
+      "billing": "metered"
+    }
+  },
+  "routing": [
+    { "match": "~/workspace/work-*", "workers": ["codex-work", "codex", "deepseek"] },
+    { "match": "*", "workers": ["codex", "deepseek"] }
+  ],
+  "only": {
+    "codex-work": ["~/workspace/work-*"]
+  },
+  "caps": { "codex": 3, "claude": 5 },
+  "preamble": [
+    "Never print secrets or tokens in your output."
+  ]
+}

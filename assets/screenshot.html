@@ -1,0 +1,97 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap">
+<style>
+  :root {
+    --bg: #1f2023; --win: #1f2023; --fg: #d4d4d4; --dim: #8a8f98; --line: #3a3d44;
+    --green: #4ec9a0; --yellow: #e0c46c; --red: #f7768e; --cyan: #56c8e8;
+    --w1: #b48ef0; --w2: #9fb4ff; --w3: #3ba6a0; --usd-sub: #8c9cff; --usd-bill: #4ec9a0; --accent: #e8a23c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: transparent; font-family: "JetBrains Mono", Menlo, monospace; font-size: 14px; line-height: 1.6; color: var(--fg); }
+  .frame { width: 1800px; padding: 28px; }
+  .win { background: var(--win); border-radius: 10px; overflow: hidden; box-shadow: 0 30px 80px rgba(0,0,0,.45), 0 0 0 1px rgba(255,255,255,.06); }
+  .bar { height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 16px; background: #1f2030; border-bottom: 1px solid var(--line); }
+  .dot { width: 12px; height: 12px; border-radius: 50%; }
+  .title { flex: 1; text-align: center; color: var(--dim); font-size: 13px; margin-right: 60px; }
+  .body { display: grid; grid-template-columns: 1fr 620px; height: 740px; }
+  .left { padding: 20px 26px; display: flex; flex-direction: column; border-right: 1px solid var(--line); }
+  .right { padding: 14px 20px; background: var(--win); overflow: hidden; }
+  .grow { flex: 1; }
+  .dim { color: var(--dim); } .b { font-weight: 700; } .g { color: var(--green); } .y { color: var(--yellow); }
+  .r { color: var(--red); } .c { color: var(--cyan); } .w1 { color: var(--w1); font-weight: 700; } .w2 { color: var(--w2); font-weight: 700; }
+  .w3 { color: var(--w3); font-weight: 700; } .sub { color: var(--usd-sub); font-weight: 700; } .bill { color: var(--usd-bill); font-weight: 700; }
+  .you { background: #2c2e33; padding: 6px 10px; border-radius: 4px; margin: 4px 0 14px; }
+  .bullet { color: var(--fg); }
+  pre { margin: 0; font: inherit; white-space: pre; }
+  table { border-collapse: collapse; margin: 6px 0 12px; }
+  td, th { border: 1px solid var(--line); padding: 2px 10px; text-align: left; font-weight: 400; }
+  th { color: var(--dim); }
+  .prompt { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 8px 2px; margin: 6px 0; }
+  .cursor { display: inline-block; width: 9px; height: 18px; background: var(--fg); vertical-align: -3px; }
+  .status { color: var(--dim); font-size: 13.5px; }
+  .tag { color: #7aa2f7; }
+.foot { padding: 0 26px 14px; border-top: 1px solid var(--line); }
+  .foot .prompt { border-top: 0; }
+  .ctx { display: inline-block; width: 120px; height: 12px; background: repeating-linear-gradient(90deg,#3a3d44 0 2px,transparent 2px 4px); vertical-align: -1px; }
+  .ctx i { display: block; width: 31%; height: 100%; background: #22c55e; }
+  .left .you, .left table { font-size: 13.5px; }
+</style></head>
+<body><div class="frame"><div class="win">
+  <div class="body">
+    <div class="left">
+      <div class="you">&gt; muster: profile the slowest tests, audit the serial test group, and draft a test tiering plan</div>
+      <div><span class="bullet">●</span> Split into 4 tasks. Two write to the repo, so each gets its own worktree.</div>
+      <table>
+        <tr><th>id</th><th>worker</th><th>cwd</th><th>goal</th></tr>
+        <tr><td>A</td><td><span class="w1">codex-work</span></td><td>acme-api-tt-A</td><td>Test registry, tags and runner</td></tr>
+        <tr><td>B</td><td><span class="w2">codex</span></td><td>acme-api</td><td>Profile the 20 slowest tests</td></tr>
+        <tr><td>C</td><td><span class="w3">deepseek</span></td><td>acme-api</td><td>Audit the serial test group</td></tr>
+        <tr><td>D</td><td><span class="w2">codex</span></td><td>acme-api-tt-D</td><td>test-plan and test-affected</td></tr>
+      </table>
+      <div><span class="bullet">●</span> Launched in the background. <span class="dim">C runs on a metered model off-peak.</span></div>
+      <div style="margin-top:14px"><span class="g">●</span> <span class="dim">Background task finished:</span> B · codex · done</div>
+      <div><span class="bullet">●</span> B's profile checks out against the timing log: 3 suites take 71% of the run.</div>
+      <div class="dim" style="margin-left:18px">Waiting on A, C, D. Open <span class="c">/muster</span> to follow them.</div>
+      <div class="grow"></div>
+      <pre><span class="c b">⇉ muster </span><span class="y">… Test registry, tags and runner</span> <span class="w1">codex-work</span><span class="dim"> 7m58s  </span><span class="y">… Audit the serial test group</span> <span class="w3">deepseek</span><span class="dim"> 4m12s  </span><span class="g">✓1 </span><span class="dim">· /muster</span></pre>
+    </div>
+    <div class="right"><pre><span class="dim">e: Expand all  c: Collapse all</span>
+<span class="dim">↑↓ scroll · Enter on a run folds it</span>
+
+▾ 20261105-1635-test-tiering <span class="dim">3 running · 1 done · 0 failed</span>
+<span class="dim">  Σ </span><span class="b">4.12M</span><span class="dim"> tokens · </span><span class="bill">$0.06</span><span class="dim"> billed · </span><span class="sub">≈$5.48</span><span class="dim"> sub</span>
+<span class="dim">    </span><span class="w2">codex</span><span class="dim">: </span><span class="b">2.30M</span><span class="dim"> tokens · </span><span class="sub">≈$3.41</span><span class="dim"> sub</span>
+<span class="dim">    </span><span class="w1">codex-work</span><span class="dim">: </span><span class="b">1.40M</span><span class="dim"> tokens · </span><span class="sub">≈$2.07</span><span class="dim"> sub</span>
+<span class="dim">    </span><span class="w3">deepseek</span><span class="dim">: </span><span class="b">0.42M</span><span class="dim"> tokens · </span><span class="bill">$0.06</span><span class="dim"> billed</span>
+
+<span class="y">  … Test registry, tags and runner</span>
+<span class="dim">    A · </span><span class="w1">codex-work</span><span class="dim"> · running · 7m58s · ⎇ muster/tt-A</span>
+    <span class="y">↻</span> Registry and tag checks pass; wiring the runner flag…
+<span class="dim">    $ npm test -- --tier=unit tests/registry</span>
+
+<span class="g">  ✓ Profile the 20 slowest tests</span>
+<span class="dim">    B · </span><span class="w2">codex</span><span class="dim"> · done · 6m21s · ⎇ main</span>
+<span class="dim">    in </span><span class="b">2.30M</span><span class="dim"> (96% cached) · out </span><span class="b">14k</span><span class="dim"> · </span><span class="sub">≈$3.41</span>
+<span class="dim">    ↳ 3 suites take 71% of wall time; report.md</span>
+
+<span class="y">  … Audit the serial test group</span>
+<span class="dim">    C · </span><span class="w3">deepseek</span><span class="dim"> · running · 4m12s · ⎇ main</span>
+    <span class="y">↻</span> 9 of 31 serial tests share only a temp dir…
+<span class="dim">    $ Grep "serial: true" in tests/</span>
+
+<span class="y">  … test-plan and test-affected</span>
+<span class="dim">    D · </span><span class="w2">codex</span><span class="dim"> · running · 5m40s · ⎇ muster/tt-D</span>
+    <span class="y">↻</span> Waiting for the shared test lock held by A…
+<span class="r">    no output for 2m31s</span>
+
+▸ 20261104-2210-flaky-retries <span class="dim">0 running · 3 done · 0 failed</span>
+<span class="dim">  Σ </span><span class="b">5.61M</span><span class="dim"> tokens · </span><span class="bill">$0.09</span><span class="dim"> billed · </span><span class="sub">≈$6.02</span><span class="dim"> sub</span>
+</pre></div>
+  </div>
+  <div class="foot">
+    <div class="prompt">&gt; <span class="cursor"></span></div>
+    <div class="status"><span style="color:#56c8e8">[Opus 5.5]</span> <span class="ctx"><i></i></span> <span class="g">31%</span> │ <span class="y">acme-api</span> <span class="tag">git:(main)</span> │ 1 CLAUDE.md │ 4 MCPs │ ⏱ 42m</div>
+    <div class="status"><span class="g">✓</span> Bash ×9 │ <span class="g">✓</span> Read ×4</div>
+  </div>
+</div></div></body></html>

@@ -1,0 +1,54 @@
+{
+  "_note": "USD per 1M tokens, checked 2026-11-05 against developers.openai.com/api/docs/pricing (Standard tier) and api-docs.deepseek.com/quick_start/pricing. Prices change: override any entry in ~/.muster/prices.json.",
+  "gpt-6-astra": {
+    "input": 10.0,
+    "cached": 1.0,
+    "output": 50.0,
+    "long_context_over": 272000,
+    "long": {
+      "input": 20.0,
+      "cached": 2.0,
+      "output": 75.0
+    }
+  },
+  "deepseek-flash": {
+    "input": 0.15,
+    "cached": 0.003,
+    "output": 0.6,
+    "peak": {
+      "input": 0.3,
+      "cached": 0.006,
+      "output": 1.2
+    },
+    "peak_utc_weekdays": [
+      [
+        1,
+        4
+      ],
+      [
+        6,
+        10
+      ]
+    ]
+  },
+  "deepseek-v4-pro": {
+    "input": 0.66,
+    "cached": 0.022,
+    "output": 1.98,
+    "peak": {
+      "input": 1.32,
+      "cached": 0.044,
+      "output": 3.96
+    },
+    "peak_utc_weekdays": [
+      [
+        1,
+        4
+      ],
+      [
+        6,
+        10
+      ]
+    ]
+  }
+}

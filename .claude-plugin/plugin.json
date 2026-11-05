@@ -1,0 +1,11 @@
+{
+  "name": "muster",
+  "version": "0.1.0",
+  "description": "Fan work out from Claude Code to Codex and other CLI agents in parallel, and watch each task's progress, tokens and cost in a live pane.",
+  "author": {
+    "name": "jandyx"
+  },
+  "license": "MIT",
+  "types": "./types/index.d.ts",
+  "icon": "./assets/icon.png"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "muster",
+  "description": "Muster: fan work out from Claude Code to Codex and other CLI agents, with a live progress, token and cost pane.",
+  "owner": {
+    "name": "jandyx"
+  },
+  "plugins": [
+    {
+      "name": "muster",
+      "source": "./"
+    }
+  ]
+}
