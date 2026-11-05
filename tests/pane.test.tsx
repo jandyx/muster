@@ -1,4 +1,4 @@
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
 const R = '/h/.muster/runs'
 const files: Record<string, string> = {
@@ -136,7 +136,7 @@ const mountWith = async (
   $: any,
   on: any,
   tree: Record<string, string>,
-  opts: { config?: string; session?: string } = {},
+  opts: { config?: string; session?: string; clock?: boolean } = {},
 ) => {
   const dirs = new Map<string, Set<string>>()
   for (const path of Object.keys(tree)) {
@@ -161,8 +161,10 @@ const mountWith = async (
         ? { value: tree[e.path] }
         : { deny: 'ENOENT' },
   )
-  on('clock.every', () => ({ value: undefined }))
-  on('clock.now', () => ({ value: new Date('2026-11-05T11:32:00').getTime() }))
+  if (!opts.clock) {
+    on('clock.every', () => ({ value: undefined }))
+    on('clock.now', () => ({ value: new Date('2026-11-05T11:32:00').getTime() }))
+  }
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
   on('session.id', () => ({ value: opts.session ?? 'S1' }))
@@ -241,6 +243,21 @@ test('another session cannot see this one\'s runs', async ($, on) => {
   await mountWith($, on, tree('/h/.muster/runs', { '20261105-0900-mine': { A: task('done') } }), { session: 'OTHER' })
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /No Muster runs yet/ }))?.text).toBe('No Muster runs yet.')
+  await ui.unmount()
+})
+
+test('a run whose meta is not written yet shows once it is', async ($, on) => {
+  const clock = mock.clock(on, { now: new Date('2026-11-05T11:32:00').getTime() })
+  const t = tree('/h/.muster/runs', { '20261105-1000-new': { A: { ...task('running', 'pid=0\n'), title: 'fresh work' } } })
+  const meta = t['/h/.muster/runs/20261105-1000-new/A/meta']!
+  delete t['/h/.muster/runs/20261105-1000-new/A/meta'] // the runner makes the dir first, meta a moment later
+  await mountWith($, on, t, { clock: true })
+  await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /No Muster runs yet/ })).toBeDefined()
+  t['/h/.muster/runs/20261105-1000-new/A/meta'] = meta
+  await clock.advance(5000)
+  expect((await ui.find({ type: 'Button', text: /new/ }))?.text).toMatch(/20261105-1000-new/)
   await ui.unmount()
 })
 

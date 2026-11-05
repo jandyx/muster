@@ -249,10 +249,15 @@ export const register: Register = on => {
       const cached = ownerOf.get(name)
       if (cached !== undefined) return cached
       const dirs = (await $.fs.list(`${root}/${name}`).catch(() => [])).filter(d => d.kind === 'dir').map(d => d.name).sort()
-      const meta = dirs[0] ? await readText(`${root}/${name}/${dirs[0]}/meta`) : ''
-      const owner = /^session=(.*)$/m.exec(meta)?.[1] ?? ''
-      if (owner !== '' || dirs.length > 0) ownerOf.set(name, owner)
-      return owner
+      // The runner makes a task dir before it writes meta; cache only once a meta has been read.
+      for (const dir of dirs) {
+        const meta = await readText(`${root}/${name}/${dir}/meta`)
+        if (!meta) continue
+        const owner = /^session=(.*)$/m.exec(meta)?.[1] ?? ''
+        ownerOf.set(name, owner)
+        return owner
+      }
+      return ''
     }
     // The pane keeps every run of this session, newest first, up to KEEP.
     const KEEP = 30
