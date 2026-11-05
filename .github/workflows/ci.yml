@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runner:
+    name: runner (python ${{ matrix.python }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Unit tests
+        run: python -W error::ResourceWarning -m unittest discover -s tests -v
+
+  plugin:
+    name: plugin (validate + pane tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+      - name: Validate plugin
+        run: claude plugin validate .
+      - name: Pane and band tests
+        run: claude plugin test .
+
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: English only
+        run: |
+          if grep -rnP '[\x{4e00}-\x{9fff}\x{3000}-\x{303f}\x{ff00}-\x{ffef}]' --exclude-dir=.git --exclude='*.png' .; then
+            echo "::error::CJK text found; this repository is English only (see AGENTS.md)"; exit 1
+          fi
+      - name: JSON files parse
+        run: for f in prices.json examples/*.json .claude-plugin/*.json hooks/hooks.json; do python3 -m json.tool "$f" > /dev/null || exit 1; done
