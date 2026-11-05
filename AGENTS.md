@@ -10,7 +10,7 @@ A Claude Code plugin with three parts:
 |---|---|---|
 | `muster` skill (the dispatch loop Claude follows) | `skills/muster/SKILL.md` | Markdown |
 | `muster-setup` skill (writes the user's config) | `skills/muster-setup/SKILL.md` | Markdown |
-| Runner: run a task, enforce `only` / `caps`, price usage, `detect`, `doctor` | `skills/muster/muster.py` | Python 3.9+, standard library only |
+| Runner: run a task, enforce `only` / `caps`, price usage, `detect`, `doctor` | `skills/muster/muster.py` | Python 3.10+, standard library only |
 | Pane and band (Claude Code mod) | `hooks/register.tsx`, `types/index.d.ts` | TypeScript, Claude Code hooks API |
 | Prices | `prices.json` | JSON, USD per 1M tokens |
 
