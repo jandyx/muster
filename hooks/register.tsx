@@ -106,7 +106,7 @@ export const register: Register = on => {
   const opened = new Set<string>()
 
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'muster', description: 'Show Muster worker tasks in a pane' })
+    await $.command.register({ name: 'muster-panel', description: 'Open the Muster pane' })
     const home = (await $.env.get('HOME')) ?? ''
     // runsDir comes from ~/.muster/config.json (MUSTER_CONFIG overrides the path); default ~/.muster/runs.
     const expand = (p: string) => p.replace(/^~(?=\/|$)/, home)
@@ -150,9 +150,9 @@ export const register: Register = on => {
           } catch {
             usage = null
           }
-          // Title: the prompt's first heading, minus a leading "任务：" / "Task:".
+          // Title: the prompt's first heading, minus a leading "Task:" label (full-width colon too).
           const heading = prompt.split('\n').find(l => /^#\s/.test(l)) ?? ''
-          const title = heading.replace(/^#+\s*/, '').replace(/^(任务|Task)\s*[:：]\s*/i, '').replace(/`/g, '').trim()
+          const title = heading.replace(/^#+\s*/, '').replace(/^Task\s*[:\uFF1A]\s*/i, '').replace(/`/g, '').trim()
           const kv = Object.fromEntries(
             meta.split('\n').filter(l => l.includes('=')).map(l => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]),
           )
@@ -164,7 +164,14 @@ export const register: Register = on => {
             .replace(/\s+/g, ' ')
             .trim()
           const branch = await readBranch(kv.cwd)
-          const isLive = status.trim() === 'running'
+          // A runner that died without writing its final status (killed, crashed, machine slept) leaves `running`
+          // behind; muster.py records its pid, so a dead pid means the task is lost, not running.
+          const pid = Number(kv.pid ?? 0)
+          const isOrphan =
+            status.trim() === 'running' &&
+            pid > 0 &&
+            (await $.process.run(['kill', '-0', String(pid)], { timeoutMs: 2000 }).then(r => r.exitCode !== 0, () => false))
+          const isLive = status.trim() === 'running' && !isOrphan
           // shortcut: reads the whole log each poll while running; switch to a tail read if logs grow past a few MB.
           // meta's `type` is the worker kind muster.py ran: claude writes stream.jsonl, codex a plain log.
           const isStream = kv.type === 'claude'
@@ -181,7 +188,7 @@ export const register: Register = on => {
             session: kv.session ?? '',
             title: title.slice(0, 60) || id,
             worker: kv.worker ?? '?',
-            status: status.trim() || 'pending',
+            status: isOrphan ? 'failed: lost (runner exited without a final status)' : status.trim() || 'pending',
             startedMs: parseTime(kv.started),
             finishedMs: parseTime(kv.finished),
             summary: tidy.slice(0, 120),
@@ -254,7 +261,14 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'muster' }, async $ => {
+  // Starting a batch ("/muster …", "muster: …") opens the pane too. Opened from the person's own prompt,
+  // it is placed at any terminal width; without focus, so typing goes on in the prompt.
+  on('prompt.submit', async ($, e, next) => {
+    if (/^\s*(\/muster(:muster)?\b|muster\s*:)/i.test(e.text ?? '')) void $.ui.open({ id: PANE, title: TITLE })
+    return next(e)
+  })
+
+  on('command.run', { command: 'muster-panel' }, async $ => {
     // The command hands the pane the keyboard: ↑↓ scroll, Enter folds, Esc back to the prompt.
     await $.ui.open({ id: PANE, title: TITLE, focus: true })
     return { text: 'Muster pane opened and focused (Esc returns to the prompt).' }
@@ -384,7 +398,7 @@ export const register: Register = on => {
             </Text>
           )
         })}
-        <Text dimColor>· /muster</Text>
+        <Text dimColor>· /muster-panel</Text>
       </Box>
     )
   })

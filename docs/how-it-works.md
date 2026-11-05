@@ -15,7 +15,7 @@ flowchart LR
     runner -- "claude -p<br/>stream-json" --> ds[Claude-compatible worker<br/>e.g. DeepSeek]
     cx1 & cx2 & ds --> runs[("runs/&lt;run&gt;/&lt;task&gt;/<br/>prompt · status · meta<br/>log · result · usage")]
     prices[(prices.json)] -.-> runner
-    runs --> pane["/muster pane<br/>+ band above prompt"]
+    runs --> pane["Muster pane (/muster-panel)<br/>+ band above prompt"]
     pane --> you
 ```
 

@@ -1,6 +1,6 @@
 ---
 name: muster
-description: Fan work out from Claude Code to external CLI workers (Codex accounts, Claude Code on other backends such as DeepSeek) in parallel while Claude plans, verifies and reports. Workers, routing and caps come from ~/.muster/config.json. Use when the user says muster, dispatch, fan out, run these in parallel, hand this to codex / to the workers, 派活, 并行做, or hands over a multi-part task meant for sub-agents.
+description: Run tasks in parallel on Codex and other CLI workers, then verify and report. Use for muster, dispatch, fan out, run in parallel.
 ---
 
 # Muster
@@ -11,7 +11,7 @@ The runner is `muster.py` in this skill's base directory (the folder this file i
 
 ## Workers and routing come from the config
 
-Read `~/.muster/config.json` (or the path in `MUSTER_CONFIG`) at the start of every run. `python3 $MUSTER workers` lists the workers. If there is no config, tell the user and point them to `examples/config.example.json` in the plugin; do not guess workers.
+Read `~/.muster/config.json` (or the path in `MUSTER_CONFIG`) at the start of every run. `python3 $MUSTER workers` lists the workers. If there is no config, or `python3 $MUSTER doctor` reports problems, run the `muster-setup` skill first; do not guess workers.
 
 - `workers.<name>.type`: `codex` (runs `codex exec` with that worker's `codexHome`) or `claude` (runs a Claude Code compatible command with `-p`).
 - `routing`: a list of `{ match, workers }`. The first `match` glob (`~` allowed) that fits the task's cwd gives the worker priority, first choice first. `*` is the fallback.
@@ -44,7 +44,7 @@ Metered workers on a peak-priced model (see `prices.json`, e.g. DeepSeek: weekda
 4. **Launch.** For each task, call Bash with `run_in_background: true`:
    `python3 $MUSTER run <worker> <task-dir> <cwd>`
    Launch all independent tasks in the same message. The runner writes `status` (running / done / failed: …), `meta`, `log.txt` (codex) or `stream.jsonl` (claude), `result.md` and `usage`.
-5. **Wait.** Background tasks notify on exit, so do not poll. If the user asks in the meantime, read each `status` and report; the `/muster` pane shows live progress.
+5. **Wait.** Background tasks notify on exit, so do not poll. If the user asks in the meantime, read each `status` and report; the Muster pane (`/muster-panel`) shows live progress.
 6. **Verify.** Read each `result.md`, then check the work yourself: the diff (`git -C <cwd> diff`), the build or tests the task names. A worker's claim is not evidence. Failed or wrong: write a follow-up prompt with the concrete problem and rerun on the same or another worker.
 7. **Report** in the format below. Merging worktrees, committing and pushing happen only when the user asks; once a `muster/*` branch is merged, offer to remove its worktree.
 

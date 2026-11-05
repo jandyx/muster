@@ -4,6 +4,8 @@
     muster.py run <worker> <task-dir> <cwd>   run prompt.md, write status/meta/log/result/usage
     muster.py usage <task-dir>                (re)compute <task-dir>/usage for a finished task
     muster.py workers                         list configured workers
+    muster.py detect                          JSON: Codex homes and claude-like CLIs found on this machine
+    muster.py doctor                          check the config; exit 1 when something is wrong
 
 Config: ~/.muster/config.json (MUSTER_CONFIG overrides). Prices: prices.json at the repo
 root, overridden key by key by ~/.muster/prices.json. Standard library only.
@@ -15,6 +17,8 @@ import glob
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 
@@ -49,13 +53,18 @@ def load_prices():
     return prices
 
 
+def read_text(path, limit=None):
+    with open(path, "rb") as f:
+        return f.read(limit).decode("utf-8", "replace") if limit else f.read().decode("utf-8", "replace")
+
+
 def now():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def read_meta(task):
     try:
-        text = open(os.path.join(task, "meta")).read()
+        text = read_text(os.path.join(task, "meta"))
     except OSError:
         return {}
     return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
@@ -91,14 +100,14 @@ def codex_billing(home):
 
 
 def usage_codex(task, home, prices, billing):
-    log = open(os.path.join(task, "log.txt"), errors="replace").read()
+    log = read_text(os.path.join(task, "log.txt"))
     m = re.search(r"^session id: (\S+)", log, re.M)
     files = glob.glob(os.path.join(home, "sessions", "**", f"rollout-*{m.group(1)}.jsonl"), recursive=True) if m else []
     if not files:
         return None
     model, prev, p, usd = "?", None, None, 0.0
     tot = dict(input=0, cached=0, output=0, reasoning=0)
-    for line in open(files[0], errors="replace"):
+    for line in read_text(files[0]).splitlines():
         try:
             d = json.loads(line)
         except ValueError:
@@ -128,7 +137,7 @@ def usage_codex(task, home, prices, billing):
 def usage_claude(task, prices, billing, started_utc):
     # Reads `claude -p --output-format stream-json` (last "result" line) or plain json output.
     d = None
-    for line in open(os.path.join(task, "stream.jsonl"), errors="replace"):
+    for line in read_text(os.path.join(task, "stream.jsonl")).splitlines():
         line = line.strip()
         if not line.startswith("{"):
             continue
@@ -217,7 +226,7 @@ def running_on(cfg, name):
         if m.get("worker") != name or "finished" in m:
             continue
         try:
-            status = open(os.path.join(task, "status")).read().strip()
+            status = read_text(os.path.join(task, "status")).strip()
         except OSError:
             continue
         if status == "running" and pid_alive(int(m.get("pid", "0") or 0)):
@@ -232,7 +241,104 @@ def refuse(task, why, code):
     return code
 
 
+# ---------- setup helpers ----------
+
+def detect():
+    """What an agent needs to propose a config: Codex homes and claude-like commands on PATH or in ~/.local/bin."""
+    homes = []
+    for home in [os.environ.get("CODEX_HOME"), "~/.codex", *sorted(glob.glob(expand("~/.codex-homes/*")))]:
+        if not home:
+            continue
+        home = expand(home)
+        if os.path.isfile(os.path.join(home, "auth.json")) or os.path.isfile(os.path.join(home, "config.toml")):
+            homes.append({"codexHome": home.replace(HOME, "~", 1), "billing": codex_billing(home),
+                          "logged_in": os.path.isfile(os.path.join(home, "auth.json"))})
+    seen, commands = set(), []
+    dirs = os.environ.get("PATH", "").split(os.pathsep) + [expand("~/.local/bin")]
+    for d in dirs:
+        for f in sorted(glob.glob(os.path.join(d, "*"))):
+            name = os.path.basename(f)
+            if name in seen or not os.access(f, os.X_OK) or os.path.isdir(f):
+                continue
+            if name in ("codex", "claude"):
+                kind = name
+            elif "." in name:
+                continue  # backups such as tool.bak-2026...
+            else:
+                # A small script that sets ANTHROPIC_BASE_URL and execs a claude binary: Claude Code on another backend.
+                try:
+                    head = read_text(f, 16384) if os.path.getsize(f) < 65536 else ""
+                except OSError:
+                    head = ""
+                if not ("ANTHROPIC_BASE_URL" in head and re.search(r"\bclaude\b", head)):
+                    continue
+                kind = "claude-wrapper"
+            seen.add(name)
+            commands.append({"name": name, "kind": kind, "path": f.replace(HOME, "~", 1)})
+    return {"codex_homes": homes, "commands": commands, "config": CONFIG.replace(HOME, "~", 1),
+            "config_exists": os.path.isfile(CONFIG)}
+
+
+def doctor(cfg):
+    """Problems with the config, one line each; empty when it is usable."""
+    probs = []
+    workers = cfg.get("workers") or {}
+    if not workers:
+        probs.append("workers: none configured")
+    for name, w in workers.items():
+        kind = w.get("type")
+        if kind not in ("codex", "claude"):
+            probs.append(f"workers.{name}.type: {kind!r}, expected 'codex' or 'claude'")
+            continue
+        cmd = expand(w.get("command", kind))
+        if shutil.which(cmd) is None:
+            probs.append(f"workers.{name}.command: {cmd} not found or not executable")
+        if kind == "codex":
+            home = expand(w.get("codexHome", "~/.codex"))
+            if not os.path.isfile(os.path.join(home, "auth.json")):
+                probs.append(f"workers.{name}.codexHome: no auth.json in {home} (log in with CODEX_HOME={home} codex login)")
+    for i, r in enumerate(cfg.get("routing") or []):
+        for w in r.get("workers", []):
+            if w not in workers:
+                probs.append(f"routing[{i}] ({r.get('match')}): unknown worker {w!r}")
+    if cfg.get("routing") and not any(r.get("match") == "*" for r in cfg["routing"]):
+        probs.append("routing: no '*' fallback entry; tasks outside every match have no default worker")
+    for w in (cfg.get("only") or {}):
+        if w not in workers:
+            probs.append(f"only.{w}: unknown worker")
+    for k, v in (cfg.get("caps") or {}).items():
+        if k not in workers and k not in ("codex", "claude"):
+            probs.append(f"caps.{k}: not a worker name or type")
+        elif not isinstance(v, int) or v < 1:
+            probs.append(f"caps.{k}: {v!r}, expected a whole number of at least 1")
+    return probs
+
+
 # ---------- running ----------
+
+def finish(task, rc, status):
+    append_meta(task, finished=now(), exit=rc)
+    with open(os.path.join(task, "status"), "w") as f:
+        f.write(status + "\n")
+
+
+def supervise(task, cmd, **popen):
+    """Run the worker; if the runner itself is told to stop, stop the worker and still record a final status."""
+    child = subprocess.Popen(cmd, **popen)
+
+    def stop(signum, _frame):
+        child.terminate()
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+        name = signal.Signals(signum).name
+        finish(task, 128 + signum, f"failed: interrupted ({name})")
+        sys.exit(128 + signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, stop)
+    return child.wait()
 
 def run(cfg, name, task, cwd):
     worker = cfg["workers"].get(name)
@@ -266,11 +372,11 @@ def run(cfg, name, task, cwd):
             env["CODEX_HOME"] = expand(worker.get("codexHome", "~/.codex"))
             cmd = [expand(worker.get("command", "codex")), "exec", "--dangerously-bypass-approvals-and-sandbox",
                    "--skip-git-repo-check", "-C", cwd, "-o", os.path.join(task, "result.md"), *extra, "-"]
-            rc = subprocess.call(cmd, stdin=stdin, stdout=log, stderr=subprocess.STDOUT, cwd=cwd, env=env)
+            rc = supervise(task, cmd, stdin=stdin, stdout=log, stderr=subprocess.STDOUT, cwd=cwd, env=env)
         elif kind == "claude":
             cmd = [expand(worker.get("command", "claude")), "-p", "--output-format", "stream-json", "--verbose", *extra]
             with open(os.path.join(task, "stream.jsonl"), "w") as out:
-                rc = subprocess.call(cmd, stdin=stdin, stdout=out, stderr=log, cwd=cwd, env=env)
+                rc = supervise(task, cmd, stdin=stdin, stdout=out, stderr=log, cwd=cwd, env=env)
         else:
             sys.exit(f"muster: worker {name!r} has unknown type {kind!r} (codex or claude)")
     try:
@@ -278,9 +384,7 @@ def run(cfg, name, task, cwd):
     except Exception as e:  # usage is best effort; the task result matters more
         with open(os.path.join(task, "log.txt"), "a") as log:
             log.write(f"\nmuster: usage not recorded: {e}\n")
-    append_meta(task, finished=now(), exit=rc)
-    with open(os.path.join(task, "status"), "w") as f:
-        f.write("done\n" if rc == 0 else f"failed: exit {rc}\n")
+    finish(task, rc, "done" if rc == 0 else f"failed: exit {rc}")
     return rc
 
 
@@ -288,7 +392,14 @@ def main():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     cmd, args = sys.argv[1], sys.argv[2:]
+    if cmd == "detect":  # works before any config exists
+        print(json.dumps(detect(), indent=2))
+        return
     cfg = load_config()
+    if cmd == "doctor":
+        probs = doctor(cfg)
+        print("\n".join(probs) if probs else f"ok: {len(cfg['workers'])} workers, config {CONFIG}")
+        sys.exit(1 if probs else 0)
     if cmd == "run" and len(args) == 3:
         sys.exit(run(cfg, *args))
     if cmd == "usage" and len(args) == 1:

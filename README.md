@@ -6,12 +6,13 @@
 
 **One Claude Code session. A crew of CLI agents working in parallel. Every task's progress, tokens and cost in a live pane.**
 
+[![CI](https://github.com/jandyx/muster/actions/workflows/ci.yml/badge.svg)](https://github.com/jandyx/muster/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757.svg)](https://github.com/anthropics/claude-code)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB.svg)](https://www.python.org/)
 [![Workers: Codex · Claude-compatible](https://img.shields.io/badge/workers-Codex%20%C2%B7%20Claude--compatible-8B5CF6.svg)](#configure)
 
-[Quick start](#quick-start) · [Configure](#configure) · [The pane](#the-pane) · [Tokens and cost](#tokens-and-cost) · [How it works](docs/how-it-works.md) · [FAQ](#faq)
+[Quick start](#quick-start) · [Agent setup](#set-up-with-any-coding-agent) · [Configure](#configure) · [The pane](#the-pane) · [Tokens and cost](#tokens-and-cost) · [How it works](docs/how-it-works.md) · [FAQ](#faq)
 
 </div>
 
@@ -79,19 +80,29 @@ Muster turns that into a habit Claude already knows and a screen you can glance 
 /plugin install muster@muster
 ```
 
-**2. Describe your workers**
+**2. Let Claude set up your workers**
+
+> set up muster
+
+The `muster-setup` skill finds your Codex logins and Claude-compatible CLIs, asks which repos each one should take, writes `~/.muster/config.json` and checks it with `muster.py doctor`.
+
+<details>
+<summary>Or write the config by hand</summary>
 
 ```bash
 mkdir -p ~/.muster
 curl -fsSL https://raw.githubusercontent.com/jandyx/muster/main/examples/config.example.json -o ~/.muster/config.json
 $EDITOR ~/.muster/config.json
+python3 <plugin>/skills/muster/muster.py doctor
 ```
+
+</details>
 
 **3. Hand Claude a batch**
 
 > muster: profile the slowest tests, audit the serial test group, and draft a tiering plan
 
-Claude shows the plan table and starts. Type `/muster` to watch.
+Claude shows the plan table and starts, and the pane opens beside the chat. Reopen it any time with `/muster-panel`.
 
 <details>
 <summary>Install from a clone instead (runs straight from the folder; edit, then <code>/reload-plugins</code>)</summary>
@@ -103,6 +114,20 @@ claude plugin install muster@muster --scope user
 ```
 
 </details>
+
+### Set up with any coding agent
+
+Paste this into Claude Code (or another agent with a shell) and it does the whole install:
+
+```text
+Install and configure Muster (https://github.com/jandyx/muster) for me:
+1. Run: claude plugin marketplace add jandyx/muster && claude plugin install muster@muster --scope user
+2. Run: python3 ~/.claude/plugins/marketplaces/muster/skills/muster/muster.py detect
+   (if that path does not exist, find muster.py under ~/.claude/plugins)
+3. Follow skills/muster-setup/SKILL.md from that repo: propose workers from what detect found,
+   ask me only which repos each worker takes, write ~/.muster/config.json, then run muster.py doctor until it says ok.
+4. Never print auth files or API keys. Tell me to run /reload-plugins when done.
+```
 
 **Requirements:** Claude Code with plugin support, Python 3.9+, and the worker CLIs you use (`codex`, `claude`, or a Claude-compatible wrapper).
 
@@ -129,7 +154,7 @@ claude plugin install muster@muster --scope user
 }
 ```
 
-Check what Muster sees with `python3 <plugin>/skills/muster/muster.py workers`.
+Check it with `python3 <plugin>/skills/muster/muster.py doctor` (one line per problem, `ok` when usable), list workers with `workers`, and see what the machine offers with `detect`.
 
 <details>
 <summary>Worker types</summary>
@@ -155,11 +180,11 @@ Check what Muster sees with `python3 <plugin>/skills/muster/muster.py workers`.
 
 ## The pane
 
-`/muster` opens the pane and gives it the keyboard. While tasks run, a band above the prompt lists them.
+The pane opens by itself when a prompt starts with `muster:` or `/muster`. `/muster-panel` opens it and gives it the keyboard. While tasks run, a band above the prompt lists them.
 
 | Key | Does |
 |---|---|
-| `/muster` | open and focus the pane |
+| `/muster-panel` | open and focus the pane |
 | `ctrl+x`, then `tab` | move focus between the band and the pane |
 | `↑` `↓` | scroll |
 | `tab` · `enter` | move between runs · fold or unfold one |
@@ -225,6 +250,13 @@ The runner stopped it before it started: exit 3 means the worker is fenced away 
 </details>
 
 <details>
+<summary><b>A task shows "failed: lost" or "failed: interrupted".</b></summary>
+
+`interrupted`: the runner was told to stop (SIGTERM, SIGHUP, Ctrl-C); it stopped the worker and recorded that. `lost`: the runner process is gone without writing a final status (killed with SIGKILL, a crash, a reboot), so the pane marks it instead of showing a `running` that never ends. Read the task's `log.txt` or `stream.jsonl` for what the worker got done. Editing `muster.py` while tasks run is safe: Python reads the whole file at start.
+
+</details>
+
+<details>
 <summary><b>I resumed a session and the pane is empty.</b></summary>
 
 Runs are tied to the session id that started them. `claude --resume` keeps the id; `--fork-session` and `/clear` start a new one, so earlier runs stay on disk but leave the pane.
@@ -240,7 +272,7 @@ Runs are tied to the session id that started them. `claude --resume` keeps the i
 
 ## Contributing
 
-Issues and pull requests are welcome. Before sending a change:
+Issues and pull requests are welcome. Coding agents: read [AGENTS.md](AGENTS.md) first. Before sending a change:
 
 ```bash
 claude plugin validate .                  # manifest, hooks module, marketplace
