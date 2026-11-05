@@ -9,7 +9,7 @@
 [![CI](https://github.com/jandyx/muster/actions/workflows/ci.yml/badge.svg)](https://github.com/jandyx/muster/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Claude Code plugin](https://img.shields.io/badge/Claude%20Code-plugin-D97757.svg)](https://github.com/anthropics/claude-code)
-[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-3776AB.svg)](https://www.python.org/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB.svg)](https://www.python.org/)
 [![Workers: Codex · Claude-compatible](https://img.shields.io/badge/workers-Codex%20%C2%B7%20Claude--compatible-8B5CF6.svg)](#configure)
 
 [Quick start](#quick-start) · [Agent setup](#set-up-with-any-coding-agent) · [Configure](#configure) · [The pane](#the-pane) · [Tokens and cost](#tokens-and-cost) · [How it works](docs/how-it-works.md) · [FAQ](#faq)
@@ -129,7 +129,7 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
 4. Never print auth files or API keys. Tell me to run /reload-plugins when done.
 ```
 
-**Requirements:** Claude Code with plugin support, Python 3.9+, and the worker CLIs you use (`codex`, `claude`, or a Claude-compatible wrapper).
+**Requirements:** Claude Code with plugin support, Python 3.10+, and the worker CLIs you use (`codex`, `claude`, or a Claude-compatible wrapper).
 
 ## Configure
 
