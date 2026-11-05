@@ -243,3 +243,23 @@ test('another session cannot see this one\'s runs', async ($, on) => {
   expect((await ui.find({ type: 'Text', text: /No Muster runs yet/ }))?.text).toBe('No Muster runs yet.')
   await ui.unmount()
 })
+
+test('a long note wraps to at most three lines, a long command to two', async ($, on) => {
+  const note = 'Shell and executor tests pass; fixing the path check that treats /var and /private/var as different places, then rerunning every runtime file and the full lint and typecheck pass before reporting.'
+  const cmd = 'bash tests/run-runtime.sh tests/runtime/developer/developer-entry.test.mjs && git diff --check && git status --short && make lint'
+  const t = tree('/h/.muster/runs', { '20261105-1000-x': { A: { ...task('running', 'pid=0\n'), title: 'long one' } } })
+  t['/h/.muster/runs/20261105-1000-x/A/log.txt'] = `exec\n/bin/zsh -lc '${cmd}' in /x\n\ncodex\n${note}\n\nhook: PreToolUse\n`
+  await mountWith($, on, t)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 50 } })
+  // Whole rows only: a row's colored marker is a nested Text of its own.
+  const rows = (await ui.findAll({ type: 'Text' })).map((r: any) => r.text as string).filter(r => r.startsWith('    '))
+  const start = rows.findIndex(r => r.includes('↻'))
+  const cmdStart = rows.findIndex(r => /^\s*\$ /.test(r))
+  expect(start).toBeGreaterThan(-1)
+  expect(cmdStart - start).toBe(3) // three note rows, then the command
+  expect(rows[start + 2]).toMatch(/…$/)
+  expect(rows[cmdStart + 1]).toMatch(/…$/)
+  expect(rows[cmdStart + 2] ?? '').not.toMatch(/^\s{6}\S/)
+  for (const r of rows.slice(start, cmdStart + 2)) expect([...r].length).toBeLessThanOrEqual(50)
+  await ui.unmount()
+})

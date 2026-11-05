@@ -95,6 +95,48 @@ const parseStream = (stream: string) => {
   return { progress: progress.replace(/[`*#]/g, '').replace(/\s+/g, ' ').slice(0, 300), lastCmd: lastCmd.replace(/\s+/g, ' ').slice(0, 200) }
 }
 
+// Detail rows wrap to a few lines instead of one: enough to read, not enough for one task to fill the pane.
+const MAX_LINES = { progress: 3, command: 2, summary: 2 }
+// Terminal cells a character takes: East Asian wide and full-width forms take two.
+const cells = (ch: string) => {
+  const c = ch.codePointAt(0) ?? 0
+  return (c >= 0x1100 && c <= 0x115f) || (c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) ||
+    (c >= 0xf900 && c <= 0xfaff) || (c >= 0xfe30 && c <= 0xfe4f) || (c >= 0xff00 && c <= 0xff60) ||
+    (c >= 0xffe0 && c <= 0xffe6) || (c >= 0x1f300 && c <= 0x1faff) || (c >= 0x20000 && c <= 0x3fffd)
+    ? 2
+    : 1
+}
+const width = (text: string) => [...text].reduce((a, c) => a + cells(c), 0)
+// Splits text into lines of `width` cells, breaking at the last space when there is one; past `max` lines it
+// keeps `max` and ends the last with "…".
+const wrapCells = (text: string, cols: number, max: number) => {
+  const w = Math.max(10, cols)
+  const lines: string[] = []
+  let line = ''
+  for (const ch of text.trim()) {
+    if (width(line) + cells(ch) > w) {
+      // Break at a space only near the line's end; CJK text has few spaces, and an early one wastes the row.
+      const space = line.lastIndexOf(' ')
+      if (space > 0 && ch !== ' ' && width(line.slice(0, space)) >= w * 0.6) {
+        lines.push(line.slice(0, space))
+        line = line.slice(space + 1)
+      } else {
+        lines.push(line)
+        line = ''
+      }
+      if (ch === ' ') continue
+    }
+    line += ch
+  }
+  if (line !== '') lines.push(line)
+  if (lines.length <= max) return lines
+  const kept = lines.slice(0, max)
+  let last = kept[max - 1]!
+  while (last !== '' && width(last) + 1 > w) last = [...last].slice(0, -1).join('')
+  kept[max - 1] = `${last}…`
+  return kept
+}
+
 const fmtElapsed = (ms: number) => {
   if (ms <= 0) return ''
   const s = Math.floor(ms / 1000)
@@ -191,7 +233,7 @@ export const register: Register = on => {
             status: isOrphan ? 'failed: lost (runner exited without a final status)' : status.trim() || 'pending',
             startedMs: parseTime(kv.started),
             finishedMs: parseTime(kv.finished),
-            summary: tidy.slice(0, 120),
+            summary: tidy.slice(0, 400),
             usage,
             progress: live.progress,
             lastCmd: live.lastCmd,
@@ -291,6 +333,8 @@ export const register: Register = on => {
       void update($, foldsAtom, old => ({ ...old, ...Object.fromEntries(runs.map(r => [r.name, folded])) }))
     const toggle = (run: Run) => () => void update($, foldsAtom, old => ({ ...old, [run.name]: !isFolded(run) }))
     const now = await $.clock.now()
+    // Room for a detail line: the body less its 4-cell indent and the 2-cell marker.
+    const detailWidth = (e.props.bodyColumns ?? 80) - 6
     const Worker = (w: string) => <Text bold color={workerColor(w)}>{w}</Text>
     const Tok = (n: number) => <Text bold>{fmtTokens(n)}</Text>
     const Usd = (usd: number, billing: string) => <Text bold color={usdColor(billing)}>{fmtUsd(usd, billing)}</Text>
@@ -344,24 +388,33 @@ export const register: Register = on => {
                       {t.usage.peak && <Text bold color="error"> peak</Text>}
                     </Text>
                   )}
-                  {isRunning(t) && t.progress !== '' && (
-                    <Text wrap="truncate-end">
-                      {'    '}<Text color="warning">↻</Text> {t.progress}
-                    </Text>
-                  )}
-                  {isRunning(t) && t.lastCmd !== '' && (
-                    <Text dimColor wrap="truncate-end">
-                      {'    '}$ {t.lastCmd}
-                    </Text>
-                  )}
+                  {isRunning(t) &&
+                    t.progress !== '' &&
+                    wrapCells(t.progress, detailWidth, MAX_LINES.progress).map((line, i) => (
+                      <Text>
+                        {'    '}
+                        {i === 0 ? <Text color="warning">↻</Text> : ' '} {line}
+                      </Text>
+                    ))}
+                  {isRunning(t) &&
+                    t.lastCmd !== '' &&
+                    wrapCells(t.lastCmd, detailWidth, MAX_LINES.command).map((line, i) => (
+                      <Text dimColor>
+                        {'    '}
+                        {i === 0 ? '$' : ' '} {line}
+                      </Text>
+                    ))}
                   {isRunning(t) && t.logMs > 0 && now - t.logMs > 120000 && (
                     <Text color="error">{'    '}no output for {fmtElapsed(now - t.logMs)}</Text>
                   )}
-                  {t.summary !== '' && isFinished(t) && (
-                    <Text dimColor wrap="truncate-end">
-                      {'    '}↳ {t.summary}
-                    </Text>
-                  )}
+                  {t.summary !== '' &&
+                    isFinished(t) &&
+                    wrapCells(t.summary, detailWidth, MAX_LINES.summary).map((line, i) => (
+                      <Text dimColor>
+                        {'    '}
+                        {i === 0 ? '↳' : ' '} {line}
+                      </Text>
+                    ))}
                 </Box>
               ))}
           </Box>
