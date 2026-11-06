@@ -16,11 +16,11 @@ Read `~/.muster/config.json` (or the path in `MUSTER_CONFIG`) at the start of ev
 - `workers.<name>.type`: `codex` (runs `codex exec` with that worker's `codexHome`) or `claude` (runs a Claude Code compatible command with `-p`).
 - `routing`: a list of `{ match, workers }`. The first `match` glob (`~` allowed) that fits the task's cwd gives the worker priority, first choice first. `*` is the fallback.
 - `only.<worker>`: globs that worker may work in. Never route any other project to it, not even as a quota fallback. `muster.py` enforces it: outside those globs it refuses (exit 3, status `failed: refused, …`).
-- `caps.<worker>` or `caps.<type>`: the most tasks one worker runs at once (default codex 3, claude 5). `muster.py` enforces it: over the cap it refuses (exit 4) and starts nothing; launch that task again when a slot frees.
+- `caps.<worker>` or `caps.<type>`: the most tasks one worker runs at once (default codex 3, claude 5). `muster.py` enforces it: over the cap the task waits with status `queued` and starts by itself when a slot frees.
 - `preamble`: extra lines appended to the rules block of every prompt.
 - The user's explicit choice in the request always wins over the config.
 
-Assigning parallel tasks: in priority order, one per worker first. With more tasks than workers, give each worker more at once instead of queueing (each run is its own process), up to its cap. Tasks over every cap wait and start as earlier ones finish; a refusal with exit 4 means exactly that, not a failure of the task. When a worker fails on quota or rate limit (see `log.txt`), rerun that task on the next worker in its list.
+Assigning parallel tasks: in priority order, one per worker first. With more tasks than workers, give each worker more at once, up to its cap; launch the rest anyway, they queue in the runner and start in order. When a worker fails on quota or rate limit (see `log.txt`), rerun that task on the next worker in its list.
 
 Metered workers on a peak-priced model (see `prices.json`, e.g. DeepSeek: weekdays 01:00–04:00 and 06:00–10:00 UTC cost double): when a large, non-urgent batch would run in peak hours, say so in the plan and offer to run it later. The user decides.
 
@@ -42,8 +42,9 @@ Metered workers on a peak-priced model (see `prices.json`, e.g. DeepSeek: weekda
 
    Then each line of the config's `preamble`, and any repo rule from the user's own instructions that applies to this cwd (workers do not see Claude's CLAUDE.md or memory).
 4. **Launch.** For each task, call Bash with `run_in_background: true`:
-   `python3 $MUSTER run <worker> <task-dir> <cwd>`
-   Launch all independent tasks in the same message. The runner writes `status` (running / done / failed: …), `meta`, `log.txt` (codex) or `stream.jsonl` (claude), `result.md` and `usage`.
+   `python3 $MUSTER run <worker> <task-dir> <cwd> [--after A,B] [--priority N]`
+   Launch all tasks in the same message, dependent ones too. `--after A,B`: wait until sibling tasks A and B (same run dir) are `done`; if one fails or is canceled, this task is canceled (exit 5) without running. `--priority N` (default 0): on a full worker, higher N starts first; equal N start in launch order. The runner writes `status` (queued, … / running / done / failed: … / canceled: …), `meta`, `log.txt` (codex) or `stream.jsonl` (claude), `result.md` and `usage`.
+   **Cancel** a task that is no longer needed (superseded, out of scope) with `python3 $MUSTER cancel <task-dir> "<reason>"`; never write `status` by hand. It stops the worker if it runs and records `canceled: <reason>`, which the pane and report do not count as a failure.
 5. **Wait.** Background tasks notify on exit, so do not poll. If the user asks in the meantime, read each `status` and report; the Muster pane (`/muster-panel`) shows live progress.
 6. **Verify.** Read each `result.md`, then check the work yourself: the diff (`git -C <cwd> diff`), the build or tests the task names. A worker's claim is not evidence. Failed or wrong: write a follow-up prompt with the concrete problem and rerun on the same or another worker.
 7. **Report** in the format below. Merging worktrees, committing and pushing happen only when the user asks; once a `muster/*` branch is merged, offer to remove its worktree.
@@ -53,7 +54,7 @@ Metered workers on a peak-priced model (see `prices.json`, e.g. DeepSeek: weekda
 ```
 | id | worker | task | status | tokens | cost | result |
 |----|--------|------|--------|--------|------|--------|
-| A  | codex  | ...  | done / running / failed / needs review | in 1.5M (95% cached) · out 14k | ≈$2.91 | one line |
+| A  | codex  | ...  | done / running / queued / failed / canceled / needs review | in 1.5M (95% cached) · out 14k | ≈$2.91 | one line |
 ```
 
 Then:

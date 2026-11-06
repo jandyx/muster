@@ -124,8 +124,104 @@ class Guards(unittest.TestCase):
         (nopid / "status").write_text("running\n")
         (nopid / "meta").write_text("worker=w\nstarted=2026-11-05 10:00:00\n")
         self.assertEqual(M.running_on(self.cfg(), "w"), 1)  # neither the dead pid nor the missing one counts
-        self.assertEqual(M.run(self.cfg(caps={"w": 1}), "w", str(self.task), str(self.repo)), 4)
-        self.assertIn("1 of 1", (self.task / "status").read_text())
+
+
+class Queue(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = pathlib.Path(self.tmp.name)
+        ok = self.d / "ok"
+        ok.write_text("#!/bin/sh\ncat >/dev/null\n")
+        ok.chmod(0o755)
+        self.cfg = {"runsDir": str(self.d), "workers": {"w": {"type": "claude", "command": str(ok)}}, "caps": {"w": 1}}
+        self.cfg_path = self.d / "config.json"
+        self.cfg_path.write_text(json.dumps(self.cfg))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def task(self, tid, status=None, meta=None):
+        t = self.d / "run" / tid
+        t.mkdir(parents=True)
+        (t / "prompt.md").write_text("# t\n")
+        if status is not None:
+            (t / "status").write_text(status + "\n")
+        if meta is not None:
+            (t / "meta").write_text(meta)
+        return t
+
+    def launch(self, t, *opts):
+        import subprocess
+        return subprocess.Popen([sys.executable, str(ROOT / "skills/muster/muster.py"), "run", "w", str(t), str(self.d), *opts],
+                                env=dict(os.environ, MUSTER_CONFIG=str(self.cfg_path)))
+
+    def wait_status(self, t, prefix):
+        import time
+        for _ in range(100):
+            if (t / "status").exists() and (t / "status").read_text().startswith(prefix):
+                return
+            time.sleep(0.1)
+        self.fail(f"{t.name} status {(t / 'status').read_text()!r}, expected {prefix!r}")
+
+    def test_over_the_cap_waits_for_a_slot(self):
+        busy = self.task("B", "running", f"worker=w\npid={os.getpid()}\nstarted=2026-11-05 10:00:00\n")
+        t = self.task("A")
+        p = self.launch(t)
+        self.wait_status(t, "queued, w runs 1 of 1")
+        self.assertNotIn("started=", (t / "meta").read_text())
+        (busy / "status").write_text("done\n")
+        self.assertEqual(p.wait(timeout=20), 0)
+        self.assertEqual((t / "status").read_text().strip(), "done")
+
+    def test_after_waits_for_its_dependency(self):
+        dep = self.task("A", "running", f"worker=x\npid={os.getpid()}\n")
+        t = self.task("B")
+        p = self.launch(t, "--after", "A")
+        self.wait_status(t, "queued, waiting for A")
+        (dep / "status").write_text("done\n")
+        self.assertEqual(p.wait(timeout=20), 0)
+        self.assertEqual((t / "status").read_text().strip(), "done")
+
+    def test_a_failed_dependency_cancels_the_task(self):
+        self.task("A", "failed: exit 1")
+        t = self.task("B")
+        self.assertEqual(M.run(self.cfg, "w", str(t), str(self.d), after=["A"]), 5)
+        self.assertEqual((t / "status").read_text().strip(), "canceled: A failed")
+        self.task("L", "running", "worker=x\npid=999999\n")
+        t2 = self.task("C")
+        self.assertEqual(M.run(self.cfg, "w", str(t2), str(self.d), after=["L"]), 5)
+        self.assertEqual((t2 / "status").read_text().strip(), "canceled: L lost")
+
+    def test_unknown_dependency_exits(self):
+        with self.assertRaises(SystemExit):
+            M.run(self.cfg, "w", str(self.task("B")), str(self.d), after=["nope"])
+
+    def test_higher_priority_then_first_queued_starts_first(self):
+        q = lambda when, prio, after="": f"worker=w\npid={os.getpid()}\nqueued=2026-11-05 10:0{when}:00\npriority={prio}\nafter={after}\n"
+        late_high = self.task("A", "queued", q(5, 9))
+        early = self.task("B", "queued", q(1, 0))
+        later = self.task("C", "queued", q(2, 0))
+        self.task("D", "queued", q(0, 99, after="Z"))  # its dependency is not done, so it is not in line
+        self.task("Z", "running", f"worker=x\npid={os.getpid()}\n")
+        head = M.queue_head(self.cfg, "w")
+        self.assertEqual(head, [os.path.realpath(x) for x in (late_high, early, later)])
+
+    def test_cancel_stops_a_queued_task(self):
+        self.task("B", "running", f"worker=w\npid={os.getpid()}\nstarted=2026-11-05 10:00:00\n")
+        t = self.task("A")
+        p = self.launch(t)
+        self.wait_status(t, "queued")
+        self.assertEqual(M.cancel(str(t), "superseded by C"), 0)
+        self.assertEqual(p.wait(timeout=20), 128 + 15)
+        self.assertEqual((t / "status").read_text().strip(), "canceled: superseded by C")
+        self.assertEqual(M.cancel(str(t)), 1)  # already finished
+
+    def test_cancel_before_the_runner_starts(self):
+        t = self.task("A")
+        self.assertEqual(M.cancel(str(t)), 0)
+        self.assertEqual((t / "status").read_text().strip(), "canceled")
+        self.assertEqual(M.run(self.cfg, "w", str(t), str(self.d)), 0)
+        self.assertEqual((t / "status").read_text().strip(), "canceled")
 
 
 

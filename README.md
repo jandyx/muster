@@ -173,7 +173,7 @@ Check it with `python3 <plugin>/skills/muster/muster.py doctor` (one line per pr
 |---|---|---|
 | `routing` | picks workers in that order, falls back on quota errors | not checked |
 | `only` | never plans a fenced worker elsewhere | refuses outside its globs (exit 3) |
-| `caps` | spreads tasks, holds the rest back | refuses over the cap (exit 4); counts live processes only |
+| `caps` | spreads tasks | queues over the cap, starts each when a slot frees (priority, then launch order); counts live processes only |
 | `preamble` | adds the lines to every prompt | not checked |
 
 </details>
@@ -224,7 +224,7 @@ Muster deletes nothing on its own.
 ## Safety
 
 > [!WARNING]
-> Workers run with approvals and sandboxing off: they can run any command in the folder you give them. Use Muster in repos you trust, keep secrets out of prompts, and read the diffs before merging. Nothing is committed, pushed or merged unless you ask.
+> Workers run with approvals and sandboxing off: they can run any command in the folder you give them. Use Muster in repos you trust, keep secrets out of prompts, and read the diffs before merging. Nothing is committed, pushed or merged unless you ask. `muster.py cancel` sends SIGTERM only to the runner pid in that task's `meta`, and only while that task is queued or running.
 
 ## FAQ
 
@@ -245,14 +245,14 @@ Yes. Configure only `claude` workers: Claude Code on another backend, or any CLI
 <details>
 <summary><b>Why is a task "failed: refused"?</b></summary>
 
-The runner stopped it before it started: exit 3 means the worker is fenced away from that repo (`only`), exit 4 means the worker is at its parallel cap (`caps`). Claude launches it again when a slot frees.
+The runner stopped it before it started: exit 3 means the worker is fenced away from that repo (`only`). A worker at its parallel cap (`caps`) does not refuse; the task shows `queued` until a slot frees.
 
 </details>
 
 <details>
-<summary><b>A task shows "failed: lost" or "failed: interrupted".</b></summary>
+<summary><b>A task shows "canceled", "failed: lost" or "failed: interrupted".</b></summary>
 
-`interrupted`: the runner was told to stop (SIGTERM, SIGHUP, Ctrl-C); it stopped the worker and recorded that. `lost`: the runner process is gone without writing a final status (killed with SIGKILL, a crash, a reboot), so the pane marks it instead of showing a `running` that never ends. Read the task's `log.txt` or `stream.jsonl` for what the worker got done. Editing `muster.py` while tasks run is safe: Python reads the whole file at start.
+`canceled`: Claude stopped it on purpose with `muster.py cancel` (superseded, no longer needed), or a task it runs `--after` failed; not counted as a failure. `interrupted`: the runner was told to stop (SIGTERM, SIGHUP, Ctrl-C); it stopped the worker and recorded that. `lost`: the runner process is gone without writing a final status (killed with SIGKILL, a crash, a reboot), so the pane marks it instead of showing a `running` that never ends. Read the task's `log.txt` or `stream.jsonl` for what the worker got done. Editing `muster.py` while tasks run is safe: Python reads the whole file at start.
 
 </details>
 
