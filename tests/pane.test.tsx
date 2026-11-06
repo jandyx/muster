@@ -70,6 +70,9 @@ test('the pane shows each task of the newest run', async ($, on) => {
     expect((await ui.find({ type: 'Text', text: /Read \/x\/README/ }))?.text).toMatch(/\$ Read \/x\/README\.md/)
     expect((await ui.find({ type: 'Text', text: /Lost task/ }))?.text).toMatch(/✗ Lost task/)
     expect((await ui.find({ type: 'Text', text: /L · / }))?.text).toMatch(/failed: lost/)
+    // Tasks sit under status sections: running first, then failed, then done.
+    const heads = (await ui.findAll({ type: 'Text' })).map((r: any) => r.text as string).filter(r => /^\s*(Running|Failed|Done|Other) · \d+$/.test(r))
+    expect(heads.slice(0, 3).map(h => h.trim())).toEqual(['Running · 2', 'Failed · 1', 'Done · 1'])
     // Folding the newest run hides its rows; expanding all brings them back.
     await ui.press({ key: 'run:20261105-1130-x' })
     expect(await ui.find({ type: 'Text', text: /retry logic/ })).toBeUndefined()
