@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Muster worker runner: run one task on one configured worker and record what happened.
 
-    muster.py run <worker> <task-dir> <cwd> [--after A,B] [--priority N]
-                                              queue until deps are done and a slot frees, then run prompt.md
+    muster.py run <worker[,worker…]> <task-dir> <cwd> [--after A,B] [--priority N]
+                                              queue until deps are done and one of the workers has a free slot
+                                              (first in the list wins a tie), then run prompt.md on it
     muster.py cancel <task-dir> [reason]      stop a queued or running task; status becomes "canceled: reason"
     muster.py usage <task-dir>                (re)compute <task-dir>/usage for a finished task
     muster.py workers                         list configured workers
@@ -262,13 +263,14 @@ def dep_state(task, after):
 
 
 def queue_head(cfg, name):
-    # Queued tasks of this worker whose deps are done, in start order: higher priority first, then first queued.
+    # Queued tasks that may start on this worker and whose deps are done, in start order:
+    # higher priority first, then first queued.
     runs = expand(cfg.get("runsDir", "~/.muster/runs"))
     ready = []
     for meta in glob.glob(os.path.join(runs, "*", "*", "meta")):
         task = os.path.dirname(meta)
         m = read_meta(task)
-        if m.get("worker") != name:
+        if name not in m.get("workers", "").split(","):
             continue
         try:
             status = read_text(os.path.join(task, "status")).strip()
@@ -278,6 +280,11 @@ def queue_head(cfg, name):
         if status.startswith("queued") and live(m, status) and dep_state(task, after) == "ready":
             ready.append((-int(m.get("priority", "0") or 0), m.get("queued", ""), os.path.realpath(task)))
     return [t for _, _, t in sorted(ready)]
+
+
+def cap_of(cfg, name):
+    caps, kind = cfg.get("caps") or {}, cfg["workers"][name]["type"]
+    return int(caps.get(name, caps.get(kind, DEFAULT_CAPS.get(kind, 3))))
 
 
 def refuse(task, why, code):
@@ -425,35 +432,39 @@ def cancel(task, reason=""):
     return 0
 
 
-def run(cfg, name, task, cwd, after=(), priority=0):
-    worker = cfg["workers"].get(name)
-    if worker is None:
-        sys.exit(f"muster: unknown worker {name!r} (known: {', '.join(cfg['workers'])})")
+def run(cfg, names, task, cwd, after=(), priority=0):
+    # `names`: one worker or several ("a,b"); the task waits for whichever frees a slot first.
+    names = [n for n in (names.split(",") if isinstance(names, str) else names) if n]
+    for name in names:
+        if name not in cfg["workers"]:
+            sys.exit(f"muster: unknown worker {name!r} (known: {', '.join(cfg['workers'])})")
     prompt = os.path.join(task, "prompt.md")
     if not os.path.isfile(prompt) or not os.path.isdir(cwd):
         sys.exit(f"muster: need {prompt} and an existing cwd {cwd}")
     for dep in after:
         if not os.path.isdir(os.path.join(os.path.dirname(task), dep)):
             sys.exit(f"muster: --after {dep}: no task {dep} next to {task}")
-    kind = worker["type"]
-    if not allowed_here(cfg, name, cwd):
-        return refuse(task, f"worker {name} is limited to {cfg['only'][name]} by `only`; {cwd} is outside", 3)
+    fenced = [n for n in names if not allowed_here(cfg, n, cwd)]
+    names = [n for n in names if n not in fenced]
+    if not names:
+        limits = "; ".join(f"{n} to {cfg['only'][n]}" for n in fenced)
+        return refuse(task, f"`only` limits {limits}; {cwd} is outside", 3)
     try:
         if read_text(os.path.join(task, "status")).startswith("canceled"):
             return 0  # canceled before its runner started
     except OSError:
         pass
-    cap = int((cfg.get("caps") or {}).get(name, (cfg.get("caps") or {}).get(kind, DEFAULT_CAPS.get(kind, 3))))
     runs = expand(cfg.get("runsDir", "~/.muster/runs"))
     os.makedirs(runs, exist_ok=True)
+    # `worker` and `type` are written when the task starts; until then `workers` lists where it may go.
     with open(os.path.join(task, "meta"), "w") as f:
-        f.write(f"worker={name}\ntype={kind}\ncwd={cwd}\nsession={os.environ.get('CLAUDE_CODE_SESSION_ID', '')}\n"
+        f.write(f"workers={','.join(names)}\ncwd={cwd}\nsession={os.environ.get('CLAUDE_CODE_SESSION_ID', '')}\n"
                 f"pid={os.getpid()}\nqueued={now()}\nafter={','.join(after)}\npriority={priority}\n")
     write_status(task, "queued")
     on_stop(task)
-    shown = "queued"
-    while True:
-        # The lock makes count-then-claim atomic, so queued tasks cannot all slip under the cap at once.
+    shown, name = "queued", None
+    while name is None:
+        # The lock makes count-then-claim atomic, so queued tasks cannot all slip under a cap at once.
         with open(os.path.join(runs, ".lock"), "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             deps = dep_state(task, after)
@@ -461,13 +472,18 @@ def run(cfg, name, task, cwd, after=(), priority=0):
                 finish(task, 5, f"canceled: {deps[8:]}")
                 return 5
             if deps == "ready":
-                busy = running_on(cfg, name)
-                head = queue_head(cfg, name)
-                if busy < cap and os.path.realpath(task) in head[:cap - busy]:
-                    append_meta(task, started=now())
+                full = []
+                for n in names:
+                    busy, cap = running_on(cfg, n), cap_of(cfg, n)
+                    if busy < cap and os.path.realpath(task) in queue_head(cfg, n)[:cap - busy]:
+                        name = n
+                        break
+                    full.append(f"{n} runs {busy} of {cap}")
+                if name is not None:
+                    append_meta(task, worker=name, type=cfg["workers"][name]["type"], started=now())
                     write_status(task, "running")
                     break
-                status = f"queued, {name} runs {busy} of {cap}"
+                status = f"queued, {', '.join(full)}"
             else:
                 status = f"queued, waiting for {deps[6:]}"
             if status != shown:
@@ -475,6 +491,8 @@ def run(cfg, name, task, cwd, after=(), priority=0):
                 shown = status
         time.sleep(QUEUE_POLL_S)
 
+    worker = cfg["workers"][name]
+    kind = worker["type"]
     env = dict(os.environ)
     extra = [expand(a) for a in worker.get("args", [])]
     with open(prompt) as stdin, open(os.path.join(task, "log.txt"), "w") as log:

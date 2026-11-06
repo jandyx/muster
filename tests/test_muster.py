@@ -150,9 +150,9 @@ class Queue(unittest.TestCase):
             (t / "meta").write_text(meta)
         return t
 
-    def launch(self, t, *opts):
+    def launch(self, t, *opts, worker="w"):
         import subprocess
-        return subprocess.Popen([sys.executable, str(ROOT / "skills/muster/muster.py"), "run", "w", str(t), str(self.d), *opts],
+        return subprocess.Popen([sys.executable, str(ROOT / "skills/muster/muster.py"), "run", worker, str(t), str(self.d), *opts],
                                 env=dict(os.environ, MUSTER_CONFIG=str(self.cfg_path)))
 
     def wait_status(self, t, prefix):
@@ -197,7 +197,7 @@ class Queue(unittest.TestCase):
             M.run(self.cfg, "w", str(self.task("B")), str(self.d), after=["nope"])
 
     def test_higher_priority_then_first_queued_starts_first(self):
-        q = lambda when, prio, after="": f"worker=w\npid={os.getpid()}\nqueued=2026-11-05 10:0{when}:00\npriority={prio}\nafter={after}\n"
+        q = lambda when, prio, after="": f"workers=w\npid={os.getpid()}\nqueued=2026-11-05 10:0{when}:00\npriority={prio}\nafter={after}\n"
         late_high = self.task("A", "queued", q(5, 9))
         early = self.task("B", "queued", q(1, 0))
         later = self.task("C", "queued", q(2, 0))
@@ -205,6 +205,40 @@ class Queue(unittest.TestCase):
         self.task("Z", "running", f"worker=x\npid={os.getpid()}\n")
         head = M.queue_head(self.cfg, "w")
         self.assertEqual(head, [os.path.realpath(x) for x in (late_high, early, later)])
+
+    def test_a_task_starts_on_whichever_listed_worker_is_free(self):
+        self.cfg["workers"]["v"] = dict(self.cfg["workers"]["w"])
+        self.task("B", "running", f"worker=w\npid={os.getpid()}\nstarted=2026-11-05 10:00:00\n")
+        t = self.task("A")
+        self.assertEqual(M.run(self.cfg, "w,v", str(t), str(self.d)), 0)
+        meta = M.read_meta(str(t))
+        self.assertEqual((meta["workers"], meta["worker"], meta["type"]), ("w,v", "v", "claude"))
+        self.assertEqual((t / "status").read_text().strip(), "done")
+
+    def test_a_task_waits_on_every_listed_worker(self):
+        self.cfg["workers"]["v"] = dict(self.cfg["workers"]["w"])
+        self.cfg["caps"]["v"] = 1
+        self.cfg_path.write_text(json.dumps(self.cfg))
+        self.task("B", "running", f"worker=w\npid={os.getpid()}\nstarted=2026-11-05 10:00:00\n")
+        busy_v = self.task("C", "running", f"worker=v\npid={os.getpid()}\nstarted=2026-11-05 10:00:00\n")
+        t2 = self.task("D")
+        p = self.launch(t2, worker="w,v")
+        self.wait_status(t2, "queued, w runs 1 of 1, v runs 1 of 1")
+        self.assertEqual(M.queue_head(self.cfg, "v"), [os.path.realpath(t2)])
+        (busy_v / "status").write_text("done\n")
+        self.assertEqual(p.wait(timeout=20), 0)
+        self.assertEqual(M.read_meta(str(t2))["worker"], "v")
+
+    def test_fenced_workers_drop_out_of_the_list(self):
+        self.cfg["workers"]["v"] = dict(self.cfg["workers"]["w"])
+        self.cfg["only"] = {"w": ["/nowhere/*"]}
+        t = self.task("A")
+        self.assertEqual(M.run(self.cfg, "w,v", str(t), str(self.d)), 0)
+        self.assertEqual(M.read_meta(str(t))["worker"], "v")
+        self.cfg["only"]["v"] = ["/nowhere/*"]
+        t2 = self.task("B")
+        self.assertEqual(M.run(self.cfg, "w,v", str(t2), str(self.d)), 3)
+        self.assertTrue((t2 / "status").read_text().startswith("failed: refused"))
 
     def test_cancel_stops_a_queued_task(self):
         self.task("B", "running", f"worker=w\npid={os.getpid()}\nstarted=2026-11-05 10:00:00\n")

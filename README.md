@@ -173,7 +173,7 @@ Check it with `python3 <plugin>/skills/muster/muster.py doctor` (one line per pr
 |---|---|---|
 | `routing` | picks workers in that order, falls back on quota errors | not checked |
 | `only` | never plans a fenced worker elsewhere | refuses outside its globs (exit 3) |
-| `caps` | spreads tasks | queues over the cap, starts each when a slot frees (priority, then launch order); counts live processes only |
+| `caps` | passes each task its whole worker list | queues while every listed worker is full, starts on the first to free a slot (priority, then launch order); counts live processes only |
 | `preamble` | adds the lines to every prompt | not checked |
 
 </details>
@@ -245,7 +245,7 @@ Yes. Configure only `claude` workers: Claude Code on another backend, or any CLI
 <details>
 <summary><b>Why is a task "failed: refused"?</b></summary>
 
-The runner stopped it before it started: exit 3 means the worker is fenced away from that repo (`only`). A worker at its parallel cap (`caps`) does not refuse; the task shows `queued` until a slot frees.
+The runner stopped it before it started: exit 3 means every worker it was given is fenced away from that repo (`only`). A worker at its parallel cap (`caps`) does not refuse; the task shows `queued` until a slot frees.
 
 </details>
 
