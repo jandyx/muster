@@ -15,6 +15,13 @@ const notifiedAtom = atom({ plugin: 'muster', key: 'notified' } as const, [], { 
 
 const isRunning = (t: Task) => t.status === 'running'
 const isFinished = (t: Task) => t.status === 'done' || t.status.startsWith('failed')
+// Pane sections inside a run, in display order; a task falls into the first whose test it passes.
+const SECTIONS: [string, string | undefined, (t: Task) => boolean][] = [
+  ['Running', 'yellow', isRunning],
+  ['Failed', 'red', t => t.status.startsWith('failed')],
+  ['Done', 'green', t => t.status === 'done'],
+  ['Other', undefined, () => true],
+]
 const mark = (t: Task) => (t.status === 'done' ? '✓' : isRunning(t) ? '…' : t.status.startsWith('failed') ? '✗' : '?')
 
 // meta holds local "YYYY-MM-DD HH:MM:SS" from run-worker.sh
@@ -377,7 +384,10 @@ export const register: Register = on => {
                 return line === null ? null : <Text dimColor>{'    '}{Worker(w)}: {line}</Text>
               })}
             {!isFolded(run) &&
-              run.tasks.map(t => (
+              SECTIONS.flatMap(([label, color], i) => {
+                const tasks = run.tasks.filter(t => SECTIONS.findIndex(([, , test]) => test(t)) === i)
+                if (tasks.length === 0) return []
+                return [<Box marginTop={1}><Text bold color={color}>{'  '}{label} · {tasks.length}</Text></Box>, ...tasks.map(t => (
                 <Box flexDirection="column" marginTop={1}>
                   <Text color={t.status === 'done' ? 'green' : isRunning(t) ? 'yellow' : t.status.startsWith('failed') ? 'red' : undefined}>
                     {'  '}{mark(t)} {t.title}
@@ -421,7 +431,8 @@ export const register: Register = on => {
                       </Text>
                     ))}
                 </Box>
-              ))}
+              ))]
+              })}
           </Box>
         ))}
       </Box>
