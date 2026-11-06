@@ -9,7 +9,8 @@ const POLL_MS = 5000
 
 // Change a tag when its value's fields change, so a reload declines old values.
 const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-6' })
-// Per-run fold the person chose; a run without an entry folds once nothing in it runs.
+// Fold the person chose, per run (`<run>`) and per status section (`<run>/<label>`). A run without an entry
+// folds once nothing in it runs; a section without one stays open.
 const foldsAtom = atom({ plugin: 'muster', key: 'folds' } as const, {}, { shape: 'folds-1' })
 const notifiedAtom = atom({ plugin: 'muster', key: 'notified' } as const, [], { shape: 'notified-1' })
 
@@ -20,7 +21,8 @@ const SECTIONS: [string, string | undefined, (t: Task) => boolean][] = [
   ['Running', 'yellow', isRunning],
   ['Failed', 'red', t => t.status.startsWith('failed')],
   ['Done', 'green', t => t.status === 'done'],
-  ['Other', undefined, () => true],
+  // Status still empty: the task folder exists but its runner has not started yet.
+  ['Pending', undefined, () => true],
 ]
 const mark = (t: Task) => (t.status === 'done' ? '✓' : isRunning(t) ? '…' : t.status.startsWith('failed') ? '✗' : '?')
 
@@ -341,8 +343,8 @@ export const register: Register = on => {
     }
     const folds = await read($, foldsAtom)
     const isFolded = (run: Run) => folds[run.name] ?? !run.tasks.some(isRunning)
-    const setAll = (folded: boolean) => () =>
-      void update($, foldsAtom, old => ({ ...old, ...Object.fromEntries(runs.map(r => [r.name, folded])) }))
+    const keys = runs.flatMap(r => [r.name, ...SECTIONS.map(([label]) => `${r.name}/${label}`)])
+    const setAll = (folded: boolean) => () => void update($, foldsAtom, old => ({ ...old, ...Object.fromEntries(keys.map(k => [k, folded])) }))
     const toggle = (run: Run) => () => void update($, foldsAtom, old => ({ ...old, [run.name]: !isFolded(run) }))
     const now = await $.clock.now()
     // Room for a detail line: the body less its 4-cell indent and the 2-cell marker.
@@ -369,7 +371,7 @@ export const register: Register = on => {
           <Button key="expand-all" hotkey="e" plain onPress={setAll(false)}>Expand all</Button>
           <Button key="collapse-all" hotkey="c" plain onPress={setAll(true)}>Collapse all</Button>
         </Box>
-        <Text dimColor>{e.props.isFocused ? '↑↓ scroll · Enter on a run folds it' : 'Click or ctrl+x tab here to scroll and fold'}</Text>
+        <Text dimColor>{e.props.isFocused ? '↑↓ scroll · Enter on a run or section folds it' : 'Click or ctrl+x tab here to scroll and fold'}</Text>
         <Text> </Text>
         {runs.map(run => (
           <Box flexDirection="column" marginBottom={1}>
@@ -387,13 +389,22 @@ export const register: Register = on => {
               SECTIONS.flatMap(([label, color], i) => {
                 const tasks = run.tasks.filter(t => SECTIONS.findIndex(([, , test]) => test(t)) === i)
                 if (tasks.length === 0) return []
-                return [<Box marginTop={1}><Text bold color={color}>{'  '}{label} · {tasks.length}</Text></Box>, ...tasks.map(t => (
+                const key = `${run.name}/${label}`
+                const header = (
+                  <Box marginTop={1}>
+                    <Button key={`section:${key}`} plain onPress={() => void update($, foldsAtom, old => ({ ...old, [key]: !old[key] }))}>
+                      <Text bold color={color}>{'  '}{folds[key] ? '▸' : '▾'} {label} · {tasks.length}</Text>
+                    </Button>
+                  </Box>
+                )
+                if (folds[key]) return [header]
+                return [header, ...tasks.map(t => (
                 <Box flexDirection="column" marginTop={1}>
                   <Text color={t.status === 'done' ? 'green' : isRunning(t) ? 'yellow' : t.status.startsWith('failed') ? 'red' : undefined}>
                     {'  '}{mark(t)} {t.title}
                   </Text>
                   <Text dimColor>
-                    {'    '}{t.id} · {Worker(t.worker)} · {t.status} · {fmtElapsed((t.finishedMs || now) - t.startedMs)}{t.branch ? ` · ⎇ ${t.branch}` : ''}
+                    {'    '}{t.id} · {Worker(t.worker)} · {t.status}{t.startedMs > 0 ? ` · ${fmtElapsed((t.finishedMs || now) - t.startedMs)}` : ''}{t.branch ? ` · ⎇ ${t.branch}` : ''}
                   </Text>
                   {t.usage !== null && (
                     <Text dimColor>

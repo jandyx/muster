@@ -21,6 +21,7 @@ const files: Record<string, string> = {
   [`${R}/20261105-1130-x/L/status`]: 'running\n',
   [`${R}/20261105-1130-x/L/meta`]: 'worker=codex-a\ntype=codex\ncwd=/x\nsession=S1\npid=4242\nstarted=2026-11-05 11:30:00\n',
   [`${R}/20261105-1130-x/L/prompt.md`]: '# Lost task\n',
+  [`${R}/20261105-1130-x/P/prompt.md`]: '# Queued task\n',
   [`${R}/20261105-1130-x/B/status`]: 'running\n',
   [`${R}/20261105-1130-x/B/meta`]: 'worker=deepseek\ntype=claude\ncwd=/x\nsession=S1\nstarted=2026-11-05 11:30:00\n',
 }
@@ -36,7 +37,7 @@ test('the pane shows each task of the newest run', async ($, on) => {
   on('env.get', (_, e: any) => ({ value: e.name === 'HOME' ? '/h' : 'S1' }))
   on('fs.exists', () => ({ value: true }))
   on('fs.list', (_, e: any) => ({
-    value: e.path === R ? [dir('20261101-0900-old'), dir('20261104-0800-foreign'), dir('20261105-1130-x')] : e.path.endsWith('-x') ? [dir('A'), dir('B'), dir('G'), dir('L')] : e.path.endsWith('-old') ? [dir('Z')] : e.path.endsWith('-foreign') ? [dir('F')] : [],
+    value: e.path === R ? [dir('20261101-0900-old'), dir('20261104-0800-foreign'), dir('20261105-1130-x')] : e.path.endsWith('-x') ? [dir('A'), dir('B'), dir('G'), dir('L'), dir('P')] : e.path.endsWith('-old') ? [dir('Z')] : e.path.endsWith('-foreign') ? [dir('F')] : [],
   }))
   on('fs.read', (_, e: any) => (e.path in files ? { value: files[e.path] } : { deny: 'ENOENT' }))
   on('clock.every', () => ({ value: undefined }))
@@ -70,9 +71,17 @@ test('the pane shows each task of the newest run', async ($, on) => {
     expect((await ui.find({ type: 'Text', text: /Read \/x\/README/ }))?.text).toMatch(/\$ Read \/x\/README\.md/)
     expect((await ui.find({ type: 'Text', text: /Lost task/ }))?.text).toMatch(/✗ Lost task/)
     expect((await ui.find({ type: 'Text', text: /L · / }))?.text).toMatch(/failed: lost/)
-    // Tasks sit under status sections: running first, then failed, then done.
-    const heads = (await ui.findAll({ type: 'Text' })).map((r: any) => r.text as string).filter(r => /^\s*(Running|Failed|Done|Other) · \d+$/.test(r))
-    expect(heads.slice(0, 3).map(h => h.trim())).toEqual(['Running · 2', 'Failed · 1', 'Done · 1'])
+    // Tasks sit under status sections: running first, then failed, done, and not yet started.
+    const heads = (await ui.findAll({ type: 'Button' })).map((r: any) => r.text as string).filter(r => /^\s*▾ \w+ · \d+$/.test(r))
+    expect(heads.slice(0, 4).map(h => h.trim())).toEqual(['▾ Running · 2', '▾ Failed · 1', '▾ Done · 1', '▾ Pending · 1'])
+    // A task with no meta yet has no start time, so no elapsed time is shown.
+    expect((await ui.find({ type: 'Text', text: /P · / }))?.text).toMatch(/P · \? · pending$/)
+    // A section folds on its own; the rest of the run stays.
+    await ui.press({ key: 'section:20261105-1130-x/Done' })
+    expect(await ui.find({ type: 'Text', text: /retry logic/ })).toBeUndefined()
+    expect((await ui.find({ type: 'Button', text: /Done · 1/ }))?.text).toMatch(/▸ Done · 1/)
+    expect((await ui.find({ type: 'Text', text: /Lost task/ }))?.text).toMatch(/✗ Lost task/)
+    await ui.press({ key: 'expand-all' })
     // Folding the newest run hides its rows; expanding all brings them back.
     await ui.press({ key: 'run:20261105-1130-x' })
     expect(await ui.find({ type: 'Text', text: /retry logic/ })).toBeUndefined()
