@@ -6,6 +6,9 @@ export type Task = {
   session: string
   status: string
   startedMs: number
+  queuedMs: number
+  after: string[]
+  priority: number
   finishedMs: number
   summary: string
   usage: Usage | null

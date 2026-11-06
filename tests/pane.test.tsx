@@ -71,11 +71,12 @@ test('the pane shows each task of the newest run', async ($, on) => {
     expect((await ui.find({ type: 'Text', text: /Read \/x\/README/ }))?.text).toMatch(/\$ Read \/x\/README\.md/)
     expect((await ui.find({ type: 'Text', text: /Lost task/ }))?.text).toMatch(/✗ Lost task/)
     expect((await ui.find({ type: 'Text', text: /L · / }))?.text).toMatch(/failed: lost/)
-    // Tasks sit under status sections: running first, then failed, done, and not yet started.
+    // Tasks sit under status sections: running first, then not yet started, failed, done.
     const heads = (await ui.findAll({ type: 'Button' })).map((r: any) => r.text as string).filter(r => /^\s*▾ \w+ · \d+$/.test(r))
-    expect(heads.slice(0, 4).map(h => h.trim())).toEqual(['▾ Running · 2', '▾ Failed · 1', '▾ Done · 1', '▾ Pending · 1'])
+    expect(heads.slice(0, 4).map(h => h.trim())).toEqual(['▾ Running · 2', '▾ Queued · 1', '▾ Failed · 1', '▾ Done · 1'])
     // A task with no meta yet has no start time, so no elapsed time is shown.
     expect((await ui.find({ type: 'Text', text: /P · / }))?.text).toMatch(/P · \? · pending$/)
+    expect((await ui.find({ type: 'Text', text: /○/ }))?.text).toMatch(/○ /)
     // A section folds on its own; the rest of the run stays.
     await ui.press({ key: 'section:20261105-1130-x/Done' })
     expect(await ui.find({ type: 'Text', text: /retry logic/ })).toBeUndefined()
@@ -238,6 +239,39 @@ test('a refused task shows as failed with its reason', async ($, on) => {
   expect((await ui.find({ type: 'Text', text: /over the cap/ }))?.text).toMatch(/✗ over the cap/)
   expect((await ui.find({ type: 'Text', text: /refused/ }))?.text).toMatch(/3 of 3 tasks/)
   await ui.unmount()
+})
+
+test('queued tasks show their dependencies and priority, in the order they will start', async ($, on) => {
+  // Queued tasks have no `started` yet, so no elapsed time.
+  const q = (status: string, extra: string) => ({ status: `${status}\n`, meta: `worker=w1\ntype=codex\nsession=S1\npid=0\n${extra}` })
+  await mountWith(
+    $,
+    on,
+    tree('/h/.muster/runs', {
+      '20261105-1000-q': {
+        A: { ...task('running', 'pid=0\n'), title: 'base work' },
+        B: { ...q('queued, waiting for A', 'queued=2026-11-05 10:00:01\nafter=A\npriority=9\n'), title: 'needs base' },
+        C: { ...q('queued, w1 runs 3 of 3', 'queued=2026-11-05 10:00:05\n'), title: 'late plain' },
+        D: { ...q('queued, w1 runs 3 of 3', 'queued=2026-11-05 10:00:09\npriority=5\n'), title: 'urgent' },
+        E: { ...q('queued, w1 runs 3 of 3', 'queued=2026-11-05 10:00:02\n'), title: 'early plain' },
+        F: { ...task('canceled: superseded by G'), title: 'old approach' },
+      },
+    }),
+  )
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const titles = (await ui.findAll({ type: 'Text' })).map((r: any) => r.text as string).filter(t => /^\s*○ /.test(t)).map(t => t.trim())
+  expect(titles).toEqual(['○ urgent', '○ early plain', '○ late plain', '○ needs base'])
+  expect((await ui.find({ type: 'Text', text: /B · / }))?.text).toMatch(/B · w1 · queued, waiting for A · after A · priority 9$/)
+  expect((await ui.find({ type: 'Text', text: /D · / }))?.text).toMatch(/D · w1 · queued #1, w1 runs 3 of 3 · priority 5$/)
+  expect((await ui.find({ type: 'Text', text: /C · / }))?.text).toMatch(/C · w1 · queued #3, /)
+  expect((await ui.find({ type: 'Text', text: /old approach/ }))?.text).toMatch(/⊘ old approach/)
+  expect((await ui.find({ type: 'Button', text: /Canceled/ }))?.text).toMatch(/Canceled · 1/)
+  expect((await ui.find({ type: 'Button', text: /20261105-1000-q/ }))?.text).toMatch(/1 running · 0 done · 0 failed · 4 queued · 1 canceled/)
+  await ui.unmount()
+  const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
+  expect((await band.find({ type: 'Text', text: /^○/ }))?.text).toMatch(/○4/)
+  expect((await band.find({ type: 'Text', text: /^⊘/ }))?.text).toMatch(/⊘1/)
+  await band.unmount()
 })
 
 test('the band stays out of the way when nothing runs', async ($, on) => {

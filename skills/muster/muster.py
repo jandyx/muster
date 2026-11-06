@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Muster worker runner: run one task on one configured worker and record what happened.
 
-    muster.py run <worker> <task-dir> <cwd>   run prompt.md, write status/meta/log/result/usage
+    muster.py run <worker> <task-dir> <cwd> [--after A,B] [--priority N]
+                                              queue until deps are done and a slot frees, then run prompt.md
+    muster.py cancel <task-dir> [reason]      stop a queued or running task; status becomes "canceled: reason"
     muster.py usage <task-dir>                (re)compute <task-dir>/usage for a finished task
     muster.py workers                         list configured workers
     muster.py detect                          JSON: Codex homes and claude-like CLIs found on this machine
@@ -21,6 +23,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 
 HOME = os.path.expanduser("~")
 CONFIG = os.path.expanduser(os.environ.get("MUSTER_CONFIG", "~/.muster/config.json"))
@@ -234,6 +237,49 @@ def running_on(cfg, name):
     return n
 
 
+def live(m, status):
+    # A queued or running task whose runner process is still there.
+    return status.startswith(("queued", "running")) and "finished" not in m and pid_alive(int(m.get("pid", "0") or 0))
+
+
+def dep_state(task, after):
+    """'ready' when every task in `after` (sibling ids) is done, 'wait: …' while one is not, 'broken: …' when one never will be."""
+    waiting = []
+    for dep in after:
+        d = os.path.join(os.path.dirname(task), dep)
+        try:
+            status = read_text(os.path.join(d, "status")).strip()
+        except OSError:
+            status = ""
+        if status == "done":
+            continue
+        if status.startswith(("failed", "canceled")):
+            return f"broken: {dep} {status.split(':')[0]}"
+        if status.startswith(("queued", "running")) and not live(read_meta(d), status):
+            return f"broken: {dep} lost"
+        waiting.append(dep)
+    return f"wait: {', '.join(waiting)}" if waiting else "ready"
+
+
+def queue_head(cfg, name):
+    # Queued tasks of this worker whose deps are done, in start order: higher priority first, then first queued.
+    runs = expand(cfg.get("runsDir", "~/.muster/runs"))
+    ready = []
+    for meta in glob.glob(os.path.join(runs, "*", "*", "meta")):
+        task = os.path.dirname(meta)
+        m = read_meta(task)
+        if m.get("worker") != name:
+            continue
+        try:
+            status = read_text(os.path.join(task, "status")).strip()
+        except OSError:
+            continue
+        after = [a for a in m.get("after", "").split(",") if a]
+        if status.startswith("queued") and live(m, status) and dep_state(task, after) == "ready":
+            ready.append((-int(m.get("priority", "0") or 0), m.get("queued", ""), os.path.realpath(task)))
+    return [t for _, _, t in sorted(ready)]
+
+
 def refuse(task, why, code):
     with open(os.path.join(task, "status"), "w") as f:
         f.write(f"failed: refused, {why}\n")
@@ -316,54 +362,118 @@ def doctor(cfg):
 
 # ---------- running ----------
 
+QUEUE_POLL_S = 2.0
+_child = None  # the worker process, once started; one task per runner process
+
+
 def finish(task, rc, status):
     append_meta(task, finished=now(), exit=rc)
     with open(os.path.join(task, "status"), "w") as f:
         f.write(status + "\n")
 
 
-def supervise(task, cmd, **popen):
-    """Run the worker; if the runner itself is told to stop, stop the worker and still record a final status."""
-    child = subprocess.Popen(cmd, **popen)
+def write_status(task, status):
+    with open(os.path.join(task, "status"), "w") as f:
+        f.write(status + "\n")
 
+
+def on_stop(task):
+    """If the runner is told to stop, queued or running, stop the worker and still record a final status:
+    `canceled: …` when `muster.py cancel` asked for it, `failed: interrupted` otherwise."""
     def stop(signum, _frame):
-        child.terminate()
-        try:
-            child.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            child.kill()
-        name = signal.Signals(signum).name
-        finish(task, 128 + signum, f"failed: interrupted ({name})")
+        if _child is not None:
+            _child.terminate()
+            try:
+                _child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                _child.kill()
+        reason = read_meta(task).get("canceled")
+        if reason is None:
+            finish(task, 128 + signum, f"failed: interrupted ({signal.Signals(signum).name})")
+        else:
+            finish(task, 128 + signum, f"canceled: {reason}" if reason else "canceled")
         sys.exit(128 + signum)
 
     for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(sig, stop)
-    return child.wait()
 
-def run(cfg, name, task, cwd):
+
+def supervise(task, cmd, **popen):
+    global _child
+    _child = subprocess.Popen(cmd, **popen)
+    return _child.wait()
+
+
+def cancel(task, reason=""):
+    """Cancel a task that has not finished: signal its runner, or mark it when no runner is there."""
+    m = read_meta(task)
+    if "finished" in m:
+        print(f"muster: {task} already finished", file=sys.stderr)
+        return 1
+    try:
+        status = read_text(os.path.join(task, "status")).strip()
+    except OSError:
+        status = ""
+    append_meta(task, canceled=reason)
+    if live(m, status):
+        os.kill(int(m["pid"]), signal.SIGTERM)
+        for _ in range(150):  # the runner gives the worker 10s to stop before it kills it
+            if "finished" in read_meta(task):
+                return 0
+            time.sleep(0.1)
+    finish(task, 0, f"canceled: {reason}" if reason else "canceled")
+    return 0
+
+
+def run(cfg, name, task, cwd, after=(), priority=0):
     worker = cfg["workers"].get(name)
     if worker is None:
         sys.exit(f"muster: unknown worker {name!r} (known: {', '.join(cfg['workers'])})")
     prompt = os.path.join(task, "prompt.md")
     if not os.path.isfile(prompt) or not os.path.isdir(cwd):
         sys.exit(f"muster: need {prompt} and an existing cwd {cwd}")
+    for dep in after:
+        if not os.path.isdir(os.path.join(os.path.dirname(task), dep)):
+            sys.exit(f"muster: --after {dep}: no task {dep} next to {task}")
     kind = worker["type"]
     if not allowed_here(cfg, name, cwd):
         return refuse(task, f"worker {name} is limited to {cfg['only'][name]} by `only`; {cwd} is outside", 3)
+    try:
+        if read_text(os.path.join(task, "status")).startswith("canceled"):
+            return 0  # canceled before its runner started
+    except OSError:
+        pass
     cap = int((cfg.get("caps") or {}).get(name, (cfg.get("caps") or {}).get(kind, DEFAULT_CAPS.get(kind, 3))))
     runs = expand(cfg.get("runsDir", "~/.muster/runs"))
     os.makedirs(runs, exist_ok=True)
-    # The lock makes count-then-claim atomic, so tasks launched together cannot all slip under the cap.
-    with open(os.path.join(runs, ".lock"), "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        busy = running_on(cfg, name)
-        if busy >= cap:
-            return refuse(task, f"worker {name} already runs {busy} of {cap} tasks (caps); launch this one when a slot frees", 4)
-        with open(os.path.join(task, "meta"), "w") as f:
-            f.write(f"worker={name}\ntype={kind}\ncwd={cwd}\nsession={os.environ.get('CLAUDE_CODE_SESSION_ID', '')}\n"
-                    f"pid={os.getpid()}\nstarted={now()}\n")
-        with open(os.path.join(task, "status"), "w") as f:
-            f.write("running\n")
+    with open(os.path.join(task, "meta"), "w") as f:
+        f.write(f"worker={name}\ntype={kind}\ncwd={cwd}\nsession={os.environ.get('CLAUDE_CODE_SESSION_ID', '')}\n"
+                f"pid={os.getpid()}\nqueued={now()}\nafter={','.join(after)}\npriority={priority}\n")
+    write_status(task, "queued")
+    on_stop(task)
+    shown = "queued"
+    while True:
+        # The lock makes count-then-claim atomic, so queued tasks cannot all slip under the cap at once.
+        with open(os.path.join(runs, ".lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            deps = dep_state(task, after)
+            if deps.startswith("broken"):
+                finish(task, 5, f"canceled: {deps[8:]}")
+                return 5
+            if deps == "ready":
+                busy = running_on(cfg, name)
+                head = queue_head(cfg, name)
+                if busy < cap and os.path.realpath(task) in head[:cap - busy]:
+                    append_meta(task, started=now())
+                    write_status(task, "running")
+                    break
+                status = f"queued, {name} runs {busy} of {cap}"
+            else:
+                status = f"queued, waiting for {deps[6:]}"
+            if status != shown:
+                write_status(task, status)
+                shown = status
+        time.sleep(QUEUE_POLL_S)
 
     env = dict(os.environ)
     extra = [expand(a) for a in worker.get("args", [])]
@@ -400,8 +510,14 @@ def main():
         probs = doctor(cfg)
         print("\n".join(probs) if probs else f"ok: {len(cfg['workers'])} workers, config {CONFIG}")
         sys.exit(1 if probs else 0)
-    if cmd == "run" and len(args) == 3:
-        sys.exit(run(cfg, *args))
+    if cmd == "run" and len(args) >= 3:
+        opts = dict(zip(args[3::2], args[4::2]))
+        if len(args) % 2 == 0 or set(opts) - {"--after", "--priority"}:
+            sys.exit(__doc__)
+        after = [a for a in opts.get("--after", "").split(",") if a]
+        sys.exit(run(cfg, *args[:3], after=after, priority=int(opts.get("--priority", "0"))))
+    if cmd == "cancel" and len(args) in (1, 2):
+        sys.exit(cancel(args[0], args[1] if len(args) == 2 else ""))
     if cmd == "usage" and len(args) == 1:
         print(json.dumps(write_usage(args[0], cfg)))
         return

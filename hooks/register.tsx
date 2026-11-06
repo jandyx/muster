@@ -8,23 +8,36 @@ const TITLE = 'Muster'
 const POLL_MS = 5000
 
 // Change a tag when its value's fields change, so a reload declines old values.
-const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-6' })
+const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-7' })
 // Fold the person chose, per run (`<run>`) and per status section (`<run>/<label>`). A run without an entry
 // folds once nothing in it runs; a section without one stays open.
 const foldsAtom = atom({ plugin: 'muster', key: 'folds' } as const, {}, { shape: 'folds-1' })
 const notifiedAtom = atom({ plugin: 'muster', key: 'notified' } as const, [], { shape: 'notified-1' })
 
 const isRunning = (t: Task) => t.status === 'running'
-const isFinished = (t: Task) => t.status === 'done' || t.status.startsWith('failed')
+const isFailed = (t: Task) => t.status.startsWith('failed')
+const isCanceled = (t: Task) => t.status.startsWith('canceled')
+const isFinished = (t: Task) => t.status === 'done' || isFailed(t) || isCanceled(t)
+// Queued by the runner (waiting for a slot or a dependency), or `pending`: the folder exists, no runner yet.
+const isQueued = (t: Task) => !isRunning(t) && !isFinished(t)
+const isActive = (t: Task) => isRunning(t) || isQueued(t)
+// Queued tasks in the order they will start: ready before waiting on a dependency, then higher priority,
+// then first queued; tasks without a runner yet go last.
+const startOrder = (a: Task, b: Task) => {
+  const rank = (t: Task) => [t.status === 'pending' ? 2 : t.status.includes('waiting for') ? 1 : 0, -t.priority, t.queuedMs]
+  const [x, y] = [rank(a), rank(b)]
+  return x[0]! - y[0]! || x[1]! - y[1]! || x[2]! - y[2]!
+}
 // Pane sections inside a run, in display order; a task falls into the first whose test it passes.
 const SECTIONS: [string, string | undefined, (t: Task) => boolean][] = [
   ['Running', 'yellow', isRunning],
-  ['Failed', 'red', t => t.status.startsWith('failed')],
-  ['Done', 'green', t => t.status === 'done'],
-  // Status still empty: the task folder exists but its runner has not started yet.
-  ['Pending', undefined, () => true],
+  ['Queued', 'cyan', isQueued],
+  ['Failed', 'red', isFailed],
+  ['Canceled', undefined, isCanceled],
+  ['Done', 'green', () => true],
 ]
-const mark = (t: Task) => (t.status === 'done' ? '✓' : isRunning(t) ? '…' : t.status.startsWith('failed') ? '✗' : '?')
+const mark = (t: Task) => (t.status === 'done' ? '✓' : isRunning(t) ? '…' : isFailed(t) ? '✗' : isCanceled(t) ? '⊘' : '○')
+const markColor = (t: Task) => (t.status === 'done' ? 'green' : isRunning(t) ? 'yellow' : isFailed(t) ? 'red' : isQueued(t) ? 'cyan' : undefined)
 
 // meta holds local "YYYY-MM-DD HH:MM:SS" from run-worker.sh
 const parseTime = (s: string | undefined) => {
@@ -219,7 +232,7 @@ export const register: Register = on => {
           // behind; muster.py records its pid, so a dead pid means the task is lost, not running.
           const pid = Number(kv.pid ?? 0)
           const isOrphan =
-            status.trim() === 'running' &&
+            /^(running|queued)/.test(status.trim()) &&
             pid > 0 &&
             (await $.process.run(['kill', '-0', String(pid)], { timeoutMs: 2000 }).then(r => r.exitCode !== 0, () => false))
           const isLive = status.trim() === 'running' && !isOrphan
@@ -241,6 +254,9 @@ export const register: Register = on => {
             worker: kv.worker ?? '?',
             status: isOrphan ? 'failed: lost (runner exited without a final status)' : status.trim() || 'pending',
             startedMs: parseTime(kv.started),
+            queuedMs: parseTime(kv.queued),
+            after: (kv.after ?? '').split(',').filter(Boolean),
+            priority: Number(kv.priority ?? 0) || 0,
             finishedMs: parseTime(kv.finished),
             summary: tidy.slice(0, 400),
             usage,
@@ -301,7 +317,7 @@ export const register: Register = on => {
         if (fresh.length) await update($, notifiedAtom, old => [...old, ...fresh.map(({ r, t }) => key(r, t))].slice(-500))
       }
 
-      const active = shown.filter(r => r.tasks.some(isRunning))
+      const active = shown.filter(r => r.tasks.some(isActive))
       const unseen = active.filter(r => !opened.has(r.name))
       if (unseen.length) {
         for (const r of unseen) opened.add(r.name)
@@ -342,7 +358,7 @@ export const register: Register = on => {
       )
     }
     const folds = await read($, foldsAtom)
-    const isFolded = (run: Run) => folds[run.name] ?? !run.tasks.some(isRunning)
+    const isFolded = (run: Run) => folds[run.name] ?? !run.tasks.some(isActive)
     const keys = runs.flatMap(r => [r.name, ...SECTIONS.map(([label]) => `${r.name}/${label}`)])
     const setAll = (folded: boolean) => () => void update($, foldsAtom, old => ({ ...old, ...Object.fromEntries(keys.map(k => [k, folded])) }))
     const toggle = (run: Run) => () => void update($, foldsAtom, old => ({ ...old, [run.name]: !isFolded(run) }))
@@ -363,8 +379,11 @@ export const register: Register = on => {
         </Text>
       )
     }
-    const count = (run: Run) =>
-      `${run.tasks.filter(isRunning).length} running · ${run.tasks.filter(t => t.status === 'done').length} done · ${run.tasks.filter(t => t.status.startsWith('failed')).length} failed`
+    const count = (run: Run) => {
+      const n = (test: (t: Task) => boolean) => run.tasks.filter(test).length
+      const extra = [[n(isQueued), 'queued'], [n(isCanceled), 'canceled']].filter(([k]) => k).map(([k, l]) => ` · ${k} ${l}`).join('')
+      return `${n(isRunning)} running · ${n(t => t.status === 'done')} done · ${n(isFailed)} failed${extra}`
+    }
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" gap={2}>
@@ -388,6 +407,16 @@ export const register: Register = on => {
             {!isFolded(run) &&
               SECTIONS.flatMap(([label, color], i) => {
                 const tasks = run.tasks.filter(t => SECTIONS.findIndex(([, , test]) => test(t)) === i)
+                if (label === 'Queued') tasks.sort(startOrder)
+                // Place in its worker's line, for tasks only a slot holds back (not a dependency, not unlaunched).
+                const place = new Map<Task, number>()
+                const perWorker = new Map<string, number>()
+                for (const t of tasks) {
+                  if (!/^queued(?!, waiting for)/.test(t.status)) continue
+                  const n = (perWorker.get(t.worker) ?? 0) + 1
+                  perWorker.set(t.worker, n)
+                  place.set(t, n)
+                }
                 if (tasks.length === 0) return []
                 const key = `${run.name}/${label}`
                 const header = (
@@ -400,11 +429,11 @@ export const register: Register = on => {
                 if (folds[key]) return [header]
                 return [header, ...tasks.map(t => (
                 <Box flexDirection="column" marginTop={1}>
-                  <Text color={t.status === 'done' ? 'green' : isRunning(t) ? 'yellow' : t.status.startsWith('failed') ? 'red' : undefined}>
+                  <Text color={markColor(t)}>
                     {'  '}{mark(t)} {t.title}
                   </Text>
                   <Text dimColor>
-                    {'    '}{t.id} · {Worker(t.worker)} · {t.status}{t.startedMs > 0 ? ` · ${fmtElapsed((t.finishedMs || now) - t.startedMs)}` : ''}{t.branch ? ` · ⎇ ${t.branch}` : ''}
+                    {'    '}{t.id} · {Worker(t.worker)} · {place.has(t) ? t.status.replace(/^queued/, `queued #${place.get(t)}`) : t.status}{t.after.length > 0 ? ` · after ${t.after.join(', ')}` : ''}{t.priority !== 0 ? ` · priority ${t.priority}` : ''}{t.startedMs > 0 ? ` · ${fmtElapsed((t.finishedMs || now) - t.startedMs)}` : ''}{t.branch ? ` · ⎇ ${t.branch}` : ''}
                   </Text>
                   {t.usage !== null && (
                     <Text dimColor>
@@ -451,7 +480,7 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const active = (await read($, runsAtom)).filter(r => r.tasks.some(isRunning))
+    const active = (await read($, runsAtom)).filter(r => r.tasks.some(isActive))
     if (e.props.hasSurvey || active.length === 0) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
@@ -461,7 +490,9 @@ export const register: Register = on => {
         {active.map((r, i) => {
           // Only running tasks get a row; finished ones collapse to counts.
           const done = r.tasks.filter(t => t.status === 'done').length
-          const failed = r.tasks.filter(t => t.status.startsWith('failed')).length
+          const failed = r.tasks.filter(isFailed).length
+          const queued = r.tasks.filter(isQueued).length
+          const canceled = r.tasks.filter(isCanceled).length
           return (
             <Text>
               {i > 0 && <Text dimColor>| </Text>}
@@ -473,8 +504,10 @@ export const register: Register = on => {
                   <Text dimColor> {fmtElapsed(now - t.startedMs)}  </Text>
                 </Text>
               ))}
+              {queued > 0 && <Text color="cyan">○{queued} </Text>}
               {done > 0 && <Text color="green">✓{done} </Text>}
               {failed > 0 && <Text color="red">✗{failed} </Text>}
+              {canceled > 0 && <Text dimColor>⊘{canceled} </Text>}
             </Text>
           )
         })}
