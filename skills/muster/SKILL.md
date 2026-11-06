@@ -20,7 +20,7 @@ Read `~/.muster/config.json` (or the path in `MUSTER_CONFIG`) at the start of ev
 - `preamble`: extra lines appended to the rules block of every prompt.
 - The user's explicit choice in the request always wins over the config.
 
-Assigning parallel tasks: in priority order, one per worker first. With more tasks than workers, give each worker more at once, up to its cap; launch the rest anyway, they queue in the runner and start in order. When a worker fails on quota or rate limit (see `log.txt`), rerun that task on the next worker in its list.
+Assigning parallel tasks: pass each task the whole worker list `routing` gives its cwd, first choice first (`run codex-a,codex-b …`), minus workers the user ruled out. The runner starts it on the first listed worker with a free slot, and while every one is full it waits on all of them, so a task never sits behind one busy worker while another is idle. Launch every task at once; do not pick one worker per task to spread the load. When a worker fails on quota or rate limit (see `log.txt`), rerun that task without that worker in its list.
 
 Metered workers on a peak-priced model (see `prices.json`, e.g. DeepSeek: weekdays 01:00–04:00 and 06:00–10:00 UTC cost double): when a large, non-urgent batch would run in peak hours, say so in the plan and offer to run it later. The user decides.
 
@@ -42,7 +42,7 @@ Metered workers on a peak-priced model (see `prices.json`, e.g. DeepSeek: weekda
 
    Then each line of the config's `preamble`, and any repo rule from the user's own instructions that applies to this cwd (workers do not see Claude's CLAUDE.md or memory).
 4. **Launch.** For each task, call Bash with `run_in_background: true`:
-   `python3 $MUSTER run <worker> <task-dir> <cwd> [--after A,B] [--priority N]`
+   `python3 $MUSTER run <worker[,worker…]> <task-dir> <cwd> [--after A,B] [--priority N]`
    Launch all tasks in the same message, dependent ones too. `--after A,B`: wait until sibling tasks A and B (same run dir) are `done`; if one fails or is canceled, this task is canceled (exit 5) without running. `--priority N` (default 0): on a full worker, higher N starts first; equal N start in launch order. The runner writes `status` (queued, … / running / done / failed: … / canceled: …), `meta`, `log.txt` (codex) or `stream.jsonl` (claude), `result.md` and `usage`.
    **Cancel** a task that is no longer needed (superseded, out of scope) with `python3 $MUSTER cancel <task-dir> "<reason>"`; never write `status` by hand. It stops the worker if it runs and records `canceled: <reason>`, which the pane and report do not count as a failure.
 5. **Wait.** Background tasks notify on exit, so do not poll. If the user asks in the meantime, read each `status` and report; the Muster pane (`/muster-panel`) shows live progress.

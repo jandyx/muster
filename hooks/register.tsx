@@ -251,7 +251,8 @@ export const register: Register = on => {
             branch,
             session: kv.session ?? '',
             title: title.slice(0, 60) || id,
-            worker: kv.worker ?? '?',
+            // A queued task has no `worker` yet, only the `workers` it may start on.
+            worker: kv.worker ?? (kv.workers ? kv.workers.split(',').join('|') : '?'),
             status: isOrphan ? 'failed: lost (runner exited without a final status)' : status.trim() || 'pending',
             startedMs: parseTime(kv.started),
             queuedMs: parseTime(kv.queued),

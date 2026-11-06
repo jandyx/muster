@@ -254,22 +254,24 @@ test('queued tasks show their dependencies and priority, in the order they will 
         C: { ...q('queued, w1 runs 3 of 3', 'queued=2026-11-05 10:00:05\n'), title: 'late plain' },
         D: { ...q('queued, w1 runs 3 of 3', 'queued=2026-11-05 10:00:09\npriority=5\n'), title: 'urgent' },
         E: { ...q('queued, w1 runs 3 of 3', 'queued=2026-11-05 10:00:02\n'), title: 'early plain' },
+        H: { status: 'queued, w1 runs 3 of 3, w2 runs 1 of 1\n', meta: 'workers=w1,w2\nsession=S1\npid=0\nqueued=2026-11-05 10:00:20\n', title: 'either worker' },
         F: { ...task('canceled: superseded by G'), title: 'old approach' },
       },
     }),
   )
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const titles = (await ui.findAll({ type: 'Text' })).map((r: any) => r.text as string).filter(t => /^\s*○ /.test(t)).map(t => t.trim())
-  expect(titles).toEqual(['○ urgent', '○ early plain', '○ late plain', '○ needs base'])
+  expect(titles).toEqual(['○ urgent', '○ early plain', '○ late plain', '○ either worker', '○ needs base'])
+  expect((await ui.find({ type: 'Text', text: /H · / }))?.text).toMatch(/H · w1\|w2 · queued #1, w1 runs 3 of 3, w2 runs 1 of 1$/)
   expect((await ui.find({ type: 'Text', text: /B · / }))?.text).toMatch(/B · w1 · queued, waiting for A · after A · priority 9$/)
   expect((await ui.find({ type: 'Text', text: /D · / }))?.text).toMatch(/D · w1 · queued #1, w1 runs 3 of 3 · priority 5$/)
   expect((await ui.find({ type: 'Text', text: /C · / }))?.text).toMatch(/C · w1 · queued #3, /)
   expect((await ui.find({ type: 'Text', text: /old approach/ }))?.text).toMatch(/⊘ old approach/)
   expect((await ui.find({ type: 'Button', text: /Canceled/ }))?.text).toMatch(/Canceled · 1/)
-  expect((await ui.find({ type: 'Button', text: /20261105-1000-q/ }))?.text).toMatch(/1 running · 0 done · 0 failed · 4 queued · 1 canceled/)
+  expect((await ui.find({ type: 'Button', text: /20261105-1000-q/ }))?.text).toMatch(/1 running · 0 done · 0 failed · 5 queued · 1 canceled/)
   await ui.unmount()
   const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
-  expect((await band.find({ type: 'Text', text: /^○/ }))?.text).toMatch(/○4/)
+  expect((await band.find({ type: 'Text', text: /^○/ }))?.text).toMatch(/○5/)
   expect((await band.find({ type: 'Text', text: /^⊘/ }))?.text).toMatch(/⊘1/)
   await band.unmount()
 })
