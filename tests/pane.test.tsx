@@ -241,6 +241,22 @@ test('a refused task shows as failed with its reason', async ($, on) => {
   await ui.unmount()
 })
 
+test('a failed task with no result shows the error line from its log', async ($, on) => {
+  const t = tree('/h/.muster/runs', {
+    '20261105-1000-x': {
+      A: { ...task('failed: exit 101'), title: 'broke' },
+      B: { ...task('running', 'pid=0\n'), title: 'keeps the run open' },
+    },
+  })
+  t['/h/.muster/runs/20261105-1000-x/A/log.txt'] =
+    'exec\n/bin/zsh -lc "make test" in /x\n\n2026-11-09T03:01:13.414647Z ERROR codex_core::session: failed to record rollout items: thread-store internal error: No space left on device (os error 28)\n'
+  await mountWith($, on, t)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /broke/ }))?.text).toMatch(/✗ broke/)
+  expect((await ui.find({ type: 'Text', text: /ERROR codex_core/ }))?.text).toMatch(/^\s+↳ ERROR codex_core::session: failed to record/)
+  await ui.unmount()
+})
+
 test('queued tasks show their dependencies and priority, in the order they will start', async ($, on) => {
   // Queued tasks have no `started` yet, so no elapsed time.
   const q = (status: string, extra: string) => ({ status: `${status}\n`, meta: `worker=w1\ntype=codex\nsession=S1\npid=0\n${extra}` })

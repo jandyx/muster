@@ -11,6 +11,7 @@ export type Task = {
   priority: number
   finishedMs: number
   summary: string
+  reason: string
   usage: Usage | null
   progress: string
   lastCmd: string
