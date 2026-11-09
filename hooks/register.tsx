@@ -117,6 +117,21 @@ const parseStream = (stream: string) => {
   return { progress: progress.replace(/[`*#]/g, '').replace(/\s+/g, ' ').slice(0, 300), lastCmd: lastCmd.replace(/\s+/g, ' ').slice(0, 200) }
 }
 
+// Why a failed task died: the log's last line that looks like an error. A failed codex task leaves
+// result.md empty, so this is the only reason there is.
+const failureLine = (log: string) =>
+  (log
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l !== '' && !l.startsWith('hook:'))
+    .reverse()
+    .find(l => /error|fail|panic/i.test(l)) ?? ''
+  )
+    .replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z\s+/, '')
+    .replace(/[`*]/g, '')
+    .replace(/\s+/g, ' ')
+    .slice(0, 300)
+
 // Detail rows wrap to a few lines instead of one: enough to read, not enough for one task to fill the pane.
 const MAX_LINES = { progress: 3, command: 2, summary: 2 }
 // Terminal cells a character takes: East Asian wide and full-width forms take two.
@@ -246,6 +261,9 @@ export const register: Register = on => {
               ? parseStream(await readText(liveFile))
               : parseProgress(await readText(liveFile))
           const logMs = isLive ? ((await $.fs.stat(liveFile).catch(() => undefined))?.mtimeMs ?? 0) : 0
+          // result.md already says why when the worker wrote one; otherwise fall back to the log.
+          const failed = isOrphan || status.trim().startsWith('failed')
+          const reason = failed && tidy === '' ? failureLine(await readText(`${dir}/log.txt`)) : ''
           return {
             id,
             branch,
@@ -260,6 +278,7 @@ export const register: Register = on => {
             priority: Number(kv.priority ?? 0) || 0,
             finishedMs: parseTime(kv.finished),
             summary: tidy.slice(0, 400),
+            reason,
             usage,
             progress: live.progress,
             lastCmd: live.lastCmd,
@@ -436,6 +455,14 @@ export const register: Register = on => {
                   <Text dimColor>
                     {'    '}{t.id} · {Worker(t.worker)} · {place.has(t) ? t.status.replace(/^queued/, `queued #${place.get(t)}`) : t.status}{t.after.length > 0 ? ` · after ${t.after.join(', ')}` : ''}{t.priority !== 0 ? ` · priority ${t.priority}` : ''}{t.startedMs > 0 ? ` · ${fmtElapsed((t.finishedMs || now) - t.startedMs)}` : ''}{t.branch ? ` · ⎇ ${t.branch}` : ''}
                   </Text>
+                  {isFailed(t) &&
+                    t.reason !== '' &&
+                    wrapCells(t.reason, detailWidth, MAX_LINES.summary).map((line, i) => (
+                      <Text color="error">
+                        {'    '}
+                        {i === 0 ? '↳' : ' '} {line}
+                      </Text>
+                    ))}
                   {t.usage !== null && (
                     <Text dimColor>
                       {'    '}in {Tok(t.usage.input)}
