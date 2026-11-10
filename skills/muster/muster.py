@@ -3,7 +3,8 @@
 
     muster.py run <worker[,worker…]> <task-dir> <cwd> [--after A,B] [--priority N]
                                               queue until deps are done and one of the workers has a free slot
-                                              (first in the list wins a tie), then run prompt.md on it
+                                              (first in the list wins a tie), then run prompt.md on it;
+                                              exit 3 refused (`only`), 4 disk low (`minFreeGB`), 5 dependency failed
     muster.py cancel <task-dir> [reason]      stop a queued or running task; status becomes "canceled: reason"
     muster.py usage <task-dir>                (re)compute <task-dir>/usage for a finished task
     muster.py workers                         list configured workers
@@ -21,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 import signal
 import subprocess
 import sys
@@ -287,6 +289,82 @@ def cap_of(cfg, name):
     return int(caps.get(name, caps.get(kind, DEFAULT_CAPS.get(kind, 3))))
 
 
+DEFAULT_MIN_FREE_GB = 10
+
+
+def min_free_gb(cfg, name):
+    return float(cfg["workers"][name].get("minFreeGB", cfg.get("minFreeGB", DEFAULT_MIN_FREE_GB)))
+
+
+def mount_of(path):
+    path = os.path.realpath(path)
+    while not os.path.ismount(path):
+        path = os.path.dirname(path)
+    return path
+
+
+def free_gb(path):
+    return shutil.disk_usage(path).free / 1e9
+
+
+def disk_low(paths, need):
+    """'<free>G free on <mount>, need <need>G' for the first volume under `need`, else None."""
+    for path in paths:
+        free = free_gb(path)
+        if free < need:
+            return f"{free:.1f}G free on {mount_of(path)}, need {need:g}G"
+    return None
+
+
+ERROR_LINE = re.compile(r"ENOSPC|no space left on device|error|panic|traceback|quota|rate.?limit", re.I)
+ENOSPC = re.compile(r"ENOSPC|no space left on device", re.I)
+SECRET = re.compile(r"(?i)\b(bearer\s+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*)\S+"
+                    r"|\b(sk-|xox[a-z]?-|ghp_|gho_|ghs_|github_pat_)[A-Za-z0-9_\-]+")
+
+
+def redact(text):
+    return SECRET.sub(lambda m: (m.group(1) or m.group(2)) + "***", text)
+
+
+def tail_lines(path, size=65536):
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - size))
+            return f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+
+
+def last_error(paths):
+    """(line, path): the last line that looks like an error in the tails of `paths`, first path first;
+    an ENOSPC line anywhere wins. stream-json lines count through their error text only."""
+    hits = []
+    for path in paths:
+        for line in tail_lines(path):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    o = {}
+                line = str(o.get("result") or o.get("error") or "") if isinstance(o, dict) and (o.get("is_error") or o.get("error")) else ""
+            if ERROR_LINE.search(line):
+                hits.append((re.sub(r"^\d{4}-\d\d-\d\dT[\d:.]+Z\s+", "", line), path))  # drop codex log timestamps
+    disk = [h for h in hits if ENOSPC.search(h[0])]
+    if disk:
+        return disk[-1]
+    for path in paths:
+        mine = [h for h in hits if h[1] == path]
+        if mine:
+            return mine[-1]
+    return None, None
+
+
+def short(text, n=160):
+    text = redact(re.sub(r"\s+", " ", text)).strip()
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
 def refuse(task, why, code):
     with open(os.path.join(task, "status"), "w") as f:
         f.write(f"failed: refused, {why}\n")
@@ -359,6 +437,10 @@ def doctor(cfg):
     for w in (cfg.get("only") or {}):
         if w not in workers:
             probs.append(f"only.{w}: unknown worker")
+    for where, w in [("", cfg), *((f"workers.{n}.", w) for n, w in workers.items())]:
+        v = w.get("minFreeGB")
+        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
+            probs.append(f"{where}minFreeGB: {v!r}, expected a number of GB, 0 or more")
     for k, v in (cfg.get("caps") or {}).items():
         if k not in workers and k not in ("codex", "claude"):
             probs.append(f"caps.{k}: not a worker name or type")
@@ -462,6 +544,10 @@ def run(cfg, names, task, cwd, after=(), priority=0):
                 f"pid={os.getpid()}\nqueued={now()}\nafter={','.join(after)}\npriority={priority}\n")
     write_status(task, "queued")
     on_stop(task)
+    # Fail early when even the most lenient listed worker could not start; checked again at claim time.
+    low = disk_low((cwd, runs), min(min_free_gb(cfg, n) for n in names))
+    if low:
+        return disk_fail(task, low)
     shown, name = "queued", None
     while name is None:
         # The lock makes count-then-claim atomic, so queued tasks cannot all slip under a cap at once.
@@ -480,6 +566,9 @@ def run(cfg, names, task, cwd, after=(), priority=0):
                         break
                     full.append(f"{n} runs {busy} of {cap}")
                 if name is not None:
+                    low = disk_low((cwd, runs), min_free_gb(cfg, name))
+                    if low:
+                        return disk_fail(task, low)
                     append_meta(task, worker=name, type=cfg["workers"][name]["type"], started=now())
                     write_status(task, "running")
                     break
@@ -512,8 +601,29 @@ def run(cfg, names, task, cwd, after=(), priority=0):
     except Exception as e:  # usage is best effort; the task result matters more
         with open(os.path.join(task, "log.txt"), "a") as log:
             log.write(f"\nmuster: usage not recorded: {e}\n")
-    finish(task, rc, "done" if rc == 0 else f"failed: exit {rc}")
+    if rc == 0:
+        finish(task, 0, "done")
+        return 0
+    main_log = os.path.join(task, "stream.jsonl" if kind == "claude" else "log.txt")
+    logs = [main_log] + ([os.path.join(task, "log.txt")] if kind == "claude" else [])
+    line, where = last_error(logs)
+    reason = short(line) if line else f"exit {rc}"
+    status = f"failed: {reason}"
+    if line and ENOSPC.search(line):
+        status = f"failed: disk full (ENOSPC), {free_gb(cwd):.1f}G free on {mount_of(cwd)}"
+        with open(os.path.join(task, "result.md"), "a") as f:
+            f.write(f"\n\nDisk full (ENOSPC). To resume: free space, then rerun this task dir; the worker starts over "
+                    f"from prompt.md in the same cwd, so add what is already done to prompt.md first:\n\n"
+                    "    " + shlex.join(["python3", os.path.abspath(__file__), "run", ",".join(names), os.path.abspath(task), cwd]) + "\n")
+    append_meta(task, last_error=reason, log_path=os.path.abspath(where or main_log))
+    finish(task, rc, status)
     return rc
+
+
+def disk_fail(task, low):
+    append_meta(task, last_error=f"disk low ({low})")
+    finish(task, 4, f"failed: disk low ({low})")
+    return 4
 
 
 def main():

@@ -18,9 +18,10 @@ Read `~/.muster/config.json` (or the path in `MUSTER_CONFIG`) at the start of ev
 - `only.<worker>`: globs that worker may work in. Never route any other project to it, not even as a quota fallback. `muster.py` enforces it: outside those globs it refuses (exit 3, status `failed: refused, …`).
 - `caps.<worker>` or `caps.<type>`: the most tasks one worker runs at once (default codex 3, claude 5). `muster.py` enforces it: over the cap the task waits with status `queued` and starts by itself when a slot frees.
 - `preamble`: extra lines appended to the rules block of every prompt.
+- `minFreeGB` (global or `workers.<name>.minFreeGB`, default 10): `muster.py` will not start a task while the cwd's or `runsDir`'s volume has less free space (exit 4, status `failed: disk low (…)`). Free space before rerunning; do not lower the threshold without asking the user.
 - The user's explicit choice in the request always wins over the config.
 
-Assigning parallel tasks: pass each task the whole worker list `routing` gives its cwd, first choice first (`run codex-a,codex-b …`), minus workers the user ruled out. The runner starts it on the first listed worker with a free slot, and while every one is full it waits on all of them, so a task never sits behind one busy worker while another is idle. Launch every task at once; do not pick one worker per task to spread the load. When a worker fails on quota or rate limit (see `log.txt`), rerun that task without that worker in its list.
+Assigning parallel tasks: pass each task the whole worker list `routing` gives its cwd, first choice first (`run codex-a,codex-b …`), minus workers the user ruled out. The runner starts it on the first listed worker with a free slot, and while every one is full it waits on all of them, so a task never sits behind one busy worker while another is idle. Launch every task at once; do not pick one worker per task to spread the load. When a worker fails on quota or rate limit (its status and meta `last_error` say so), rerun that task without that worker in its list.
 
 Metered workers on a peak-priced model (see `prices.json`, e.g. DeepSeek: weekdays 01:00–04:00 and 06:00–10:00 UTC cost double): when a large, non-urgent batch would run in peak hours, say so in the plan and offer to run it later. The user decides.
 
@@ -61,7 +62,7 @@ Then:
 - **Results**: what each task produced, with file paths or diff stats.
 - **Usage**: from each task's `usage` file. Total tokens for the run, then metered money as `$` (say when it ran at peak price) and subscription work as `≈$` (API-equivalent; not billed per token).
 - **Verification**: what Claude checked and the result (commands run, pass or fail).
-- **Open / risks**: anything skipped, failed, or needing the user's decision.
+- **Open / risks**: anything skipped, failed, or needing the user's decision. For each failed task give meta's `last_error` and `log_path`. On `failed: disk full (ENOSPC)` the end of `result.md` has the rerun command; say what filled the disk if the log shows it.
 - **Next**: concrete options (merge worktree X, rerun B, ...).
 
 Write the report in the user's language.
