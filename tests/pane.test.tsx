@@ -257,6 +257,26 @@ test('a failed task with no result shows the error line from its log', async ($,
   await ui.unmount()
 })
 
+test('a failed task shows last_error and log_path from meta', async ($, on) => {
+  await mountWith(
+    $,
+    on,
+    tree('/h/.muster/runs', {
+      '20261105-1000-x': {
+        A: {
+          ...task('failed: disk full (ENOSPC), 1.2G free on /', 'last_error=Error: ENOSPC: no space left on device, write\nlog_path=/h/.muster/runs/20261105-1000-x/A/log.txt\n'),
+          title: 'filled the disk',
+        },
+        B: { ...task('running', 'pid=0\n'), title: 'keeps the run open' },
+      },
+    }),
+  )
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /no space left/ }))?.text).toMatch(/^\s+↳ Error: ENOSPC: no space left on device/)
+  expect((await ui.find({ type: 'Text', text: /^\s+log / }))?.text).toMatch(/^\s+log \/h\/\.muster\/runs\/20261105-1000-x\/A\/log/)
+  await ui.unmount()
+})
+
 test('queued tasks show their dependencies and priority, in the order they will start', async ($, on) => {
   // Queued tasks have no `started` yet, so no elapsed time.
   const q = (status: string, extra: string) => ({ status: `${status}\n`, meta: `worker=w1\ntype=codex\nsession=S1\npid=0\n${extra}` })

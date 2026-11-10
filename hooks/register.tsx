@@ -8,7 +8,7 @@ const TITLE = 'Muster'
 const POLL_MS = 5000
 
 // Change a tag when its value's fields change, so a reload declines old values.
-const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-7' })
+const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-8' })
 // Fold the person chose, per run (`<run>`) and per status section (`<run>/<label>`). A run without an entry
 // folds once nothing in it runs; a section without one stays open.
 const foldsAtom = atom({ plugin: 'muster', key: 'folds' } as const, {}, { shape: 'folds-1' })
@@ -261,9 +261,9 @@ export const register: Register = on => {
               ? parseStream(await readText(liveFile))
               : parseProgress(await readText(liveFile))
           const logMs = isLive ? ((await $.fs.stat(liveFile).catch(() => undefined))?.mtimeMs ?? 0) : 0
-          // result.md already says why when the worker wrote one; otherwise fall back to the log.
+          // muster.py records why in meta (`last_error`); older runs: result.md says why, or the log's error line.
           const failed = isOrphan || status.trim().startsWith('failed')
-          const reason = failed && tidy === '' ? failureLine(await readText(`${dir}/log.txt`)) : ''
+          const reason = !failed ? '' : (kv.last_error ?? '') || (tidy === '' ? failureLine(await readText(`${dir}/log.txt`)) : '')
           return {
             id,
             branch,
@@ -279,6 +279,7 @@ export const register: Register = on => {
             finishedMs: parseTime(kv.finished),
             summary: tidy.slice(0, 400),
             reason,
+            logPath: failed ? (kv.log_path ?? '') : '',
             usage,
             progress: live.progress,
             lastCmd: live.lastCmd,
@@ -461,6 +462,13 @@ export const register: Register = on => {
                       <Text color="error">
                         {'    '}
                         {i === 0 ? '↳' : ' '} {line}
+                      </Text>
+                    ))}
+                  {isFailed(t) &&
+                    t.logPath !== '' &&
+                    wrapCells(`log ${t.logPath}`, detailWidth, MAX_LINES.command).map(line => (
+                      <Text dimColor>
+                        {'    '}  {line}
                       </Text>
                     ))}
                   {t.usage !== null && (
