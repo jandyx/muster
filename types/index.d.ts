@@ -12,6 +12,7 @@ export type Task = {
   finishedMs: number
   summary: string
   reason: string
+  logPath: string
   usage: Usage | null
   progress: string
   lastCmd: string
