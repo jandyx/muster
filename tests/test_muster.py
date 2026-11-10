@@ -447,6 +447,75 @@ echo "all done" > "$out"
                 M.run({"runsDir": d, "workers": {"x": {"type": "cli"}}}, "x", str(task), d)
 
 
+class Failures(unittest.TestCase):
+    def test_disk_low_refuses_to_start(self):
+        with tempfile.TemporaryDirectory() as d:
+            task = make_task(d)
+            ok = fake_cli(d, "ok", "cat >/dev/null\n")
+            cfg = {"runsDir": d, "minFreeGB": 1e9, "workers": {"w": {"type": "claude", "command": ok}}}
+            self.assertEqual(M.run(cfg, "w", str(task), d), 4)
+            status = (task / "status").read_text().strip()
+            self.assertRegex(status, r"^failed: disk low \([\d.]+G free on /.*, need 1e\+09G\)$")
+            self.assertEqual(M.read_meta(str(task))["last_error"], status[len("failed: "):])
+            cfg["workers"]["w"]["minFreeGB"] = 0  # a worker's own threshold beats the global one
+            self.assertEqual(M.run(cfg, "w", str(task), d), 0)
+
+    def test_disk_is_checked_again_when_a_queued_task_starts(self):
+        with tempfile.TemporaryDirectory() as d:
+            task = make_task(d)
+            cfg = {"runsDir": d, "workers": {"w": {"type": "claude", "command": fake_cli(d, "ok", "cat >/dev/null\n")}}}
+            calls = []
+            real = M.free_gb
+            M.free_gb = lambda p: (calls.append(p), 100 if len(calls) <= 2 else 1)[1]  # fills up while queued
+            try:
+                self.assertEqual(M.run(cfg, "w", str(task), d), 4)
+            finally:
+                M.free_gb = real
+            self.assertEqual(len(calls), 3)
+            self.assertNotIn("worker", M.read_meta(str(task)))
+
+    def test_enospc_says_disk_full_and_how_to_resume(self):
+        with tempfile.TemporaryDirectory() as d:
+            bad = fake_cli(d, "bad", "cat >/dev/null\necho \"Error: ENOSPC: no space left on device, write\" >&2\n"
+                                     "echo 'error: later noise' >&2\nexit 1\n")
+            task = make_task(d)
+            cfg = {"runsDir": d, "workers": {"b": {"type": "claude", "command": bad}}}
+            self.assertEqual(M.run(cfg, "b", str(task), d), 1)
+            self.assertRegex((task / "status").read_text(), r"^failed: disk full \(ENOSPC\), [\d.]+G free on /")
+            meta = M.read_meta(str(task))
+            self.assertEqual(meta["last_error"], "Error: ENOSPC: no space left on device, write")
+            self.assertEqual(meta["log_path"], os.path.abspath(task / "log.txt"))
+            self.assertIn(f" run b {os.path.abspath(task)} {d}", (task / "result.md").read_text())
+
+    def test_failed_status_names_the_last_error_without_secrets(self):
+        with tempfile.TemporaryDirectory() as d:
+            cx = fake_cli(d, "codex", "cat >/dev/null\necho 'Traceback (most recent call last):'\n"
+                                      "echo 'ValueError: bad key sk-abc123XYZ for Bearer eyJhbGciOi'\necho done.\nexit 2\n")
+            task = make_task(d)
+            cfg = {"runsDir": d, "workers": {"cx": {"type": "codex", "codexHome": d, "command": cx}}}
+            self.assertEqual(M.run(cfg, "cx", str(task), d), 2)
+            self.assertEqual((task / "status").read_text().strip(), "failed: ValueError: bad key sk-*** for Bearer ***")
+            self.assertEqual(M.read_meta(str(task))["log_path"], os.path.abspath(task / "log.txt"))
+
+    def test_claude_error_result_is_the_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            bad = fake_cli(d, "bad", "cat >/dev/null\n"
+                                     "echo '{\"type\":\"result\",\"is_error\":true,\"result\":\"API Error: 429 rate limit exceeded\"}'\nexit 1\n")
+            task = make_task(d)
+            cfg = {"runsDir": d, "workers": {"b": {"type": "claude", "command": bad}}}
+            self.assertEqual(M.run(cfg, "b", str(task), d), 1)
+            self.assertEqual((task / "status").read_text().strip(), "failed: API Error: 429 rate limit exceeded")
+            self.assertEqual(M.read_meta(str(task))["log_path"], os.path.abspath(task / "stream.jsonl"))
+
+    def test_reason_is_short_and_redacted(self):
+        self.assertEqual(len(M.short("error " * 100)), 160)
+        self.assertEqual(M.redact("token=abc ghp_XYZ123 xoxb-1-2 api_key: k"), "token=*** ghp_*** xoxb-*** api_key: ***")
+
+    def test_doctor_checks_min_free_gb(self):
+        probs = M.doctor({"minFreeGB": "10", "workers": {"w": {"type": "claude", "command": sys.executable, "minFreeGB": -1}}})
+        self.assertEqual([p.split(":")[0] for p in probs], ["minFreeGB", "workers.w.minFreeGB"])
+
+
 class MoreGuards(unittest.TestCase):
     def test_only_resolves_symlinks(self):
         with tempfile.TemporaryDirectory() as d:
