@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Run, Task, Usage } from '../types'
+import type { Agent, Run, Task, Usage } from '../types'
 
 const PANE = 'muster'
 const TITLE = 'Muster'
@@ -9,6 +9,9 @@ const POLL_MS = 5000
 
 // Change a tag when its value's fields change, so a reload declines old values.
 const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-9' })
+// The session's own subagents (`$.agent.list()`), refreshed every poll. They are not Muster runs: no worker,
+// no cost; the list is already bound to this session, so it needs no session filter.
+const agentsAtom = atom({ plugin: 'muster', key: 'agents' } as const, [] as Agent[], { shape: 'agents-1' })
 // Fold the person chose, per run (`<run>`) and per status section (`<run>/<label>`). A run without an entry
 // folds once nothing in it runs; a section without one stays open.
 const foldsAtom = atom({ plugin: 'muster', key: 'folds' } as const, {}, { shape: 'folds-1' })
@@ -38,6 +41,23 @@ const SECTIONS: [string, string | undefined, (t: Task) => boolean][] = [
 ]
 const mark = (t: Task) => (t.status === 'done' ? '✓' : isRunning(t) ? '…' : isFailed(t) ? '✗' : isCanceled(t) ? '⊘' : '○')
 const markColor = (t: Task) => (t.status === 'done' ? 'green' : isRunning(t) ? 'yellow' : isFailed(t) ? 'red' : isQueued(t) ? 'cyan' : undefined)
+
+// A subagent's lifecycle: the engine reports `running`, `completed`, `failed`, `killed`, and its own
+// waiting states. A waiting one is still active, so it stays in the pane.
+const isAgentRunning = (a: Agent) => a.status === 'running'
+const isAgentFinished = (a: Agent) => a.status === 'completed' || a.status === 'failed' || a.status === 'killed'
+const isAgentActive = (a: Agent) => !isAgentFinished(a)
+const agentMark = (a: Agent) => (a.status === 'completed' ? '✓' : isAgentRunning(a) ? '…' : a.status === 'failed' ? '✗' : a.status === 'killed' ? '⊘' : '○')
+const agentColor = (a: Agent) =>
+  a.status === 'completed' ? 'green' : isAgentRunning(a) ? 'yellow' : a.status === 'failed' ? 'red' : isAgentActive(a) ? 'cyan' : undefined
+const countAgents = (as: Agent[]) => {
+  const n = (test: (a: Agent) => boolean) => as.filter(test).length
+  const extra = [[n(a => isAgentActive(a) && !isAgentRunning(a)), 'waiting'], [n(a => a.status === 'killed'), 'stopped']]
+    .filter(([k]) => k)
+    .map(([k, l]) => ` · ${k} ${l}`)
+    .join('')
+  return `${n(isAgentRunning)} running · ${n(a => a.status === 'completed')} done · ${n(a => a.status === 'failed')} failed${extra}`
+}
 
 // meta holds local "YYYY-MM-DD HH:MM:SS" from run-worker.sh
 const parseTime = (s: string | undefined) => {
@@ -112,6 +132,15 @@ const parseStream = (stream: string) => {
     }
   }
   return { progress: progress.replace(/[`*#]/g, '').replace(/\s+/g, ' ').slice(0, 300), lastCmd: lastCmd.replace(/\s+/g, ' ').slice(0, 200) }
+}
+
+// The latest tool call of a subagent as the pane shows it: a Bash command alone, anything else with its tool
+// name and most telling argument. A tool with no such argument still shows its name.
+const callText = (e: Record<string, unknown>) => {
+  const arg = [e.command, e.file_path, e.pattern, e.description, e.prompt, e.url, e.query].find(v => typeof v === 'string' && v !== '')
+  const tool = typeof e.tool === 'string' ? e.tool : ''
+  const text = typeof arg !== 'string' ? tool : tool === 'Bash' ? arg : `${tool} ${arg}`
+  return text.replace(/\s+/g, ' ').trim().slice(0, 200)
 }
 
 // Progress the worker printed, newest plausible reading in the last 400 lines: "45%", "12/40", "[3/7]".
@@ -218,6 +247,9 @@ const titleOf = (prompt: string, id: string) => {
 export const register: Register = on => {
   let primed = false
   const opened = new Set<string>()
+  // Each subagent's latest tool call, by `agentId`, for the pane. In memory: a reload starts them blank until
+  // the agent calls a tool again. Never stored, so a busy fleet costs no state writes.
+  const agentActs = new Map<string, string>()
 
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'muster-panel', description: 'Open the Muster pane' })
@@ -378,6 +410,13 @@ export const register: Register = on => {
       const shown = [...all].reverse()
       await update($, runsAtom, () => shown)
 
+      // The session's own subagents, which the engine scopes to this session already.
+      const agents = await $.agent.list().catch(() => [] as Agent[])
+      await update($, agentsAtom, () => agents)
+      // Drop calls of agents this session no longer lists, so a long session's map stays bounded.
+      const listed = new Set(agents.map(a => a.id))
+      for (const id of agentActs.keys()) if (!listed.has(id)) agentActs.delete(id)
+
       const key = (r: Run, t: Task) => `${r.name}/${t.id}`
       const finished = all.flatMap(r => r.tasks.filter(isFinished).map(t => key(r, t)))
       if (!primed) {
@@ -414,14 +453,32 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // Remember each subagent's latest tool call for the pane; the main loop carries no agentId, so its calls stay
+  // out. Best effort: bookkeeping must never stand in a tool call's way.
+  on('tool.call', ($, e, next) => {
+    if (e.agentId) {
+      try {
+        const text = callText(e as unknown as Record<string, unknown>)
+        if (text !== '') agentActs.set(e.agentId, text)
+      } catch {
+        // A pane detail is not worth failing a call over.
+      }
+    }
+    return next(e)
+  })
+
   on('command.run', { command: 'muster-panel' }, async $ => {
     // The command hands the pane the keyboard: ↑↓ scroll, Enter folds, Esc back to the prompt.
     await $.ui.open({ id: PANE, title: TITLE, focus: true })
     // Same rows as text, so a session that cannot show the pane still gets the state in its own context.
     const runs = await read($, runsAtom)
-    const rows = runs.flatMap(r =>
-      r.tasks.filter(isActive).map(t => `${t.id} · ${t.worker} · ${t.status}${t.pctText ? ` · ${t.pctText}` : ''} · ${t.title}`),
-    )
+    const agents = (await read($, agentsAtom)).filter(isAgentActive)
+    const rows = [
+      ...runs.flatMap(r =>
+        r.tasks.filter(isActive).map(t => `${t.id} · ${t.worker} · ${t.status}${t.pctText ? ` · ${t.pctText}` : ''} · ${t.title}`),
+      ),
+      ...agents.map(a => `${a.type} · ${a.status} · ${a.description}${agentActs.has(a.id) ? ` · ${agentActs.get(a.id)}` : ''}`),
+    ]
     return {
       text: rows.length === 0 ? 'Muster pane focused. Nothing runs right now.' : `Muster pane focused (Esc returns).\n${rows.join('\n')}`,
     }
@@ -430,7 +487,8 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const runs = await read($, runsAtom)
-    if (runs.length === 0) {
+    const agents = await read($, agentsAtom)
+    if (runs.length === 0 && agents.length === 0) {
       return (
         <Box flexDirection="column">
           <Text dimColor>No Muster runs yet.</Text>
@@ -440,7 +498,13 @@ export const register: Register = on => {
     }
     const folds = await read($, foldsAtom)
     const isFolded = (run: Run) => folds[run.name] ?? !run.tasks.some(isActive)
-    const keys = runs.flatMap(r => [r.name, ...SECTIONS.map(([label]) => `${r.name}/${label}`)])
+    const isAgentsFolded = folds.agents ?? !agents.some(isAgentActive)
+    const isFinishedAgentsFolded = folds['agents/finished'] ?? true
+    const finishedAgents = agents.filter(isAgentFinished)
+    const keys = [
+      ...runs.flatMap(r => [r.name, ...SECTIONS.map(([label]) => `${r.name}/${label}`)]),
+      ...(agents.length > 0 ? ['agents', 'agents/finished'] : []),
+    ]
     const setAll = (folded: boolean) => () => void update($, foldsAtom, old => ({ ...old, ...Object.fromEntries(keys.map(k => [k, folded])) }))
     const toggle = (run: Run) => () => void update($, foldsAtom, old => ({ ...old, [run.name]: !isFolded(run) }))
     const now = await $.clock.now()
@@ -465,14 +529,59 @@ export const register: Register = on => {
       const extra = [[n(isQueued), 'queued'], [n(isCanceled), 'canceled']].filter(([k]) => k).map(([k, l]) => ` · ${k} ${l}`).join('')
       return `${n(isRunning)} running · ${n(t => t.status === 'done')} done · ${n(isFailed)} failed${extra}`
     }
+    // Subagent rows: running first, then waiting; finished ones sit under their own fold.
+    const agentRows = (list: Agent[]) =>
+      [...list]
+        .sort((a, b) => Number(isAgentRunning(b)) - Number(isAgentRunning(a)))
+        .map(a => {
+          // Only a live agent's latest call says where it is now; a finished one's is history.
+          const act = isAgentActive(a) ? (agentActs.get(a.id) ?? '') : ''
+          return (
+            <Box flexDirection="column" marginTop={1}>
+              <Text color={agentColor(a)}>
+                {'  '}{agentMark(a)} {a.description}
+              </Text>
+              <Text dimColor>
+                {'    '}{Worker(a.type)} · {a.status}
+              </Text>
+              {act !== '' &&
+                wrapCells(act, detailWidth, MAX_LINES.command).map((line, i) => (
+                  <Text dimColor>
+                    {'    '}
+                    {i === 0 ? '$' : ' '} {line}
+                  </Text>
+                ))}
+            </Box>
+          )
+        })
     return (
       <Box flexDirection="column">
         <Box flexDirection="row" gap={2}>
           <Button key="expand-all" hotkey="e" plain onPress={setAll(false)}>Expand all</Button>
           <Button key="collapse-all" hotkey="c" plain onPress={setAll(true)}>Collapse all</Button>
         </Box>
-        <Text dimColor>{e.props.isFocused ? '↑↓ scroll · Enter on a run or section folds it' : 'Click or ctrl+x tab here to scroll and fold'}</Text>
+        <Text dimColor>{e.props.isFocused ? '↑↓ scroll · Enter folds a run, section or agent' : 'Click or ctrl+x tab here to scroll and fold'}</Text>
         <Text> </Text>
+        {agents.length > 0 && (
+          <Box flexDirection="column" marginBottom={1}>
+            <Button key="agents" plain onPress={() => void update($, foldsAtom, old => ({ ...old, agents: !isAgentsFolded }))}>
+              {isAgentsFolded ? '▸' : '▾'} Claude agents <Text dimColor>{countAgents(agents)}</Text>
+            </Button>
+            {!isAgentsFolded && agentRows(agents.filter(isAgentActive))}
+            {!isAgentsFolded && finishedAgents.length > 0 && (
+              <Box marginTop={1}>
+                <Button
+                  key="agents/finished"
+                  plain
+                  onPress={() => void update($, foldsAtom, old => ({ ...old, 'agents/finished': !isFinishedAgentsFolded }))}
+                >
+                  <Text dimColor>{'  '}{isFinishedAgentsFolded ? '▸' : '▾'} Finished · {finishedAgents.length}</Text>
+                </Button>
+              </Box>
+            )}
+            {!isAgentsFolded && !isFinishedAgentsFolded && agentRows(finishedAgents)}
+          </Box>
+        )}
         {runs.map(run => (
           <Box flexDirection="column" marginBottom={1}>
             <Button key={`run:${run.name}`} plain onPress={toggle(run)}>
@@ -583,7 +692,9 @@ export const register: Register = on => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const active = (await read($, runsAtom)).filter(r => r.tasks.some(isActive))
-    if (e.props.hasSurvey || active.length === 0) return next(e)
+    // Claude's own subagents count while one is still going; a finished one leaves the band quiet.
+    const activeAgents = (await read($, agentsAtom)).filter(isAgentActive)
+    if (e.props.hasSurvey || (active.length === 0 && activeAgents.length === 0)) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
     return (
@@ -613,6 +724,7 @@ export const register: Register = on => {
             </Text>
           )
         })}
+        {activeAgents.length > 0 && <Text color="cyan">{activeAgents.length} agent{activeAgents.length === 1 ? '' : 's'} </Text>}
         <Text dimColor>· /muster-panel</Text>
       </Box>
     )

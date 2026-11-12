@@ -66,7 +66,7 @@ Muster turns that into a habit Claude already knows and a screen you can glance 
 - **A `muster` skill.** Plan → isolate → self-contained prompts → launch in the background → verify → one report table. The same loop every time.
 - **Any number of workers.** Each Codex account is a `codex` worker with its own `CODEX_HOME`; any Claude Code compatible CLI is a `claude` worker. Several tasks can run on one account at once.
 - **Routing you write once.** Per-repo worker priority with quota fallbacks, workers fenced to certain repos, parallel caps. The fences and caps are enforced by the runner, not left to Claude's memory.
-- **A live pane and band.** Task title, worker, elapsed time, the worker's latest note and command, a red warning after 2 minutes of silence, a one-line result, foldable runs.
+- **A live pane and band.** Task title, worker, elapsed time, the worker's latest note and command, a red warning after 2 minutes of silence, a one-line result, foldable runs — and the session's own Claude subagents, running first, finished ones folded.
 - **Honest cost accounting.** Billed `$` for metered APIs, with DeepSeek's peak-hour price; API-equivalent `≈$` for Codex on a ChatGPT subscription; long-context pricing per request.
 - **Session-bound.** A session sees only the runs it started; `claude --resume` brings them back.
 - **No dependencies.** The runner is one Python file on the standard library.
@@ -186,6 +186,8 @@ When a worker fails, `status` reads `failed: <reason>`: the last error line of i
 
 The pane opens by itself when a prompt starts with `muster:` or `/muster`. `/muster-panel` opens it and gives it the keyboard. While tasks run, a band above the prompt lists them.
 
+Above the runs, **Claude agents** lists the subagents this Claude Code session spawned — the Agent tool's, including plugin agents such as `oh-my-claudecode:executor-high`. Running and waiting ones show with their status and, while they work, their latest tool call (`$ …`); finished ones fold into a count. The engine supplies the list (`$.agent.list()`), so they carry no worker, tokens or cost.
+
 | Key | Does |
 |---|---|
 | `/muster-panel` | open and focus the pane |
@@ -208,7 +210,7 @@ The full decision chain is drawn in [docs/how-it-works.md](docs/how-it-works.md#
 
 ## How it works
 
-Claude runs the `muster` skill, which calls `muster.py` once per task in the background. `muster.py` checks the fences and caps, starts the worker, writes everything under `runsDir`, and prices the usage when the worker exits. The pane reads those files every 5 seconds.
+Claude runs the `muster` skill, which calls `muster.py` once per task in the background. `muster.py` checks the fences and caps, starts the worker, writes everything under `runsDir`, and prices the usage when the worker exits. The pane reads those files every 5 seconds, and asks the engine for the session's own subagents on the same poll.
 
 Architecture, a run's sequence, a task's states and what each pane row reads are drawn in **[docs/how-it-works.md](docs/how-it-works.md)**.
 
@@ -272,6 +274,7 @@ Runs are tied to the session id that started them. `claude --resume` keeps the i
 - The peak or off-peak price is chosen by a task's start time; public holidays are not modelled.
 - `≈$` is an estimate of API cost, not what a subscription charges.
 - While a `claude` worker is thinking, its `↻` note stays on the previous line.
+- A Claude agent's latest tool call is kept in memory: a plugin reload forgets it until that agent calls another tool.
 - The pane shows the last 30 runs of the current session.
 
 ## Contributing
