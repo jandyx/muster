@@ -149,7 +149,7 @@ const mountWith = async (
   $: any,
   on: any,
   tree: Record<string, string>,
-  opts: { config?: string; session?: string; clock?: boolean } = {},
+  opts: { config?: string; session?: string; clock?: boolean; agents?: any[] } = {},
 ) => {
   const dirs = new Map<string, Set<string>>()
   for (const path of Object.keys(tree)) {
@@ -181,6 +181,7 @@ const mountWith = async (
   on('ui.status', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
   on('session.id', () => ({ value: opts.session ?? 'S1' }))
+  on('agent.list', () => ({ value: opts.agents ?? [] }))
   on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
@@ -348,6 +349,76 @@ test('the band stays out of the way when nothing runs', async ($, on) => {
   const ui = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
   expect((await ui.find({ type: 'Text' }))?.text).toBe('engine')
   await ui.unmount()
+})
+
+test('the pane lists the session\'s Claude agents, running first and finished folded', async ($, on) => {
+  await mountWith($, on, {}, {
+    agents: [
+      { id: 'a1', description: 'Running the full OpenUICore test suite', type: 'oh-my-claudecode:executor-high', status: 'running' },
+      { id: 'a2', description: 'Searching OpenUI fixture and gallery references', type: 'oh-my-claudecode:explore', status: 'pending' },
+      { id: 'a3', description: 'Older audit', type: 'Plan', status: 'completed' },
+      { id: 'a4', description: 'Broken review', type: 'oh-my-claudecode:code-reviewer', status: 'failed' },
+    ],
+  })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Button', text: /Claude agents/ }))?.text).toMatch(/^▾ Claude agents 1 running · 1 done · 1 failed · 1 waiting$/)
+  const rows = (await ui.findAll({ type: 'Text' })).map((r: any) => r.text as string).filter(t => /^\s*[✓…✗⊘○] /.test(t))
+  expect(rows).toEqual(['  … Running the full OpenUICore test suite', '  ○ Searching OpenUI fixture and gallery references'])
+  expect((await ui.find({ type: 'Text', text: /executor-high · running/ }))?.text).toMatch(/oh-my-claudecode:executor-high · running/)
+  // A finished agent folds away with its kind, until the person opens it.
+  expect(await ui.find({ type: 'Text', text: /Older audit/ })).toBeUndefined()
+  expect((await ui.find({ type: 'Button', text: /Finished · 2/ }))?.text).toMatch(/▸ Finished · 2/)
+  await ui.press({ key: 'agents/finished' })
+  expect((await ui.find({ type: 'Text', text: /Older audit/ }))?.text).toMatch(/✓ Older audit/)
+  expect((await ui.find({ type: 'Text', text: /Broken review/ }))?.text).toMatch(/✗ Broken review/)
+  await ui.unmount()
+})
+
+test('a live Claude agent shows its latest tool call', async ($, on) => {
+  await mountWith($, on, {}, {
+    agents: [
+      { id: 'a1', description: 'Running the suite', type: 'oh-my-claudecode:executor-high', status: 'running' },
+      { id: 'a2', description: 'Waiting for the run', type: 'oh-my-claudecode:executor-high', status: 'pending' },
+    ],
+  })
+  // A Bash call reads as its command; any other tool carries its name. No tool runs beneath the test's hooks.
+  await $.tool.call({ tool: 'Bash', command: 'npm test -- retry', agentId: 'a1' } as any).catch(() => {})
+  await $.tool.call({ tool: 'Read', file_path: '/x/README.md', agentId: 'a2' } as any).catch(() => {})
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /npm test -- retry/ }))?.text).toMatch(/^\s+\$ npm test -- retry$/)
+  expect((await ui.find({ type: 'Text', text: /Read \/x\/README/ }))?.text).toMatch(/^\s+\$ Read \/x\/README\.md$/)
+  await ui.unmount()
+})
+
+test('a Claude agents block with nothing running starts folded', async ($, on) => {
+  await mountWith($, on, {}, {
+    agents: [{ id: 'a1', description: 'Finished audit', type: 'Plan', status: 'completed' }],
+  })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Button', text: /Claude agents/ }))?.text).toMatch(/^▸ Claude agents 0 running · 1 done · 0 failed$/)
+  expect(await ui.find({ type: 'Text', text: /Finished audit/ })).toBeUndefined()
+  // Opening the block still keeps finished agents behind their own fold.
+  await ui.press({ key: 'agents' })
+  expect((await ui.find({ type: 'Button', text: /Finished · 1/ }))?.text).toMatch(/▸ Finished · 1/)
+  await ui.press({ key: 'agents/finished' })
+  expect((await ui.find({ type: 'Text', text: /Finished audit/ }))?.text).toMatch(/✓ Finished audit/)
+  await ui.unmount()
+})
+
+test('the band counts the Claude agents still running', async ($, on) => {
+  on('ui.render', ($: any, e: any) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>engine</Text>
+  })
+  await mountWith($, on, {}, {
+    agents: [
+      { id: 'a1', description: 'live agent', type: 'Explore', status: 'running' },
+      { id: 'a2', description: 'old agent', type: 'Plan', status: 'completed' },
+    ],
+  })
+  const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
+  expect((await band.find({ type: 'Text', text: /1 agent/ }))?.text).toMatch(/1 agent/)
+  await band.unmount()
 })
 
 test('another session cannot see this one\'s runs', async ($, on) => {

@@ -33,10 +33,22 @@ export type Usage = {
 }
 export type Run = { name: string; tasks: Task[] }
 
+// One subagent the session spawned (the Agent tool), as `$.agent.list()` reports it.
+export type Agent = {
+  id: string
+  description: string
+  type: string
+  status: string
+  parentId?: string
+  spawnedBy?: string
+  name?: string
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'muster': {
       runs: Shaped<Run[]>
+      agents: Shaped<Agent[]>
       notified: Shaped<string[]>
       folds: Shaped<Record<string, boolean>>
     }
