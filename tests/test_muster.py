@@ -9,6 +9,14 @@ spec.loader.exec_module(M)
 PRICES = json.loads((ROOT / "prices.json").read_text())
 
 
+class TaskId(unittest.TestCase):
+    def test_slug_rule(self):
+        for ok in ("f191", "fix-pr-assoc-wait", "f44-r2", "a1-b2-c3"):
+            self.assertTrue(M.TASK_ID.match(ok), ok)
+        for bad in ("FIX-A", "f191_workflow", "-lead", "trail-", "double--dash", "9lives", ""):
+            self.assertFalse(M.TASK_ID.match(bad), bad)
+
+
 class Usage(unittest.TestCase):
     def test_codex_rollout_dedupes_and_prices(self):
         with tempfile.TemporaryDirectory() as d:

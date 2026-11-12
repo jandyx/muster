@@ -32,6 +32,9 @@ HOME = os.path.expanduser("~")
 CONFIG = os.path.expanduser(os.environ.get("MUSTER_CONFIG", "~/.muster/config.json"))
 REPO_PRICES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "prices.json")
 USER_PRICES = os.path.expanduser("~/.muster/prices.json")
+# Task ids are directory names and triple as the pane label, `--after` name and worktree branch suffix, so they
+# follow the usual slug rule (DNS-1123 label, same as k8s resource names and Docker tags).
+TASK_ID = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
 
 
 def expand(p):
@@ -523,6 +526,11 @@ def run(cfg, names, task, cwd, after=(), priority=0):
     prompt = os.path.join(task, "prompt.md")
     if not os.path.isfile(prompt) or not os.path.isdir(cwd):
         sys.exit(f"muster: need {prompt} and an existing cwd {cwd}")
+    tid = os.path.basename(os.path.abspath(task))
+    if not TASK_ID.match(tid) or len(tid) > 63:
+        # Warn, not exit: only the naming convention is wrong, and callers outside the skill may pass old-style ids.
+        print(f"muster: task id {tid!r} should be a kebab-case slug "
+              f"(^[a-z][a-z0-9]*(-[a-z0-9]+)*$, max 63 chars); see SKILL.md", file=sys.stderr)
     for dep in after:
         if not os.path.isdir(os.path.join(os.path.dirname(task), dep)):
             sys.exit(f"muster: --after {dep}: no task {dep} next to {task}")

@@ -16,6 +16,10 @@ export type Task = {
   usage: Usage | null
   progress: string
   lastCmd: string
+  // Progress the worker printed as it went ("12/40 (30%)") and an ETA from its rate, both best effort.
+  pct: number | null
+  pctText: string
+  etaMs: number
   logMs: number
 }
 export type Usage = {

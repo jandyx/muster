@@ -224,6 +224,33 @@ test('a finished run starts folded, a running one open', async ($, on) => {
   await ui.unmount()
 })
 
+test('a prompt with no title line shows its first prose line, not the bare task id', async ($, on) => {
+  const t = tree('/h/.muster/runs', {
+    '20261105-1000-x': { A: { ...task('running', 'pid=0\n') }, B: { ...task('running', 'pid=0\n') } },
+  })
+  t['/h/.muster/runs/20261105-1000-x/A/prompt.md'] = 'Rules for this task:\n- Do not push.\n'
+  t['/h/.muster/runs/20261105-1000-x/B/prompt.md'] = 'Fix the workflow timeline\nRules for this task:\n- Do not push.\n'
+  await mountWith($, on, t)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /… Fix the workflow timeline/ }))?.text).toMatch(/… Fix the workflow timeline/)
+  expect((await ui.find({ type: 'Text', text: /… A$/ }))?.text).toMatch(/… A$/)
+  expect(await ui.find({ type: 'Text', text: /Rules for this task/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a running task shows the progress it printed, and a path is not progress', async ($, on) => {
+  const t = tree('/h/.muster/runs', {
+    '20261105-1000-x': { A: { ...task('running', 'pid=0\n'), title: 'building' }, B: { ...task('running', 'pid=0\n'), title: 'reading' } },
+  })
+  t['/h/.muster/runs/20261105-1000-x/A/log.txt'] = 'codex\nbuilding\nStep 12/40: compiling serde\n'
+  t['/h/.muster/runs/20261105-1000-x/B/log.txt'] = 'reading /Users/x/sessions/2026/11/05/log.txt\nversion 1.2/3 ok\n'
+  await mountWith($, on, t)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /▰ 12\/40 \(30%\)/ }))?.text).toMatch(/▰ 12\/40 \(30%\)$/)
+  expect((await ui.findAll({ type: 'Text' })).filter((r: any) => /▰/.test(r.text))).toHaveLength(1)
+  await ui.unmount()
+})
+
 test('a refused task shows as failed with its reason', async ($, on) => {
   await mountWith(
     $,
