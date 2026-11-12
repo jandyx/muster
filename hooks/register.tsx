@@ -8,7 +8,7 @@ const TITLE = 'Muster'
 const POLL_MS = 5000
 
 // Change a tag when its value's fields change, so a reload declines old values.
-const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-8' })
+const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-9' })
 // Fold the person chose, per run (`<run>`) and per status section (`<run>/<label>`). A run without an entry
 // folds once nothing in it runs; a section without one stays open.
 const foldsAtom = atom({ plugin: 'muster', key: 'folds' } as const, {}, { shape: 'folds-1' })
@@ -45,9 +45,6 @@ const parseTime = (s: string | undefined) => {
   const ms = new Date(s.trim().replace(' ', 'T')).getTime()
   return Number.isNaN(ms) ? 0 : ms
 }
-
-// Run dir is YYYYMMDD-HHMM-<slug>; the slug alone labels it on the status line.
-const slug = (name: string) => name.replace(/^\d{8}-\d{4}-/, '')
 
 // Worker colors are theme keys, so they follow the person's light/dark theme.
 // Each worker name hashes to one theme key, so a worker keeps its color across runs and sessions.
@@ -117,6 +114,33 @@ const parseStream = (stream: string) => {
   return { progress: progress.replace(/[`*#]/g, '').replace(/\s+/g, ' ').slice(0, 300), lastCmd: lastCmd.replace(/\s+/g, ' ').slice(0, 200) }
 }
 
+// Progress the worker printed, newest plausible reading in the last 400 lines: "45%", "12/40", "[3/7]".
+// shortcut: dates, clock stamps and version numbers are only partly filtered out (a bare `3/15` after a clock
+// accepts); tighten the guards if a worker's output starts reading as progress.
+const readPct = (text: string): { pct: number; text: string } | null => {
+  const lines = text.split('\n').slice(-400)
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!
+    const at = [...line.matchAll(/(?<![\d.])(\d{1,3})%(?!\d)/g)].pop()
+    if (at) {
+      const n = Number(at[1])
+      if (n <= 100) return { pct: n, text: `${n}%` }
+    }
+    // A fraction glued to a digit, dot, slash or letter is part of a path, a date or a version, not progress.
+    const frac = [...line.matchAll(/(?<![\d.\w/])(\d{1,6})\s*\/\s*(\d{1,6})(?![\d.\w/])/g)].pop()
+    if (frac) {
+      const [a, b] = [Number(frac[1]), Number(frac[2])]
+      if (a > 0 && a <= b) return { pct: Math.round((a / b) * 100), text: `${a}/${b} (${Math.round((a / b) * 100)}%)` }
+    }
+  }
+  return null
+}
+
+const fmtEta = (ms: number) => {
+  const m = Math.ceil(ms / 60000)
+  return m < 1 ? '~<1m' : m < 60 ? `~${m}m` : `~${Math.floor(m / 60)}h${String(m % 60).padStart(2, '0')}m`
+}
+
 // Why a failed task died: the log's last line that looks like an error. A failed codex task leaves
 // result.md empty, so this is the only reason there is.
 const failureLine = (log: string) =>
@@ -180,6 +204,17 @@ const fmtElapsed = (ms: number) => {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`
 }
 
+// Pane title: the prompt's first line, minus heading marks and a leading "Task:" label (full-width colon too).
+// Prompts should open with `# <short title>`; older ones drop straight into the rules block, so fall back to their
+// first prose line, then to the task id (which is what those runs used to show alone).
+const titleOf = (prompt: string, id: string) => {
+  const lines = prompt.split('\n').filter(l => l.trim() !== '')
+  const rules = lines.findIndex(l => /^Rules for this task\s*[:\uFF1A]\s*$/i.test(l))
+  const first = (rules < 0 ? lines : lines.slice(0, rules))[0] ?? ''
+  const title = first.replace(/^#+\s*/, '').replace(/^Task\s*[:\uFF1A]\s*/i, '').replace(/`/g, '').trim()
+  return title.slice(0, 60) || id
+}
+
 export const register: Register = on => {
   let primed = false
   const opened = new Set<string>()
@@ -211,6 +246,21 @@ export const register: Register = on => {
       return head.startsWith('ref: refs/heads/') ? head.slice(16) : head.slice(0, 7)
     }
 
+    // ETA from the progress rate: a reading has to move for 10s before it estimates, and a drop starts a new
+    // phase. In memory only, so a reload just loses the estimate until progress moves again.
+    const rates = new Map<string, { pct: number; at: number }>()
+    const etaOf = (key: string, pct: number, at: number) => {
+      const prev = rates.get(key)
+      if (!prev || pct < prev.pct) {
+        rates.set(key, { pct, at })
+        return 0
+      }
+      const dt = at - prev.at
+      if (pct === 100 || dt < 10000 || pct === prev.pct) return 0
+      rates.set(key, { pct, at })
+      return (100 - pct) / ((pct - prev.pct) / dt)
+    }
+
     const loadTasks = async (name: string): Promise<Task[]> => {
       const dirs = (await $.fs.list(`${root}/${name}`)).filter(d => d.kind === 'dir').map(d => d.name).sort()
       return Promise.all(
@@ -229,9 +279,6 @@ export const register: Register = on => {
           } catch {
             usage = null
           }
-          // Title: the prompt's first heading, minus a leading "Task:" label (full-width colon too).
-          const heading = prompt.split('\n').find(l => /^#\s/.test(l)) ?? ''
-          const title = heading.replace(/^#+\s*/, '').replace(/^Task\s*[:\uFF1A]\s*/i, '').replace(/`/g, '').trim()
           const kv = Object.fromEntries(
             meta.split('\n').filter(l => l.includes('=')).map(l => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]),
           )
@@ -255,11 +302,14 @@ export const register: Register = on => {
           // meta's `type` is the worker kind muster.py ran: claude writes stream.jsonl, codex a plain log.
           const isStream = kv.type === 'claude'
           const liveFile = `${dir}/${isStream ? 'stream.jsonl' : 'log.txt'}`
+          const liveText = isLive ? await readText(liveFile) : ''
           const live = !isLive
             ? { progress: '', lastCmd: '' }
             : isStream
-              ? parseStream(await readText(liveFile))
-              : parseProgress(await readText(liveFile))
+              ? parseStream(liveText)
+              : parseProgress(liveText)
+          const measure = isLive ? readPct(liveText) : null
+          const etaMs = measure === null ? 0 : etaOf(`${name}/${id}`, measure.pct, Date.now())
           const logMs = isLive ? ((await $.fs.stat(liveFile).catch(() => undefined))?.mtimeMs ?? 0) : 0
           // muster.py records why in meta (`last_error`); older runs: result.md says why, or the log's error line.
           const failed = isOrphan || status.trim().startsWith('failed')
@@ -268,7 +318,7 @@ export const register: Register = on => {
             id,
             branch,
             session: kv.session ?? '',
-            title: title.slice(0, 60) || id,
+            title: titleOf(prompt, id),
             // A queued task has no `worker` yet, only the `workers` it may start on.
             worker: kv.worker ?? (kv.workers ? kv.workers.split(',').join('|') : '?'),
             status: isOrphan ? 'failed: lost (runner exited without a final status)' : status.trim() || 'pending',
@@ -283,6 +333,9 @@ export const register: Register = on => {
             usage,
             progress: live.progress,
             lastCmd: live.lastCmd,
+            pct: measure?.pct ?? null,
+            pctText: measure?.text ?? '',
+            etaMs,
             logMs,
           }
         }),
@@ -364,7 +417,14 @@ export const register: Register = on => {
   on('command.run', { command: 'muster-panel' }, async $ => {
     // The command hands the pane the keyboard: ↑↓ scroll, Enter folds, Esc back to the prompt.
     await $.ui.open({ id: PANE, title: TITLE, focus: true })
-    return { text: 'Muster pane opened and focused (Esc returns to the prompt).' }
+    // Same rows as text, so a session that cannot show the pane still gets the state in its own context.
+    const runs = await read($, runsAtom)
+    const rows = runs.flatMap(r =>
+      r.tasks.filter(isActive).map(t => `${t.id} · ${t.worker} · ${t.status}${t.pctText ? ` · ${t.pctText}` : ''} · ${t.title}`),
+    )
+    return {
+      text: rows.length === 0 ? 'Muster pane focused. Nothing runs right now.' : `Muster pane focused (Esc returns).\n${rows.join('\n')}`,
+    }
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -495,6 +555,12 @@ export const register: Register = on => {
                         {i === 0 ? '$' : ' '} {line}
                       </Text>
                     ))}
+                  {isRunning(t) && t.pctText !== '' && (
+                    <Text dimColor>
+                      {'    '}▰ {t.pctText}
+                      {t.pct === 100 ? ' · finishing' : t.etaMs > 0 ? ` · ${fmtEta(t.etaMs)}` : ''}
+                    </Text>
+                  )}
                   {isRunning(t) && t.logMs > 0 && now - t.logMs > 120000 && (
                     <Text color="error">{'    '}no output for {fmtElapsed(now - t.logMs)}</Text>
                   )}
