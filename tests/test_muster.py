@@ -456,32 +456,6 @@ echo "all done" > "$out"
 
 
 class Failures(unittest.TestCase):
-    def test_disk_low_refuses_to_start(self):
-        with tempfile.TemporaryDirectory() as d:
-            task = make_task(d)
-            ok = fake_cli(d, "ok", "cat >/dev/null\n")
-            cfg = {"runsDir": d, "minFreeGB": 1e9, "workers": {"w": {"type": "claude", "command": ok}}}
-            self.assertEqual(M.run(cfg, "w", str(task), d), 4)
-            status = (task / "status").read_text().strip()
-            self.assertRegex(status, r"^failed: disk low \([\d.]+G free on /.*, need 1e\+09G\)$")
-            self.assertEqual(M.read_meta(str(task))["last_error"], status[len("failed: "):])
-            cfg["workers"]["w"]["minFreeGB"] = 0  # a worker's own threshold beats the global one
-            self.assertEqual(M.run(cfg, "w", str(task), d), 0)
-
-    def test_disk_is_checked_again_when_a_queued_task_starts(self):
-        with tempfile.TemporaryDirectory() as d:
-            task = make_task(d)
-            cfg = {"runsDir": d, "workers": {"w": {"type": "claude", "command": fake_cli(d, "ok", "cat >/dev/null\n")}}}
-            calls = []
-            real = M.free_gb
-            M.free_gb = lambda p: (calls.append(p), 100 if len(calls) <= 2 else 1)[1]  # fills up while queued
-            try:
-                self.assertEqual(M.run(cfg, "w", str(task), d), 4)
-            finally:
-                M.free_gb = real
-            self.assertEqual(len(calls), 3)
-            self.assertNotIn("worker", M.read_meta(str(task)))
-
     def test_enospc_says_disk_full_and_how_to_resume(self):
         with tempfile.TemporaryDirectory() as d:
             bad = fake_cli(d, "bad", "cat >/dev/null\necho \"Error: ENOSPC: no space left on device, write\" >&2\n"
@@ -518,10 +492,6 @@ class Failures(unittest.TestCase):
     def test_reason_is_short_and_redacted(self):
         self.assertEqual(len(M.short("error " * 100)), 160)
         self.assertEqual(M.redact("token=abc ghp_XYZ123 xoxb-1-2 api_key: k"), "token=*** ghp_*** xoxb-*** api_key: ***")
-
-    def test_doctor_checks_min_free_gb(self):
-        probs = M.doctor({"minFreeGB": "10", "workers": {"w": {"type": "claude", "command": sys.executable, "minFreeGB": -1}}})
-        self.assertEqual([p.split(":")[0] for p in probs], ["minFreeGB", "workers.w.minFreeGB"])
 
 
 class MoreGuards(unittest.TestCase):

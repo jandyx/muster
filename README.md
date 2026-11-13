@@ -150,7 +150,6 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
   ],
   "only":  { "codex-work": ["~/workspace/work-*"] },   // this worker refuses any other repo
   "caps":  { "codex": 3, "claude": 5 },               // tasks at once per worker (by type or by name)
-  "minFreeGB": 10,                                     // free disk a task needs to start; also per worker
   "preamble": ["Never print secrets or tokens in your output."]
 }
 ```
@@ -176,7 +175,6 @@ Check it with `python3 <plugin>/skills/muster/muster.py doctor` (one line per pr
 | `only` | never plans a fenced worker elsewhere | refuses outside its globs (exit 3) |
 | `caps` | passes each task its whole worker list | queues while every listed worker is full, starts on the first to free a slot (priority, then launch order); counts live processes only |
 | `preamble` | adds the lines to every prompt | not checked |
-| `minFreeGB` (default 10; a worker's own value wins) | — | will not start a task while the cwd's or `runsDir`'s volume has less free space (exit 4, `failed: disk low (…)`); checked again when a queued task gets its slot |
 
 When a worker fails, `status` reads `failed: <reason>`: the last error line of its log (secrets such as `sk-…` or `Bearer …` masked, cut to 160 characters), or `exit <code>` when there is none. `meta` keeps it as `last_error`, with the log's path as `log_path`, and the pane shows both. A worker that ran out of disk shows `failed: disk full (ENOSPC), …` and its `result.md` ends with the command to rerun it.
 
