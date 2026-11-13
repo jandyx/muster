@@ -18,7 +18,6 @@ Read `~/.muster/config.json` (or the path in `MUSTER_CONFIG`) at the start of ev
 - `only.<worker>`: globs that worker may work in. Never route any other project to it, not even as a quota fallback. `muster.py` enforces it: outside those globs it refuses (exit 3, status `failed: refused, …`).
 - `caps.<worker>` or `caps.<type>`: the most tasks one worker runs at once (default codex 3, claude 5). `muster.py` enforces it: over the cap the task waits with status `queued` and starts by itself when a slot frees.
 - `preamble`: extra lines appended to the rules block of every prompt.
-- `minFreeGB` (global or `workers.<name>.minFreeGB`, default 10): `muster.py` will not start a task while the cwd's or `runsDir`'s volume has less free space (exit 4, status `failed: disk low (…)`). Free space before rerunning; do not lower the threshold without asking the user.
 - The user's explicit choice in the request always wins over the config.
 
 Assigning parallel tasks: pass each task the whole worker list `routing` gives its cwd, first choice first (`run codex-a,codex-b …`), minus workers the user ruled out. The runner starts it on the first listed worker with a free slot, and while every one is full it waits on all of them, so a task never sits behind one busy worker while another is idle. Launch every task at once; do not pick one worker per task to spread the load. When a worker fails on quota or rate limit (its status and meta `last_error` say so), rerun that task without that worker in its list.

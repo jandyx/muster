@@ -4,7 +4,7 @@
     muster.py run <worker[,worker…]> <task-dir> <cwd> [--after A,B] [--priority N]
                                               queue until deps are done and one of the workers has a free slot
                                               (first in the list wins a tie), then run prompt.md on it;
-                                              exit 3 refused (`only`), 4 disk low (`minFreeGB`), 5 dependency failed
+                                              exit 3 refused (`only`), 5 dependency failed
     muster.py cancel <task-dir> [reason]      stop a queued or running task; status becomes "canceled: reason"
     muster.py usage <task-dir>                (re)compute <task-dir>/usage for a finished task
     muster.py workers                         list configured workers
@@ -292,13 +292,6 @@ def cap_of(cfg, name):
     return int(caps.get(name, caps.get(kind, DEFAULT_CAPS.get(kind, 3))))
 
 
-DEFAULT_MIN_FREE_GB = 10
-
-
-def min_free_gb(cfg, name):
-    return float(cfg["workers"][name].get("minFreeGB", cfg.get("minFreeGB", DEFAULT_MIN_FREE_GB)))
-
-
 def mount_of(path):
     path = os.path.realpath(path)
     while not os.path.ismount(path):
@@ -308,15 +301,6 @@ def mount_of(path):
 
 def free_gb(path):
     return shutil.disk_usage(path).free / 1e9
-
-
-def disk_low(paths, need):
-    """'<free>G free on <mount>, need <need>G' for the first volume under `need`, else None."""
-    for path in paths:
-        free = free_gb(path)
-        if free < need:
-            return f"{free:.1f}G free on {mount_of(path)}, need {need:g}G"
-    return None
 
 
 ERROR_LINE = re.compile(r"ENOSPC|no space left on device|error|panic|traceback|quota|rate.?limit", re.I)
@@ -440,10 +424,6 @@ def doctor(cfg):
     for w in (cfg.get("only") or {}):
         if w not in workers:
             probs.append(f"only.{w}: unknown worker")
-    for where, w in [("", cfg), *((f"workers.{n}.", w) for n, w in workers.items())]:
-        v = w.get("minFreeGB")
-        if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
-            probs.append(f"{where}minFreeGB: {v!r}, expected a number of GB, 0 or more")
     for k, v in (cfg.get("caps") or {}).items():
         if k not in workers and k not in ("codex", "claude"):
             probs.append(f"caps.{k}: not a worker name or type")
@@ -552,10 +532,6 @@ def run(cfg, names, task, cwd, after=(), priority=0):
                 f"pid={os.getpid()}\nqueued={now()}\nafter={','.join(after)}\npriority={priority}\n")
     write_status(task, "queued")
     on_stop(task)
-    # Fail early when even the most lenient listed worker could not start; checked again at claim time.
-    low = disk_low((cwd, runs), min(min_free_gb(cfg, n) for n in names))
-    if low:
-        return disk_fail(task, low)
     shown, name = "queued", None
     while name is None:
         # The lock makes count-then-claim atomic, so queued tasks cannot all slip under a cap at once.
@@ -574,9 +550,6 @@ def run(cfg, names, task, cwd, after=(), priority=0):
                         break
                     full.append(f"{n} runs {busy} of {cap}")
                 if name is not None:
-                    low = disk_low((cwd, runs), min_free_gb(cfg, name))
-                    if low:
-                        return disk_fail(task, low)
                     append_meta(task, worker=name, type=cfg["workers"][name]["type"], started=now())
                     write_status(task, "running")
                     break
@@ -626,12 +599,6 @@ def run(cfg, names, task, cwd, after=(), priority=0):
     append_meta(task, last_error=reason, log_path=os.path.abspath(where or main_log))
     finish(task, rc, status)
     return rc
-
-
-def disk_fail(task, low):
-    append_meta(task, last_error=f"disk low ({low})")
-    finish(task, 4, f"failed: disk low ({low})")
-    return 4
 
 
 def main():
