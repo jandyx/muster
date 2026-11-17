@@ -218,7 +218,7 @@ Architecture, a run's sequence, a task's states and what each pane row reads are
 
 | What | Where | Size, roughly |
 |---|---|---|
-| Runs: prompts, status, logs, results, usage | `runsDir` (`~/.muster/runs`) | 1–3 MB per run; `log.txt` is the bulk |
+| Runs: prompts, status, logs, results, usage, `changes.diff`, `check.txt`, `review.md` | `runsDir` (`~/.muster/runs`) | 1–3 MB per run; `log.txt` is the bulk |
 | Worker transcripts | each CLI's own folder (`codexHome/sessions`, the Claude profile's `projects`) | owned by those tools |
 | Worktrees for parallel writers | next to the repo, branch `muster/<task>` | a full checkout each |
 
@@ -229,7 +229,7 @@ Muster deletes nothing on its own.
 ## Safety
 
 > [!WARNING]
-> Workers run with approvals and sandboxing off: they can run any command in the folder you give them. Use Muster in repos you trust, keep secrets out of prompts, and read the diffs before merging. Nothing is committed, pushed or merged unless you ask. `muster.py cancel` sends SIGTERM only to the runner pid in that task's `meta`, and only while that task is queued or running.
+> Workers run with approvals and sandboxing off: they can run any command in the folder you give them. Use Muster in repos you trust, keep secrets out of prompts, and read the diffs before merging. Nothing is committed, pushed or merged unless you ask. `muster.py cancel` sends SIGTERM only to the runner pid in that task's `meta`, and only while that task is queued or running. Around each task the runner snapshots the cwd's repo with `git add -A` into a throwaway copy of the index and `git write-tree`, before and after, to write `changes.diff`: that adds objects to the repo's `.git` (unreferenced, so git's automatic gc removes them once they are about two weeks old; with Git LFS, `git add` also copies tracked large files into `.git/lfs/objects`), but never touches the real index, a branch or a working file. `--check` runs the given command in the cwd with `sh -c`, with the same rights as the worker, one check at a time on the machine. Muster does not merge and does not police merges: the pane marks each done task `needs review` until its `review.md` approves the current `changes.diff`; use your repo's branch protection if merges need a hard gate.
 
 ## FAQ
 
