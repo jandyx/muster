@@ -49,10 +49,25 @@ def load_json(path, default):
         return default
 
 
+# A string, or a `//` comment up to the end of the line. Comments go; strings stay, so `"https://…"` survives.
+# hooks/register.tsx strips comments with the same pattern.
+JSON_COMMENT = re.compile(r'"(?:\\.|[^"\\\n])*"|//[^\n]*')
+
+
 def load_config():
-    cfg = load_json(CONFIG, None)
-    if cfg is None:
+    try:
+        with open(CONFIG, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
         sys.exit(f"muster: no config at {CONFIG} (copy examples/config.example.json there)")
+    except (OSError, ValueError) as e:  # unreadable, a directory, not UTF-8
+        sys.exit(f"muster: cannot read {CONFIG}: {e}")
+    try:
+        cfg = json.loads(JSON_COMMENT.sub(lambda m: m[0] if m[0][0] == '"' else "", text))
+    except ValueError as e:
+        sys.exit(f"muster: {CONFIG} is not valid JSON: {e}")
+    if not isinstance(cfg, dict):
+        sys.exit(f"muster: {CONFIG} must hold a JSON object")
     return cfg
 
 
@@ -397,13 +412,43 @@ def detect():
             "config_exists": os.path.isfile(CONFIG)}
 
 
+KEYS = {"": {"runsDir", "workers", "routing", "only", "caps", "preamble"},
+        "worker": {"type", "command", "args", "codexHome", "billing"},
+        "route": {"match", "workers", "preamble"}}
+
+
 def doctor(cfg):
     """Problems with the config, one line each; empty when it is usable."""
     probs = []
+
+    def strings(v):
+        return v is None or (isinstance(v, list) and all(isinstance(x, str) for x in v))
+
+    def unknown(where, d, kind):
+        # A typo such as "preambel" would otherwise be ignored without a word. Keys starting with "_" are notes.
+        for k in d:
+            if k not in KEYS[kind] and not k.startswith("_"):
+                probs.append(f"{where}{k}: unknown key (expected one of {', '.join(sorted(KEYS[kind]))})")
+
+    unknown("", cfg, "")
+    if not isinstance(cfg.get("runsDir", ""), str):
+        probs.append("runsDir: expected a path string")
     workers = cfg.get("workers") or {}
+    if not isinstance(workers, dict):
+        probs.append("workers: expected an object of name -> worker")
+        workers = {}
     if not workers:
         probs.append("workers: none configured")
-    for name, w in workers.items():
+    for name, w in list(workers.items()):
+        if not isinstance(w, dict):
+            probs.append(f"workers.{name}: expected an object")
+            del workers[name]
+            continue
+        unknown(f"workers.{name}.", w, "worker")
+        if not strings(w.get("args")):
+            probs.append(f"workers.{name}.args: expected a list of strings")
+        if w.get("billing") not in (None, "metered", "subscription"):
+            probs.append(f"workers.{name}.billing: {w['billing']!r}, expected 'metered' or 'subscription'")
         kind = w.get("type")
         if kind not in ("codex", "claude"):
             probs.append(f"workers.{name}.type: {kind!r}, expected 'codex' or 'claude'")
@@ -415,19 +460,42 @@ def doctor(cfg):
             home = expand(w.get("codexHome", "~/.codex"))
             if not os.path.isfile(os.path.join(home, "auth.json")):
                 probs.append(f"workers.{name}.codexHome: no auth.json in {home} (log in with CODEX_HOME={home} codex login)")
-    for i, r in enumerate(cfg.get("routing") or []):
-        for w in r.get("workers", []):
+    if not strings(cfg.get("preamble")):
+        probs.append("preamble: expected a list of strings")
+    routing = cfg.get("routing") or []
+    if not isinstance(routing, list) or not all(isinstance(r, dict) for r in routing):
+        probs.append("routing: expected a list of { match, workers } objects")
+        routing = []
+    for i, r in enumerate(routing):
+        unknown(f"routing[{i}].", r, "route")
+        if not isinstance(r.get("match"), str):
+            probs.append(f"routing[{i}].match: expected a glob string")
+        if not r.get("workers") or not strings(r.get("workers")):
+            probs.append(f"routing[{i}] ({r.get('match')}).workers: expected a non-empty list of worker names")
+            continue
+        for w in r["workers"]:
             if w not in workers:
                 probs.append(f"routing[{i}] ({r.get('match')}): unknown worker {w!r}")
-    if cfg.get("routing") and not any(r.get("match") == "*" for r in cfg["routing"]):
+        if not strings(r.get("preamble")):
+            probs.append(f"routing[{i}] ({r.get('match')}).preamble: expected a list of strings")
+    if routing and not any(r.get("match") == "*" for r in routing):
         probs.append("routing: no '*' fallback entry; tasks outside every match have no default worker")
-    for w in (cfg.get("only") or {}):
+    only, caps = cfg.get("only") or {}, cfg.get("caps") or {}
+    if not isinstance(only, dict):
+        probs.append("only: expected an object of worker -> globs")
+        only = {}
+    if not isinstance(caps, dict):
+        probs.append("caps: expected an object of worker or type -> number")
+        caps = {}
+    for w, globs in only.items():
         if w not in workers:
             probs.append(f"only.{w}: unknown worker")
-    for k, v in (cfg.get("caps") or {}).items():
+        if not globs or not strings(globs):
+            probs.append(f"only.{w}: expected a non-empty list of globs")
+    for k, v in caps.items():
         if k not in workers and k not in ("codex", "claude"):
             probs.append(f"caps.{k}: not a worker name or type")
-        elif not isinstance(v, int) or v < 1:
+        elif not isinstance(v, int) or isinstance(v, bool) or v < 1:
             probs.append(f"caps.{k}: {v!r}, expected a whole number of at least 1")
     return probs
 
