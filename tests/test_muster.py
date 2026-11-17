@@ -155,7 +155,7 @@ class Run(unittest.TestCase):
     def test_check_runs_after_the_worker_and_its_exit_code_decides(self):
         with tempfile.TemporaryDirectory() as d:
             repo = self.git_repo(d, {"a.txt": "a\n"})
-            rc, task = self.run_script(d, repo, "true", check="echo checking; test -f a.txt")
+            rc, task = self.run_script(d, repo, "echo made > marker.txt", check="echo checking; test -f marker.txt")
             self.assertEqual((rc, M.read_meta(str(task))["check"]), (0, "pass"))
             self.assertIn("checking", (task / "check.txt").read_text())
         with tempfile.TemporaryDirectory() as d:
@@ -177,6 +177,72 @@ class Run(unittest.TestCase):
             repo = self.git_repo(d, {"src/a.py": "x = 1\n", "tests/test_a.py": "assert True\n"})
             rc, task = self.run_script(d, repo, "echo 'x = 2' > src/a.py\necho '' > tests/test_a.py", check="true")
             self.assertEqual(M.read_meta(str(task))["tests_touched"], "tests/test_a.py")
+
+    def test_edits_hidden_by_assume_unchanged_still_count(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            repo = self.git_repo(d, {"a.txt": "a\n"})
+            subprocess.run(["git", "-C", str(repo), "update-index", "--assume-unchanged", "a.txt"], check=True)
+            rc, task = self.run_script(d, repo, "echo changed > a.txt")
+            self.assertIn("+changed", (task / "changes.diff").read_text())
+
+    def test_dirty_submodule_is_named_as_missing(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            child = self.git_repo(d, {"c.txt": "c\n"})
+            child = child.rename(pathlib.Path(d, "child-src"))
+            repo = self.git_repo(d, {"a.txt": "a\n"})
+            g = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "protocol.file.allow=always", "-c", "user.name=t",
+                                           "-c", "user.email=t@t", *a], check=True, capture_output=True)
+            g("submodule", "add", "-q", str(child), "child")
+            g("commit", "-qm", "add child")
+            rc, task = self.run_script(d, repo, "echo edit >> child/c.txt")
+            meta = M.read_meta(str(task))
+            self.assertEqual(meta["changes_missing"], "uncommitted edits inside submodules child")
+
+    def test_a_failing_git_diff_marks_changes_unavailable(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self.git_repo(d, {"a.txt": "a\n"})
+            real = subprocess_popen = __import__("subprocess").Popen
+            def popen(cmd, *a, **k):  # the streamed diff fails; everything else runs
+                if cmd[:1] == ["git"] and "--no-textconv" in cmd:
+                    cmd = ["sh", "-c", "echo partial; exit 2"]
+                return real(cmd, *a, **k)
+            with unittest.mock.patch.object(M.subprocess, "Popen", side_effect=popen):
+                rc, task = self.run_script(d, repo, "echo x >> a.txt")
+            self.assertEqual(M.read_meta(str(task))["changes"], "unavailable: git diff failed")
+            self.assertFalse((task / "changes.diff").exists())
+
+    def test_tests_touched_keeps_hidden_names_and_reads_absolute_paths(self):
+        self.assertEqual(M.tests_touched([".check.sh", "x/run.sh"], "./.check.sh && /r/x/run.sh", "/r"), [".check.sh", "x/run.sh"])
+
+    def test_sigterm_during_the_check_stops_its_children_and_keeps_usage(self):
+        import fcntl, signal, subprocess, time as t
+        with tempfile.TemporaryDirectory() as d:
+            repo = self.git_repo(d, {"a.txt": "a\n"})
+            fake = pathlib.Path(d, "fake-claude")
+            fake.write_text("#!/bin/sh\ncat >/dev/null\necho '{\"type\":\"result\",\"result\":\"worker done\",\"modelUsage\":{}}'\n")
+            fake.chmod(0o755)
+            cfg = pathlib.Path(d, "config.json")
+            cfg.write_text(json.dumps({"runsDir": d, "workers": {"w": {"type": "claude", "command": str(fake)}}}))
+            task = pathlib.Path(d, "run/a")
+            task.mkdir(parents=True)
+            (task / "prompt.md").write_text("# t\n")
+            pidfile = pathlib.Path(d, "child.pid")
+            p = subprocess.Popen([sys.executable, str(ROOT / "skills/muster/muster.py"), "run", "w", str(task), str(repo),
+                                  "--check", f"sleep 60 & echo $! > {pidfile}; wait"], env=dict(os.environ, MUSTER_CONFIG=str(cfg)),
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(100):
+                if pidfile.exists() and pidfile.read_text().strip():
+                    break
+                t.sleep(0.1)
+            self.assertTrue((task / "result.md").exists() and (task / "usage").exists())  # written before the check
+            p.send_signal(signal.SIGTERM)
+            self.assertEqual(p.wait(timeout=30), 128 + signal.SIGTERM)
+            child = int(pidfile.read_text())
+            t.sleep(0.3)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child, 0)
 
     def test_meta_names_tasks_that_shared_the_repo(self):
         with tempfile.TemporaryDirectory() as d:
@@ -255,6 +321,21 @@ class Run(unittest.TestCase):
             meta = M.read_meta(str(task))
             self.assertNotIn("base", meta)
             self.assertEqual(meta["changes"], "unavailable: cwd is not in a git repo")
+
+    def test_model_and_effort_come_from_the_worker_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            task = pathlib.Path(d, "a")
+            task.mkdir()
+            (task / "log.txt").write_text("OpenAI Codex v0.169.0\n--------\nmodel: gpt-6-astra\nreasoning effort: high\n--------\n")
+            M.record_model(str(task), "codex")
+            meta = M.read_meta(str(task))
+            self.assertEqual((meta["model"], meta["effort"]), ("gpt-6-astra", "high"))
+            other = pathlib.Path(d, "b")
+            other.mkdir()
+            (other / "stream.jsonl").write_text('{"type":"system","subtype":"hook_started"}\n'
+                                                '{"type":"system","subtype":"init","model":"deepseek-flash[1m]"}\n')
+            M.record_model(str(other), "claude")
+            self.assertEqual(M.read_meta(str(other))["model"], "deepseek-flash[1m]")
 
     def test_sigterm_still_records_a_final_status(self):
         import signal, subprocess, time
@@ -457,6 +538,9 @@ class Queue(unittest.TestCase):
 class Setup(unittest.TestCase):
     def test_doctor_names_each_problem(self):
         self.assertIn("only: expected", "\n".join(M.doctor({"workers": {}, "only": ["x"], "caps": [1]})))
+        odd = "\n".join(M.doctor({"workers": {"x": {"type": "claude", "command": 5, "args": None}}}))
+        self.assertIn("workers.x.command: expected a path string", odd)
+        self.assertIn("workers.x.args: expected a list of strings", odd)
         cfg = {"workers": {"a": {"type": "codex", "codexHome": "/nonexistent", "command": sys.executable},
                            "b": {"type": "cli"}},
                "routing": [{"match": "~/x/*", "workers": ["a", "ghost"], "preamble": "one line"}],
@@ -732,7 +816,11 @@ class Clean(unittest.TestCase):
             (done_wt / "b.txt").write_text("b\n")
             g("add", ".", cwd=done_wt)
             g("commit", "-qm", "done work", cwd=done_wt)
+            (repo / "other.txt").write_text("o\n")
+            g("add", ".")
+            g("commit", "-qm", "unrelated work on main")
             g("cherry-pick", "muster/done")  # merged by content, as a rebase or cherry-pick merge leaves it
+            self.assertNotEqual(subprocess.run(["git", "-C", str(repo), "merge-base", "--is-ancestor", "muster/done", "main"]).returncode, 0)
             g("worktree", "add", "-q", str(open_wt), "-b", "muster/open")
             (open_wt / "c.txt").write_text("c\n")
             g("add", ".", cwd=open_wt)
@@ -753,6 +841,17 @@ class Clean(unittest.TestCase):
             self.assertRegex(out, r"worktree .*repo-done \[muster/done\]: merged, .*   git -C .* worktree remove")
             self.assertRegex(out, r"worktree .*repo-open \[muster/open\]: 1 commits not in main, .*# keep or check first")
             self.assertIn("all 2 merged branches without a worktree", out)
+            # A branch whose own merge commit carries work main lacks is not merged, though `git cherry` shows nothing.
+            g("checkout", "-q", "-b", "muster/with-merge", "main~1")
+            g("checkout", "-q", "-b", "side", "main~1")
+            (repo / "side.txt").write_text("s\n")
+            g("add", ".")
+            g("commit", "-qm", "side")
+            g("checkout", "-q", "muster/with-merge")
+            g("merge", "-q", "--no-ff", "-m", "merge side", "side")
+            g("branch", "-D", "side")
+            g("checkout", "-q", "main")
+            self.assertRegex(M.clean({"runsDir": str(runs)}, days=14), r"branch muster/with-merge: \d+ commits not in main")
             self.assertTrue(done_wt.is_dir() and (runs / "20260101-0000-old").is_dir())  # nothing deleted
             self.assertIn("muster/old-merged", subprocess.run(["git", "-C", str(repo), "branch"], capture_output=True, text=True).stdout)
 

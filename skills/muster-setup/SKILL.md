@@ -44,7 +44,7 @@ If the user already said these things in this conversation, do not ask again.
 ## 4. Write and check
 
 1. Show the final JSON in one block and say where it goes. If a config exists, show what changes.
-2. Write it. Back up an existing file first: `cp ~/.muster/config.json ~/.muster/config.json.bak-$(date +%Y%m%d-%H%M%S)`.
+2. Write it. Back up an existing file first: `C="${MUSTER_CONFIG:-$HOME/.muster/config.json}"; cp "$C" "$C.bak-$(date +%Y%m%d-%H%M%S)"`.
 3. Run `python3 $MUSTER doctor`. Fix every line it prints, then run it again until it says `ok`.
 4. Optional smoke test, only if the user agrees (it spends a little quota): one task per worker that replies `PONG`, run with `python3 $MUSTER run <worker> <task-dir> /tmp`; report each `status` and `usage`.
 

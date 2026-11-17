@@ -357,8 +357,10 @@ export const register: Register = on => {
           // A done task whose diff muster recorded counts as reviewed once review.md approves that same diff: its
           // `Verdict:` line and meta's `changes_sha256`, so a review of an earlier diff does not count. Older tasks
           // (no `changes` in meta) show no review state.
+          // The last `Verdict:` line counts, so a quoted or earlier approval cannot outvote a later "Needs fixes".
+          const verdict = ([...reviewText.matchAll(/^\W*Verdict\W*:\W*(.*?)\W*$/gim)].at(-1)?.[1] ?? '').toLowerCase()
           const approved =
-            /^\W*Verdict:\W*(Approved|User override)\W*$/im.test(reviewText) &&
+            (verdict === 'approved' || verdict === 'user override') &&
             (!kv.changes_sha256 || reviewText.includes(kv.changes_sha256))
           const review = status.trim() !== 'done' || kv.changes === undefined ? '' : approved ? 'reviewed' : 'needs review'
           return {
@@ -708,7 +710,8 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const active = (await read($, runsAtom)).filter(r => r.tasks.some(isActive))
+    // A run stays in the band while a task runs or a finished one still needs review.
+    const active = (await read($, runsAtom)).filter(r => r.tasks.some(t => isActive(t) || t.review === 'needs review'))
     // Claude's own subagents count while one is still going; a finished one leaves the band quiet.
     const activeAgents = (await read($, agentsAtom)).filter(isAgentActive)
     if (e.props.hasSurvey || (active.length === 0 && activeAgents.length === 0)) return next(e)
