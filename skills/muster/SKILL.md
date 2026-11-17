@@ -5,69 +5,99 @@ description: Run tasks in parallel on Codex and other CLI workers, then verify a
 
 # Muster
 
-Claude is the planner and verifier. Workers do the hands-on work. Every run follows the same loop and the same report format, so the user never has to explain it again.
+Claude plans and verifies; workers do the hands-on work. Every run follows the same loop and report, so the user never explains it again. `$MUSTER` below is `muster.py` in this skill's folder.
 
-The runner is `muster.py` in this skill's base directory (the folder this file is in). Below, `$MUSTER` means that path.
+## Config
 
-## Workers and routing come from the config
+Read `~/.muster/config.json` (or `MUSTER_CONFIG`) at the start of every run; `python3 $MUSTER workers` lists workers. No config, or `python3 $MUSTER doctor` reports problems: run the `muster-setup` skill first; never guess workers.
 
-Read `~/.muster/config.json` (or the path in `MUSTER_CONFIG`) at the start of every run. `python3 $MUSTER workers` lists the workers. If there is no config, or `python3 $MUSTER doctor` reports problems, run the `muster-setup` skill first; do not guess workers.
+- `workers.<name>.type`: `codex` (`codex exec` with its `codexHome`) or `claude` (a Claude Code compatible command run with `-p`).
+- `routing`: `{ match, workers, preamble? }` list. The first `match` glob (`~` allowed) that fits the cwd gives its workers, first choice first; `*` is the fallback.
+- `only.<worker>`: the only globs that worker may work in; never route elsewhere, not even as a quota fallback. The runner refuses outside them (exit 3).
+- `caps.<worker>` or `caps.<type>`: tasks at once per worker (default codex 3, claude 5). The runner queues over the cap.
+- `preamble` and the matching `routing` entry's `preamble`: lines added to every prompt's rules block.
+- The user's explicit choice always wins over the config.
 
-- `workers.<name>.type`: `codex` (runs `codex exec` with that worker's `codexHome`) or `claude` (runs a Claude Code compatible command with `-p`).
-- `routing`: a list of `{ match, workers }`. The first `match` glob (`~` allowed) that fits the task's cwd gives the worker priority, first choice first. `*` is the fallback.
-- `only.<worker>`: globs that worker may work in. Never route any other project to it, not even as a quota fallback. `muster.py` enforces it: outside those globs it refuses (exit 3, status `failed: refused, …`).
-- `caps.<worker>` or `caps.<type>`: the most tasks one worker runs at once (default codex 3, claude 5). `muster.py` enforces it: over the cap the task waits with status `queued` and starts by itself when a slot frees.
-- `preamble`: extra lines appended to the rules block of every prompt.
-- The user's explicit choice in the request always wins over the config.
+Pass each task the whole worker list for its cwd (`run codex-a,codex-b …`), minus workers the user ruled out, and launch every task at once: the runner starts each on the first listed worker with a free slot. A task failed on quota or rate limit (`last_error` says so): rerun it without that worker.
 
-Assigning parallel tasks: pass each task the whole worker list `routing` gives its cwd, first choice first (`run codex-a,codex-b …`), minus workers the user ruled out. The runner starts it on the first listed worker with a free slot, and while every one is full it waits on all of them, so a task never sits behind one busy worker while another is idle. Launch every task at once; do not pick one worker per task to spread the load. When a worker fails on quota or rate limit (its status and meta `last_error` say so), rerun that task without that worker in its list.
-
-Metered workers on a peak-priced model (see `prices.json`, e.g. DeepSeek: weekdays 01:00–04:00 and 06:00–10:00 UTC cost double): when a large, non-urgent batch would run in peak hours, say so in the plan and offer to run it later. The user decides.
+Metered workers on a peak-priced model (`prices.json`; DeepSeek costs double weekdays 01:00–04:00 and 06:00–10:00 UTC): if a large, non-urgent batch would run at peak, say so in the plan and offer to run it later.
 
 ## Loop
 
-1. **Plan.** Split the request into independent tasks, each with a clear goal, scope (files or directories) and a done check. Show the plan as a table (id, worker, cwd, goal) and start without waiting, unless the request is ambiguous.
-2. **Isolate.** Tasks that write to the same repo in parallel (on one worker or several) each get their own worktree: `git -C <repo> worktree add ../<repo>-<task-id> -b muster/<task-id>`. A single writer, or read-only tasks, can share the repo.
-3. **Prepare.** Run dir: `<runsDir>/<YYYYMMDD-HHMM>-<slug>/<task-id>/` (`runsDir` from the config, default `~/.muster/runs`). `<task-id>` is a kebab-case slug — the DNS-1123 label rule used for Kubernetes resource names and Docker tags: `^[a-z][a-z0-9]*(-[a-z0-9]+)*$`, max 63 chars, no leading, trailing or doubled `-`. Derive it from the title's English core (lowercase, non-alphanumerics to `-`, cut at a word boundary: `fix-pr-association-wait`, `f191-workflow-timeline`), and append `-r2`, `-r3` to a retry. It is what the pane labels the task with, what `--after` names, and the suffix of the `muster/<task-id>` worktree branch, so keep it stable once launched.
-   Write `prompt.md` there. Workers start cold, so the prompt holds everything: goal, cwd, files in scope, constraints, the done check, and "end with a short summary: what changed, how it was verified, open issues". The first line is `# <short task title>` in the user's language, at most 60 characters — the pane shows it as the task name and shows the bare id when it is missing — then the rules block:
+1. **Plan.** Split the request into independent tasks, each with a goal, scope and done check. Show a table (id, worker, cwd, goal) and start without waiting unless the request is ambiguous. Size each task so one run can finish it; work that needs design judgment gets the design written into the brief, or stays with Claude.
+2. **Isolate.** Parallel writers to one repo each get a worktree: `git -C <repo> worktree add ../<repo>-<task-id> -b muster/<task-id>`. One writer, or read-only tasks, may share the repo.
+3. **Prepare.** Task dir: `<runsDir>/<YYYYMMDD-HHMM>-<slug>/<task-id>/` (`runsDir` default `~/.muster/runs`). `<task-id>` is a kebab-case slug (`^[a-z][a-z0-9]*(-[a-z0-9]+)*$`, max 63 chars) from the title's English core, e.g. `fix-pr-association-wait`; a retry appends `-r2`, `-r3`. It labels the task in the pane, names it in `--after` and ends its `muster/<task-id>` branch, so keep it stable.
+   Write `prompt.md`. Workers start cold and run once, so it is a full brief:
+   - **Goal and why**: the outcome and where it fits in the larger change.
+   - **Decisions made**: settle approach, names and data shapes now; a worker left to choose often picks what you would reject.
+   - **Where to look**: cwd, files expected to change, interfaces to call, one existing file that shows the pattern to follow.
+   - **Not this task**: what sibling tasks own and what to leave alone.
+   - **Done check**: a command you write that proves the outcome. Prefer end to end (the real program driven as a user would: CLI, API, browser, simulator); for a migration or refactor, compare old and new outputs on the same inputs; for an invariant such as encode-then-decode, a property test. Use the repo's verify skill or script if it has one. Confirm it can run in this cwd before launch.
+
+   First line: `# <short task title>` in the user's language, at most 60 characters (the pane's task name). Then:
 
    ```
    Rules for this task:
    - Do not commit, push, rebase, or open a pull request unless this task says so.
    - Never write CI skip markers ([skip ci], [ci skip], [no ci], [skip actions], [actions skip], skip-checks: true) in a commit message unless this task says the commit is meant to skip CI.
    - No new dependencies unless this task says so.
-   - Stay inside the files in scope. If the task needs more, stop and say so in the summary.
-   - Run the done check yourself before finishing and report its real output. If it fails, say so; do not claim success.
-   - You run once, with no follow-up turn: finish the whole task, or state clearly what is left.
+   - Change only what this task needs, plus files the change strictly requires (callers, tests, types); list each extra file with its reason. Never edit what "Not this task" lists. Report BLOCKED instead of guessing when the task needs a design choice it does not settle, or more than a few files beyond the expected ones.
+   - Follow the codebase's patterns and reuse its helpers. No refactors, renames or cleanups outside the task; no options, abstractions or fallbacks "for later".
+   - Tests check real behavior, not mocks, and fail if the change is reverted. Never weaken, skip or delete a test to make it pass. A flaky test is not fixed by rerunning, sleeps or retries: find the cause, or leave it failing and say why.
+   - Before reporting, read your whole diff once for missing or unasked-for work, debug leftovers, duplicated logic and swallowed errors; fix them.
+   - Run the done check yourself and report its real output. If it fails, say so.
+   - You run once: finish the task or state what is left. Saying the task is too hard or under-specified is fine; handing in work you are unsure of without saying so is not.
+   - End with a report whose first line is exactly one of `Status: DONE`, `Status: DONE_WITH_CONCERNS`, `Status: BLOCKED`, `Status: NEEDS_CONTEXT`, then the files changed (extra files with their reason), the done check's real output tail, and concerns or what is left.
    ```
 
-   Then each line of the config's `preamble`, and any repo rule from the user's own instructions that applies to this cwd (workers do not see Claude's CLAUDE.md or memory).
-4. **Launch.** For each task, call Bash with `run_in_background: true`:
-   `python3 $MUSTER run <worker[,worker…]> <task-dir> <cwd> [--after A,B] [--priority N]`
-   Launch all tasks in the same message, dependent ones too. `--after A,B`: wait until sibling tasks A and B (same run dir) are `done`; if one fails or is canceled, this task is canceled (exit 5) without running. `--priority N` (default 0): on a full worker, higher N starts first; equal N start in launch order. The runner writes `status` (queued, … / running / done / failed: … / canceled: …), `meta`, `log.txt` (codex) or `stream.jsonl` (claude), `result.md` and `usage`.
-   **Cancel** a task that is no longer needed (superseded, out of scope) with `python3 $MUSTER cancel <task-dir> "<reason>"`; never write `status` by hand. It stops the worker if it runs and records `canceled: <reason>`, which the pane and report do not count as a failure.
-5. **Wait.** Background tasks notify on exit, so do not poll. If the user asks in the meantime, read each `status` and report; the Muster pane (`/muster-panel`) shows live progress.
-6. **Verify.** Read each `result.md`, then check the work yourself: the diff (`git -C <cwd> diff`), the build or tests the task names. A worker's claim is not evidence. Failed or wrong: write a follow-up prompt with the concrete problem and rerun on the same or another worker.
-7. **Report** in the format below. Merging worktrees, committing and pushing happen only when the user asks; once a `muster/*` branch is merged, offer to remove its worktree.
+   Then the config's `preamble` lines, the matching `routing` entry's, and any repo rule from the user's own instructions for this cwd (workers do not see Claude's CLAUDE.md or memory).
+4. **Launch.** Each task in its own Bash call with `run_in_background: true`, all in one message, dependent ones too:
+   `python3 $MUSTER run <worker[,worker…]> <task-dir> <cwd> [--after A,B] [--priority N] [--check "<done check>"]`
+   - `--after A,B`: wait until sibling tasks A and B are `done`; if one fails or is canceled, this one is canceled (exit 5).
+   - `--priority N` (default 0): on a full worker, higher starts first.
+   - `--check`: give it for every done check that is a command. After the worker exits, the runner runs it in the cwd (`sh -c`, one check at a time on the machine), writes `check.txt` and `check=pass|fail (exit N)` to `meta`, and a failure makes the task `failed: done check failed …`. That exit code is the test evidence, not the worker's report. Keep it narrow (the touched modules' tests, a typecheck), since the worker usually ran it too.
+   - The runner writes `status`, `meta`, `log.txt` or `stream.jsonl`, `result.md`, `usage`, `check.txt`, and `changes.diff` when the cwd is in a git repo.
+   - `python3 $MUSTER cancel <task-dir> "<reason>"` stops a task that is no longer needed; never write `status` by hand.
+5. **Wait.** Tasks notify on exit; do not poll. If asked meanwhile, read each `status`; `/muster-panel` shows live progress.
+6. **Verify.** The failure to avoid, seen in past runs: merging after reading only `result.md`, `git log`, `--stat` or a diff piped to `head`, on the worker's word. A worker's report is a claim. No task is merged, deployed or reported done until its whole diff is read and `review.md` records it; the pane marks done tasks `needs review` until then. Merge only when the user asks, and only reviewed tasks.
+   - **The runner's evidence.** `changes.diff` is everything that changed in the repo between the worker's start and exit: its commits, edits and new files, without edits already uncommitted before it started. It cannot tell who made a change: if `meta` has `shared_with` (other tasks ran in that repo meanwhile), check each file against this task's brief before calling it extra, and never edit a repo yourself while a worker runs in it. `meta` also has `changes` (`N files +A -B`), `changes_sha256`, `branch`, `commits`, `check`, `tests_touched`, and `branch_start` if the worker switched branches. `changes=unavailable: <reason>`: inspect `git -C <repo> status` and `diff` yourself, new files included, or mark the task `needs review`.
+   - **Read** `result.md` (no `Status:` line: treat as `DONE_WITH_CONCERNS`), `check.txt`, then all of `changes.diff` with the Read tool (page with `offset`/`limit`), never through `head`, `tail` or `grep`.
+   - **Review against `prompt.md`**, in two passes:
+     - **Spec**: every requirement maps to a hunk. Flag **missing**, **extra** (not asked for) and **misread** (wrong problem or approach). What the diff cannot show goes under **Cannot verify**.
+     - **Quality**: codebase patterns, no duplicated logic or swallowed errors, edge cases handled, tests that fail without the change, no file grown far past the task. Style is Minor.
+     Rate each finding Critical, Important (task cannot be trusted until fixed) or Minor. A problem in code the task did not change is Pre-existing: report it, do not send it back.
+   - **The change must not grade itself.** Read the hunks in `tests_touched` (changed tests and files the `--check` runs) first: a weakened assertion, a skipped or deleted test or a loosened check script is Critical unless the brief asked for it. Never rerun a failed check hoping for green; a flaky check is a finding.
+   - **A fresh reviewer** for a diff over about 300 lines or 8 files, or when your context is long: an Agent subagent (`general-purpose`) given the paths of `prompt.md`, `result.md`, `check.txt` and `changes.diff`, told to read the whole diff, treat `result.md` and the worker's reasons as unverified claims, review against the brief rather than taste, cite `file:line`, rate each finding, list what it cannot verify, and end with `Verdict: Approved` or `Verdict: Needs fixes`. Do not tell it what you expect to find. Confirm its Critical and Important findings in the code yourself.
+   - **Record** `review.md` in the task dir:
+     ```
+     Reviewer: <Claude, or reviewer subagent>
+     Verdict: <Approved, or Needs fixes>
+     changes-sha256: <changes_sha256 from meta>
+     Findings: <severity, file:line, problem; or none>
+     Cannot verify: <items; or none>
+     ```
+     `Approved` needs no open Critical or Important finding and every Cannot verify item settled (run it, check it, or ask the user). `Verdict: User override` only when the user explicitly said to merge without review.
+   - Tasks in one repo: compare the files in their `changes.diff`; an overlap is a merge conflict to plan.
+   **Fix loop.** Critical or Important findings, or `failed: done check failed`: write `<task-id>-r2` repeating the original brief plus each finding at `file:line` (or the end of `check.txt`) and what is wanted, and run it in the same worktree. Its diff holds only the fix; review it against the brief and the findings. Once approved, set the original's `review.md` to `Verdict: Approved` with `Fixed in: <task-id>-r2`, keeping its own `changes-sha256`. BLOCKED or NEEDS_CONTEXT: answer in the follow-up, or split the task. After three failed rounds (the first run and two fixes), stop: use a stronger worker, do it yourself, or ask the user.
+   **Learn from misses.** The same kind of miss caught twice in one project: propose one line for that project's `routing[].preamble` and add it once the user agrees. Drop preamble lines that no longer fire.
+7. **Report** as below. Merge, commit and push only when asked; after a `muster/*` branch is merged, offer to remove its worktree. Asked what can be cleaned up: show `python3 $MUSTER clean` (it deletes nothing) and remove only what the user picks.
 
 ## Report format
 
 ```
-| id | worker | task | status | tokens | cost | result |
-|----|--------|------|--------|--------|------|--------|
-| A  | codex  | ...  | done / running / queued / failed / canceled / needs review | in 1.5M (95% cached) · out 14k | ≈$2.91 | one line |
+| id | worker | task | status | verified | tokens | cost | result |
+|----|--------|------|--------|----------|--------|------|--------|
+| A  | codex  | ...  | done / running / queued / failed / canceled / needs review | check pass · review subagent / none | in 1.5M (95% cached) · out 14k | ≈$2.91 | one line |
 ```
 
-Then:
-- **Results**: what each task produced, with file paths or diff stats.
-- **Usage**: from each task's `usage` file. Total tokens for the run, then metered money as `$` (say when it ran at peak price) and subscription work as `≈$` (API-equivalent; not billed per token).
-- **Verification**: what Claude checked and the result (commands run, pass or fail).
-- **Open / risks**: anything skipped, failed, or needing the user's decision. For each failed task give meta's `last_error` and `log_path`. On `failed: disk full (ENOSPC)` the end of `result.md` has the rerun command; say what filled the disk if the log shows it.
-- **Next**: concrete options (merge worktree X, rerun B, ...).
-
-Write the report in the user's language.
+Then, in the user's language:
+- **Results**: what each task produced, with paths or diff stats.
+- **Usage**: from each `usage` file. Total tokens; metered money as `$` (say if at peak price), subscription work as `≈$` (API-equivalent).
+- **Verification**: per task, who read the whole diff and the verdict in `review.md`, plus the commands you ran and their result; `none` when nothing was verified. "The worker says tests pass" is not verification.
+- **Open / risks**: anything skipped, failed or needing a decision; for each failure, meta's `last_error` and `log_path` (on `disk full (ENOSPC)`, `result.md` ends with the rerun command).
+- **Next**: concrete options (merge worktree X, rerun B, …).
 
 ## Notes
 
-- Codex workers run `codex exec --dangerously-bypass-approvals-and-sandbox`; claude workers run whatever `command` and `args` the config gives (usually with permissions skipped). Workers can run any command: keep them in repos the user trusts, and never put secrets in prompts.
-- Codex workers still load their `codexHome`'s `AGENTS.md`, config and skills; wrappers such as oh-my-codex add runtime hooks that plain `codex exec` does not run.
+- Codex workers run `codex exec --dangerously-bypass-approvals-and-sandbox`; claude workers run their configured `command` and `args`, usually with permissions skipped. Workers can run any command: keep them in repos the user trusts, and never put secrets in prompts.
+- Codex workers still load their `codexHome`'s `AGENTS.md`, config and skills; wrappers such as oh-my-codex add hooks that plain `codex exec` does not run.
