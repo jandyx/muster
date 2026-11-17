@@ -20,29 +20,37 @@
 
 You talk to one Claude Code session. Claude splits the job, hands each piece to a worker (a Codex account, Claude Code on another backend such as DeepSeek), checks what comes back, and reports. Muster gives that loop a fixed shape so you stop re-explaining it every session, and puts a pane beside the chat that shows what every worker is doing right now and what it has cost.
 
-<p align="center"><img src="assets/screenshot.png" alt="Claude Code with the Muster pane: a plan table on the left, live task progress, tokens and cost on the right, and the muster band above the prompt" width="100%"></p>
+<p align="center"><img src="assets/screenshot.png" alt="Claude Code with the Muster pane: a plan table with done checks and the review of each finished task on the left; on the right a reviewer subagent at work, live task progress, each task&#39;s model, tokens and cost, and a done task marked needs review; the muster band above the prompt" width="100%"></p>
 
 <details>
 <summary>The same pane as text</summary>
 
 ```text
-▾ 20261105-1635-test-tiering  2 running · 4 done · 0 failed
-  Σ 6.95M tokens · $0.35 billed · ≈$10.14 sub
-    codex-work: 3.66M tokens · ≈$5.17 sub
-    deepseek: 3.29M tokens · $0.35 billed
+▾ Claude agents 1 running · 0 done · 0 failed
 
-  ✓ Tiered tests: registry, tags and runner
-    A · codex-work · done · 10m49s · ⎇ muster/tt-A
-    in 3.65M (97% cached) · out 12k · ≈$5.17
-    ↳ Registry, tag checks and migration list done; report.md
+  … Review A's diff against its brief
+    general-purpose · running
+    $ Read runs/20261117-1635-test-tiering/a/changes.diff
 
-  … Tiered tests: test-plan and test-affected
-    D · codex · running · 9m35s · ⎇ muster/tt-D
-    ↻ Shell and executor tests pass; fixing the /var vs /private/var check, rerunning
-    $ bash tests/run-runtime.sh tests/runtime/developer/developer-entry.test.mjs
+▾ 20261117-1635-test-tiering 1 running · 2 done · 0 failed
+  Σ 4.12M tokens · $0.06 billed · ≈$5.48 sub
+    codex: 2.30M tokens · ≈$3.41 sub
+    codex-work: 1.40M tokens · ≈$2.07 sub
+    deepseek: 0.42M tokens · $0.06 billed
 
-▸ 20261105-1540-test-speed  0 running · 6 done · 0 failed
-  Σ 19.60M tokens · $0.35 billed · ≈$11.50 sub
+  ▾ Running · 1
+
+  … test-affected command
+    C · deepseek · deepseek-flash · running · 6m02s · ⎇ muster/tt-C
+    ↻ Mapping changed files to the suites that cover them…
+    $ npm test -- tests/affected
+
+  ▾ Done · 2
+
+  ✓ Test tiers: registry and tags · needs review
+    A · codex-work · gpt-6-astra high · done · 9m14s · ⎇ muster/tt-A
+    in 1.40M (95% cached) · out 11k · ≈$2.07
+    ↳ Status: DONE
 ```
 
 </details>
@@ -59,16 +67,18 @@ Muster turns that into a habit Claude already knows and a screen you can glance 
 | Parallel edits to one repo | hope they don't collide | one git worktree per task, automatically |
 | "Is it done? Is it stuck?" | switch terminals, read logs | live pane: latest note, latest command, stall warning |
 | "What did that cost?" | guess | tokens and dollars per task, per worker, per run |
-| Trusting the result | read every worker's claims | Claude checks the diffs and tests before reporting |
+| Trusting the result | take the worker's "tests pass" | the runner runs the done check and records exactly what changed; Claude reads the whole diff, and the pane marks what nobody reviewed |
 
 ## Features
 
 - **A `muster` skill.** Plan → isolate → self-contained prompts → launch in the background → run the done check itself (`--check`) → review the whole diff (`changes.diff`, written by the runner) into `review.md`; the pane marks unreviewed tasks → one report table. The same loop every time.
 - **Any number of workers.** Each Codex account is a `codex` worker with its own `CODEX_HOME`; any Claude Code compatible CLI is a `claude` worker. Several tasks can run on one account at once.
 - **Routing you write once.** Per-repo worker priority with quota fallbacks, workers fenced to certain repos, parallel caps. The fences and caps are enforced by the runner, not left to Claude's memory.
-- **A live pane and band.** Task title, worker, elapsed time, the worker's latest note and command, a red warning after 2 minutes of silence, a one-line result, foldable runs — and the session's own Claude subagents, running first, finished ones folded.
+- **Evidence, not claims.** Around each task the runner snapshots the repo and writes `changes.diff` with only that worker's changes, runs the done check itself (`--check`), and flags edits to tests (`tests_touched`) and other tasks in the same repo (`shared_with`). Claude reviews against the brief and records `review.md`.
+- **A live pane and band.** Task title, worker, the model it runs on, elapsed time, the worker's latest note and command, a red warning after 2 minutes of silence, a one-line result, `needs review` on a done task nobody has reviewed, foldable runs — and the session's own Claude subagents, running first, finished ones folded.
 - **Honest cost accounting.** Billed `$` for metered APIs, with DeepSeek's peak-hour price; API-equivalent `≈$` for Codex on a ChatGPT subscription; long-context pricing per request.
 - **Session-bound.** A session sees only the runs it started; `claude --resume` brings them back.
+- **A clean-up list.** `muster.py clean` lists old runs, task worktrees and `muster/*` branches, merged or not, with the command for each; it deletes nothing.
 - **No dependencies.** The runner is one Python file on the standard library.
 
 ## Quick start
@@ -176,6 +186,7 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
 | `only` | never plans a fenced worker elsewhere | refuses outside its globs (exit 3) |
 | `caps` | passes each task its whole worker list | queues while every listed worker is full, starts on the first to free a slot (priority, then launch order); counts live processes only |
 | `preamble` | adds the lines to every prompt, then the first matching `routing` entry's `preamble` | only its shape (`doctor`) |
+| `--check` | writes a done check for each task and passes it | runs it after the worker, one at a time per `runsDir`; a failing check fails the task |
 
 When a worker fails, `status` reads `failed: <reason>`: the last error line of its log (secrets such as `sk-…` or `Bearer …` masked, cut to 160 characters), or `exit <code>` when there is none. `meta` keeps it as `last_error`, with the log's path as `log_path`, and the pane shows both. A worker that ran out of disk shows `failed: disk full (ENOSPC), …` and its `result.md` ends with the command to rerun it.
 
@@ -262,6 +273,13 @@ The runner stopped it before it started: exit 3 means every worker it was given 
 </details>
 
 <details>
+<summary><b>What does "needs review" mean?</b></summary>
+
+The task finished, but nobody has approved its `changes.diff` yet. It clears when `review.md` in the task folder has `Verdict: Approved` and the `changes_sha256` from `meta`, so a review of an older diff does not count. Muster never merges; it only shows what was taken on trust.
+
+</details>
+
+<details>
 <summary><b>I resumed a session and the pane is empty.</b></summary>
 
 Runs are tied to the session id that started them. `claude --resume` keeps the id; `--fork-session` and `/clear` start a new one, so earlier runs stay on disk but leave the pane.
@@ -275,6 +293,7 @@ Runs are tied to the session id that started them. `claude --resume` keeps the i
 - While a `claude` worker is thinking, its `↻` note stays on the previous line.
 - A Claude agent's latest tool call is kept in memory: a plugin reload forgets it until that agent calls another tool.
 - The pane shows the last 30 runs of the current session.
+- `changes.diff` cannot tell who made a change: edits you make by hand in the same repo while a worker runs land in its diff (other muster tasks are named in `shared_with`). A large untracked, un-ignored folder makes the snapshot slow.
 
 ## Contributing
 
@@ -283,8 +302,10 @@ Issues and pull requests are welcome. Coding agents: read [AGENTS.md](AGENTS.md)
 ```bash
 claude plugin validate .                  # manifest, hooks module, marketplace
 claude plugin test .                      # pane and band
-python3 -m unittest discover -s tests     # runner, pricing, fences and caps
+python3 -W error::ResourceWarning -m unittest discover -s tests   # runner, pricing, fences, caps, snapshots
 ```
+
+Releases are automatic: a merge to `main` that changes what the plugin runs bumps the version and publishes a release. Label the pull request `major`, `minor` or `patch` (no label means minor).
 
 ## License
 
