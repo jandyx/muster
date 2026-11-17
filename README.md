@@ -222,7 +222,7 @@ Architecture, a run's sequence, a task's states and what each pane row reads are
 | Worker transcripts | each CLI's own folder (`codexHome/sessions`, the Claude profile's `projects`) | owned by those tools |
 | Worktrees for parallel writers | next to the repo, branch `muster/<task>` | a full checkout each |
 
-Muster deletes nothing on its own.
+Muster deletes nothing on its own. `python3 <plugin>/skills/muster/muster.py clean [--days N]` lists what could go: runs untouched for N days (default 14), task worktrees and `muster/*` branches, each marked merged or not (rebased and cherry-picked work counts as merged) and with uncommitted changes counted, next to the command that would remove it. You run the ones you choose.
 
 </details>
 
