@@ -54,9 +54,9 @@ test('the pane shows each task of the newest run', async ($, on) => {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.find({ type: 'Button', text: /20261105-1130-x/ }))?.text).toMatch(/▾ 20261105-1130-x/)
     expect((await ui.find({ type: 'Text', text: /add retry/ }))?.text).toMatch(/✓ add retry backoff/)
-    expect((await ui.find({ type: 'Text', text: /A · codex-a/ }))?.text).toMatch(/A · codex-a · done · 1m40s · ⎇ feat\/retry/)
+    expect((await ui.find({ type: 'Text', text: /A · codex-a/ }))?.text).toMatch(/A · codex-a · gpt-6-astra · done · 1m40s · ⎇ feat\/retry/)
     expect((await ui.find({ type: 'Text', text: /retry logic/ }))?.text).toMatch(/↳ retry logic added, see report\.md$/)
-    expect((await ui.find({ type: 'Text', text: /B · deepseek/ }))?.text).toMatch(/B · deepseek · running/)
+    expect((await ui.find({ type: 'Text', text: /B · deepseek/ }))?.text).toMatch(/B · deepseek · deepseek-flash · running/)
     expect((await ui.find({ type: 'Button', text: /20261101-0900-old/ }))?.text).toMatch(/[▸▾] 20261101-0900-old 0 running · 1 done/)
     expect(await ui.find({ type: 'Button', text: /foreign/ })).toBeUndefined()
     expect((await ui.find({ type: 'Text', text: /in 1\.51M/ }))?.text).toMatch(/in 1\.51M \(95% cached\) · out 14k · ≈\$2\.91/)
@@ -503,5 +503,31 @@ test('a done task with a recorded diff shows needs review until review.md approv
   expect(await line(/Bold label/)).not.toMatch(/needs review/)
   expect(await line(/Legacy task/)).not.toMatch(/needs review/)
   expect(await line(/Still going/)).not.toMatch(/needs review/)
+  await ui.unmount()
+})
+
+test('the band keeps a finished run that still has unreviewed tasks', async ($, on) => {
+  await mountWith($, on, tree('/h/.muster/runs', {
+    '20261117-1100-band': { done: task('done', `changes=1 files +1 -0\nchanges_sha256=${'a'.repeat(64)}\n`) },
+  }))
+  const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
+  expect((await band.find({ type: 'Text', text: /unreviewed/ }))?.text).toMatch(/1 unreviewed/)
+  await band.unmount()
+})
+
+test('each task shows the model it ran on, from meta when done and from the log while running', async ($, on) => {
+  const t = tree('/h/.muster/runs', {
+    '20261117-1200-model': {
+      fin: { ...task('done', 'model=gpt-6-astra\neffort=high\n'), title: 'Finished one' },
+      live: { status: 'running\n', meta: 'worker=w1\ntype=codex\nsession=S1\nstarted=2026-11-05 11:00:00\n', title: 'Live one' },
+    },
+  })
+  t['/h/.muster/runs/20261117-1200-model/live/log.txt'] = 'OpenAI Codex\n--------\nmodel: gpt-6-mini\nreasoning effort: low\n--------\n'
+  t['/h/.muster/runs/20261117-1200-model/fin/result.md'] = 'Status: DONE_WITH_CONCERNS\n'
+  await mountWith($, on, t)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /^\s+fin · / }))?.text).toMatch(/fin · w1 · gpt-6-astra high · done/)
+  expect((await ui.find({ type: 'Text', text: /^\s+live · / }))?.text).toMatch(/live · w1 · gpt-6-mini low · running/)
+  expect((await ui.find({ type: 'Text', text: /DONE_WITH_CONCERNS/ }))?.text).toBeTruthy()
   await ui.unmount()
 })
