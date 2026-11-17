@@ -69,6 +69,193 @@ class Run(unittest.TestCase):
             self.assertIn(u["usd"], (0.75, 1.5))  # off-peak or peak, by when the test runs
 
 
+    def test_changes_diff_holds_commits_edits_and_new_files(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            repo = pathlib.Path(d, "repo")
+            repo.mkdir()
+            g = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                                          check=True, capture_output=True)
+            g("init", "-q")
+            (repo / "kept.txt").write_text("one\n")
+            (repo / "edited.txt").write_text("old\n")
+            g("add", ".")
+            g("commit", "-qm", "base")
+            fake = pathlib.Path(d, "fake-claude")
+            fake.write_text("#!/bin/sh\ncat >/dev/null\n"
+                            "echo two >> kept.txt && git -c user.name=t -c user.email=t@t commit -qam work\n"
+                            "echo new > edited.txt\necho hi > added.txt\n"
+                            "echo '{\"type\":\"result\",\"result\":\"Status: DONE\"}'\n")
+            fake.chmod(0o755)
+            task = pathlib.Path(d, "run/A")
+            task.mkdir(parents=True)
+            (task / "prompt.md").write_text("# t\n")
+            cfg = {"runsDir": d, "workers": {"w": {"type": "claude", "command": str(fake)}}}
+            self.assertEqual(M.run(cfg, "w", str(task), str(repo)), 0)
+            diff = (task / "changes.diff").read_text()
+            for needle in ("+two", "-old", "+new", "+hi", "added.txt"):
+                self.assertIn(needle, diff)
+            meta = M.read_meta(str(task))
+            self.assertEqual(len(meta["base"]), 40)
+            self.assertEqual(meta["changes"], "3 files +3 -1")
+            self.assertEqual(len(meta["commits"].split()), 1)  # the worker's own commit
+            self.assertEqual(meta["changes_sha256"], __import__("hashlib").sha256((task / "changes.diff").read_bytes()).hexdigest())
+            self.assertEqual(subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--name-only"],
+                                            capture_output=True, text=True).stdout, "")  # index untouched
+
+    def git_repo(self, d, files):
+        import subprocess
+        repo = pathlib.Path(d, "repo")
+        repo.mkdir()
+        g = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                                      check=True, capture_output=True)
+        g("init", "-q")
+        for name, text in files.items():
+            (repo / name).parent.mkdir(parents=True, exist_ok=True)
+            (repo / name).write_text(text)
+        g("add", ".")
+        g("commit", "-qm", "base")
+        return repo
+
+    def run_script(self, d, repo, script, cwd=None, check=None):
+        fake = pathlib.Path(d, "fake-claude")
+        fake.write_text("#!/bin/sh\ncat >/dev/null\n" + script + "\necho '{\"type\":\"result\",\"result\":\"Status: DONE\"}'\n")
+        fake.chmod(0o755)
+        task = pathlib.Path(d, "run/a")
+        task.mkdir(parents=True)
+        (task / "prompt.md").write_text("# t\n")
+        cfg = {"runsDir": d, "workers": {"w": {"type": "claude", "command": str(fake)}}}
+        rc = M.run(cfg, "w", str(task), str(cwd or repo), check=check)
+        return rc, task
+
+    def test_changes_diff_leaves_out_what_was_already_uncommitted(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self.git_repo(d, {"a.txt": "a\n", "b.txt": "b\n"})
+            (repo / "a.txt").write_text("users own edit\n")
+            (repo / "old-untracked.txt").write_text("was here\n")
+            rc, task = self.run_script(d, repo, "echo worker >> b.txt")
+            self.assertEqual(rc, 0)
+            diff = (task / "changes.diff").read_text()
+            self.assertIn("+worker", diff)
+            self.assertNotIn("users own edit", diff)
+            self.assertNotIn("old-untracked", diff)
+            self.assertEqual(M.read_meta(str(task))["changes"], "1 files +1 -0")
+
+    def test_changes_diff_from_a_subdirectory_covers_the_whole_repo(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self.git_repo(d, {"sub/q.sql": "-- old comment\nselect 1;\n"})
+            rc, task = self.run_script(d, repo, "printf 'select 1;\\n' > q.sql\necho top > ../top.txt\n"
+                                       "echo s > 'sp ace.txt'\necho '++ x' > -dash", cwd=repo / "sub")
+            self.assertEqual(rc, 0)
+            diff = (task / "changes.diff").read_text()
+            for path in ("a/sub/q.sql", "b/top.txt", "b/sub/sp ace.txt", "b/sub/-dash"):
+                self.assertIn(path, diff)
+            self.assertEqual(M.read_meta(str(task))["changes"], "4 files +3 -1")  # `-- old` and `++ x` are lines too
+
+    def test_check_runs_after_the_worker_and_its_exit_code_decides(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self.git_repo(d, {"a.txt": "a\n"})
+            rc, task = self.run_script(d, repo, "true", check="echo checking; test -f a.txt")
+            self.assertEqual((rc, M.read_meta(str(task))["check"]), (0, "pass"))
+            self.assertIn("checking", (task / "check.txt").read_text())
+        with tempfile.TemporaryDirectory() as d:
+            repo = self.git_repo(d, {"a.txt": "a\n"})
+            rc, task = self.run_script(d, repo, "true", check="echo 'Error: 2 tests failed'; exit 3")
+            self.assertEqual(rc, 3)
+            self.assertEqual(M.read_meta(str(task))["check"], "fail (exit 3)")
+            status = (task / "status").read_text()
+            self.assertTrue(status.startswith("failed: done check failed (exit 3)"), status)
+            self.assertIn("2 tests failed", status)
+
+    def test_tests_touched_names_test_files_and_what_the_check_runs(self):
+        names = ["src/app.ts", "tests/runtime/a.test.mjs", "pkg/x_test.go", "Makefile", "scripts/check.sh",
+                 "Package/Tests/FooTests/FooTests.swift", "docs/testing.md", "src/latest.ts"]
+        self.assertEqual(M.tests_touched(names, "make verify && ./scripts/check.sh"),
+                         ["tests/runtime/a.test.mjs", "pkg/x_test.go", "Makefile", "scripts/check.sh",
+                          "Package/Tests/FooTests/FooTests.swift"])
+        with tempfile.TemporaryDirectory() as d:
+            repo = self.git_repo(d, {"src/a.py": "x = 1\n", "tests/test_a.py": "assert True\n"})
+            rc, task = self.run_script(d, repo, "echo 'x = 2' > src/a.py\necho '' > tests/test_a.py", check="true")
+            self.assertEqual(M.read_meta(str(task))["tests_touched"], "tests/test_a.py")
+
+    def test_meta_names_tasks_that_shared_the_repo(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self.git_repo(d, {"a.txt": "a\n"})
+            other_repo = pathlib.Path(d, "elsewhere")
+            other_repo.mkdir()
+            for name, meta in (("writer", f"repo={os.path.realpath(repo)}\nstarted=2000-01-01 00:00:00\n"),  # still running
+                               ("old", f"repo={os.path.realpath(repo)}\nstarted=2000-01-01 00:00:00\nfinished=2000-01-01 01:00:00\n"),
+                               ("apart", f"cwd={other_repo}\nstarted=2000-01-01 00:00:00\n"),
+                               ("legacy", f"cwd={os.path.realpath(repo)}/sub\nstarted=2000-01-01 00:00:00\n")):
+                t = pathlib.Path(d, "run", name)
+                t.mkdir(parents=True)
+                (t / "meta").write_text(meta)
+            rc, task = self.run_script(d, repo, "true")
+            self.assertEqual(rc, 0)
+            self.assertEqual(M.read_meta(str(task))["shared_with"], "run/legacy,run/writer")
+
+    def test_checks_run_one_at_a_time(self):
+        import fcntl, subprocess
+        with tempfile.TemporaryDirectory() as d:
+            repo = self.git_repo(d, {"a.txt": "a\n"})
+            fake = pathlib.Path(d, "fake-claude")
+            fake.write_text("#!/bin/sh\ncat >/dev/null\necho '{\"type\":\"result\",\"result\":\"ok\"}'\n")
+            fake.chmod(0o755)
+            cfg = pathlib.Path(d, "config.json")
+            cfg.write_text(json.dumps({"runsDir": d, "workers": {"w": {"type": "claude", "command": str(fake)}}}))
+            task = pathlib.Path(d, "run/a")
+            task.mkdir(parents=True)
+            (task / "prompt.md").write_text("# t\n")
+            with open(pathlib.Path(d, ".check.lock"), "a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)  # another task's check is running
+                p = subprocess.Popen([sys.executable, str(ROOT / "skills/muster/muster.py"), "run", "w", str(task), str(repo),
+                                      "--check", "true"], env=dict(os.environ, MUSTER_CONFIG=str(cfg)),
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    p.wait(timeout=3)  # waits for the lock
+            self.assertEqual(p.wait(timeout=30), 0)
+            self.assertEqual(M.read_meta(str(task))["check"], "pass")
+
+    def test_changes_diff_is_cut_at_the_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self.git_repo(d, {"a.txt": "a\n"})
+            with unittest.mock.patch.object(M, "CHANGES_MAX", 2000):
+                rc, task = self.run_script(d, repo, "seq 1 2000 > big.txt")
+            self.assertEqual(rc, 0)
+            diff = (task / "changes.diff").read_text()
+            self.assertLess(len(diff), 2300)
+            self.assertIn("cut at", diff)
+            meta = M.read_meta(str(task))
+            self.assertTrue(meta["changes"].endswith("(cut)"), meta["changes"])
+            self.assertEqual(meta["changes_sha256"], __import__("hashlib").sha256((task / "changes.diff").read_bytes()).hexdigest())
+
+    def test_a_failing_snapshot_does_not_stop_the_task(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = self.git_repo(d, {"a.txt": "a\n"})
+            with unittest.mock.patch.object(M, "snapshot", side_effect=FileNotFoundError("index vanished")):
+                rc, task = self.run_script(d, repo, "true")
+            self.assertEqual(rc, 0)
+            self.assertEqual((task / "status").read_text().strip(), "done")
+            self.assertIn("unavailable: index vanished", M.read_meta(str(task))["changes"])
+
+    def test_no_changes_diff_outside_a_repo(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = pathlib.Path(d, "fake-claude")
+            fake.write_text("#!/bin/sh\ncat >/dev/null\necho '{\"type\":\"result\",\"result\":\"ok\"}'\n")
+            fake.chmod(0o755)
+            task = pathlib.Path(d, "run/A")
+            task.mkdir(parents=True)
+            (task / "prompt.md").write_text("# t\n")
+            plain = pathlib.Path(d, "plain")
+            plain.mkdir()
+            cfg = {"runsDir": d, "workers": {"w": {"type": "claude", "command": str(fake)}}}
+            with unittest.mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": d}):
+                self.assertEqual(M.run(cfg, "w", str(task), str(plain)), 0)
+            self.assertFalse((task / "changes.diff").exists())
+            meta = M.read_meta(str(task))
+            self.assertNotIn("base", meta)
+            self.assertEqual(meta["changes"], "unavailable: cwd is not in a git repo")
+
     def test_sigterm_still_records_a_final_status(self):
         import signal, subprocess, time
         with tempfile.TemporaryDirectory() as d:

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Muster worker runner: run one task on one configured worker and record what happened.
 
-    muster.py run <worker[,worker…]> <task-dir> <cwd> [--after A,B] [--priority N]
+    muster.py run <worker[,worker…]> <task-dir> <cwd> [--after A,B] [--priority N] [--check CMD]
                                               queue until deps are done and one of the workers has a free slot
-                                              (first in the list wins a tie), then run prompt.md on it;
+                                              (first in the list wins a tie), then run prompt.md on it; then run
+                                              CMD (sh -c, in cwd) and fail the task if it fails;
                                               exit 3 refused (`only`), 5 dependency failed
     muster.py cancel <task-dir> [reason]      stop a queued or running task; status becomes "canceled: reason"
     muster.py usage <task-dir>                (re)compute <task-dir>/usage for a finished task
@@ -18,6 +19,7 @@ import datetime
 import fcntl
 import fnmatch
 import glob
+import hashlib
 import json
 import os
 import re
@@ -26,6 +28,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 HOME = os.path.expanduser("~")
@@ -506,6 +509,166 @@ QUEUE_POLL_S = 2.0
 _child = None  # the worker process, once started; one task per runner process
 
 
+CHANGES_MAX = 5 * 1024 * 1024  # changes.diff is cut here; meta says so and how to see the rest
+
+
+def git(cwd, *args, ok=(0,), env=None, timeout=120):
+    """stdout of a git command in cwd, or None when cwd is not a repo or git fails. No optional locks, so it never
+    races a worker's own git commands for index.lock."""
+    try:
+        r = subprocess.run(["git", "-C", cwd, "-c", "color.ui=never", *args], capture_output=True, text=True,
+                           errors="replace", timeout=timeout,
+                           env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", **(env or {})})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout if r.returncode in ok else None
+
+
+def snapshot(top):
+    """Tree id of the whole working tree as it is now: tracked and untracked files, minus ignored ones. Built in a
+    throwaway copy of the index, so the real index and anything the worker staged stay as they are. It writes blob
+    objects, which git's gc drops once nothing refers to them."""
+    real = git(top, "rev-parse", "--path-format=absolute", "--git-path", "index")
+    if real is None:
+        return None
+    fd, tmp = tempfile.mkstemp(prefix="muster-index-")
+    os.close(fd)
+    try:
+        if os.path.isfile(real.strip()):
+            shutil.copy2(real.strip(), tmp)  # keeps the stat cache and its timestamp, so only changed files are hashed
+        else:
+            os.unlink(tmp)  # a repo with no index yet: git starts an empty one
+        env = {"GIT_INDEX_FILE": tmp}
+        if git(top, "add", "-A", env=env, timeout=600) is None:
+            return None
+        tree = git(top, "write-tree", env=env)
+        return tree.strip() if tree else None
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def mark_start(task, cwd):
+    """Before the worker starts: snapshot the working tree, so changes.diff later holds only what this worker did,
+    not edits that were already uncommitted (the user's, a dependency's, an earlier round's)."""
+    top = git(cwd, "rev-parse", "--show-toplevel")
+    if top is None:
+        append_meta(task, changes="unavailable: cwd is not in a git repo")
+        return
+    top = top.strip()
+    base = snapshot(top)
+    if base is None:
+        append_meta(task, changes="unavailable: git could not snapshot the working tree")
+        return
+    head = (git(top, "rev-parse", "--verify", "-q", "HEAD") or "").strip()
+    branch = (git(top, "symbolic-ref", "-q", "--short", "HEAD") or "").strip()
+    append_meta(task, base=base, base_head=head, branch=branch, repo=top)
+
+
+def overlapping(task, top):
+    """Other tasks that worked in the same repo while this one ran: their edits land in this task's changes.diff too,
+    because the snapshot covers the whole repo."""
+    me, runs = read_meta(task), os.path.dirname(os.path.dirname(os.path.abspath(task)))
+    start, end = me.get("started", ""), now()
+    out = []
+    for other in sorted(glob.glob(os.path.join(runs, "*", "*", "meta"))):
+        d = os.path.dirname(other)
+        if os.path.samefile(d, task):
+            continue
+        m = read_meta(d)
+        where = m.get("repo") or os.path.realpath(m.get("cwd", "/nonexistent"))
+        same = where == top or where.startswith(top.rstrip("/") + "/")
+        if same and m.get("started") and m["started"] <= end and m.get("finished", end) >= start:
+            out.append(f"{os.path.basename(os.path.dirname(d))}/{os.path.basename(d)}")
+    return out
+
+
+# Paths that hold tests: a change to one can make the done check pass without the work being right.
+TEST_PATH = re.compile(r"(^|/)(tests?|__tests__|specs?|Tests)/|[._-](test|spec)s?\.[^/]+$|(^|/)test_[^/]+$")
+# A check run through a tool also depends on that tool's recipe file.
+CHECK_FILES = {"make": "Makefile", "npm": "package.json", "pnpm": "package.json", "yarn": "package.json",
+               "bun": "package.json", "cargo": "Cargo.toml", "swift": "Package.swift"}
+
+
+def tests_touched(names, check):
+    """Changed files that are tests, or that the --check command names or runs through."""
+    try:
+        words = shlex.split(check or "")
+    except ValueError:
+        words = (check or "").split()
+    named = {w.lstrip("./") for w in words if "/" in w or "." in w} | {CHECK_FILES[w] for w in words if w in CHECK_FILES}
+    return [n for n in names if TEST_PATH.search(n) or any(n == w or n.endswith("/" + w) for w in named)]
+
+
+def write_changes(task, check=None):
+    """After the worker exits: changes.diff, everything it changed since the start snapshot (commits, uncommitted
+    edits and new files, paths from the repo root), so the reviewer reads the real code, not the worker's account."""
+    m = read_meta(task)
+    base, top = m.get("base"), m.get("repo")
+    if not base or not top:
+        return
+    end = snapshot(top)
+    numstat = end and git(top, "diff", "--no-color", "--numstat", base, end)
+    if numstat is None:
+        append_meta(task, changes="unavailable: git could not diff the working tree")
+        return
+    # Streamed to the file and stopped at the cap, so a huge diff never sits in memory whole.
+    path, cut = os.path.join(task, "changes.diff"), False
+    sha = hashlib.sha256()
+    proc = subprocess.Popen(["git", "-C", top, "diff", "--no-color", "--no-ext-diff", "--no-textconv", base, end],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    with open(path, "wb") as out:
+        size = 0
+        for chunk in iter(lambda: proc.stdout.read(65536), b""):
+            if size + len(chunk) > CHANGES_MAX:
+                chunk, cut = chunk[:CHANGES_MAX - size], True
+            out.write(chunk)
+            sha.update(chunk)
+            size += len(chunk)
+            if cut:
+                proc.kill()
+                break
+        proc.stdout.close()
+        proc.wait()
+        if cut:
+            note = (f"\n… cut at {CHANGES_MAX // 1048576} MB. Full diff: "
+                    f"git -C {shlex.quote(top)} diff {base} {end}\n").encode()
+            out.write(note)
+            sha.update(note)
+    rows = [line.split("\t") for line in numstat.splitlines() if line]
+    plus = sum(int(r[0]) for r in rows if r[0].isdigit())
+    minus = sum(int(r[1]) for r in rows if len(r) > 1 and r[1].isdigit())
+    head = (git(top, "rev-parse", "--verify", "-q", "HEAD") or "").strip()
+    branch = (git(top, "symbolic-ref", "-q", "--short", "HEAD") or "").strip()
+    # After a rebase this range also holds the upstream commits the worker rebased onto.
+    commits = (git(top, "rev-list", "--max-count=100", f"{m['base_head']}..{head}") or "").split() \
+        if m.get("base_head") and head else []
+    extra = {"branch": branch, "branch_start": m.get("branch", "")} if branch != m.get("branch", "") else {}
+    names = (git(top, "diff", "--name-only", "--no-renames", "-z", base, end) or "").split("\0")
+    touched = tests_touched([n for n in names if n], check)
+    if touched:
+        extra["tests_touched"] = ",".join(touched[:20]) + (f",+{len(touched) - 20} more" if len(touched) > 20 else "")
+    shared = overlapping(task, top)
+    if shared:
+        extra["shared_with"] = ",".join(shared[:10]) + (f",+{len(shared) - 10} more" if len(shared) > 10 else "")
+    append_meta(task, changes=f"{len(rows)} files +{plus} -{minus}" + (" (cut)" if cut else ""),
+                changes_sha256=sha.hexdigest(), head=head, commits=" ".join(commits), **extra)
+
+
+def run_check(task, cwd, check, env, runs):
+    """The done check, run by the runner itself after the worker: its exit code is recorded, not claimed. One check
+    at a time on this machine (a lock in runsDir), so tasks that finish together do not pile their test runs up."""
+    os.makedirs(runs, exist_ok=True)
+    with open(os.path.join(task, "check.txt"), "w") as out, open(os.path.join(runs, ".check.lock"), "a") as lock:
+        out.write(f"$ {check}\n")
+        out.flush()
+        fcntl.flock(lock, fcntl.LOCK_EX)  # released when the file closes, also if the runner dies
+        rc = supervise(task, ["/bin/sh", "-c", check], stdout=out, stderr=subprocess.STDOUT, cwd=cwd, env=env)
+    append_meta(task, check="pass" if rc == 0 else f"fail (signal {-rc})" if rc < 0 else f"fail (exit {rc})")
+    return rc
+
+
 def finish(task, rc, status):
     append_meta(task, finished=now(), exit=rc)
     with open(os.path.join(task, "status"), "w") as f:
@@ -565,7 +728,7 @@ def cancel(task, reason=""):
     return 0
 
 
-def run(cfg, names, task, cwd, after=(), priority=0):
+def run(cfg, names, task, cwd, after=(), priority=0, check=None):
     # `names`: one worker or several ("a,b"); the task waits for whichever frees a slot first.
     names = [n for n in (names.split(",") if isinstance(names, str) else names) if n]
     for name in names:
@@ -629,6 +792,10 @@ def run(cfg, names, task, cwd, after=(), priority=0):
                 shown = status
         time.sleep(QUEUE_POLL_S)
 
+    try:
+        mark_start(task, cwd)
+    except Exception as e:  # a missing diff must not cost the task; meta says why
+        append_meta(task, changes=f"unavailable: {short(str(e), 80)}")
     worker = cfg["workers"][name]
     kind = worker["type"]
     env = dict(os.environ)
@@ -645,6 +812,24 @@ def run(cfg, names, task, cwd, after=(), priority=0):
                 rc = supervise(task, cmd, stdin=stdin, stdout=out, stderr=log, cwd=cwd, env=env)
         else:
             sys.exit(f"muster: worker {name!r} has unknown type {kind!r} (codex or claude)")
+    try:
+        write_changes(task, check)
+    except Exception as e:  # best effort, like usage; meta says why there is no diff
+        append_meta(task, changes=f"unavailable: {short(str(e), 80)}")
+    if rc != 0 and check:
+        append_meta(task, check="skipped: the worker failed")
+    if rc == 0 and check:
+        crc = run_check(task, cwd, check, env, expand(cfg.get("runsDir", "~/.muster/runs")))
+        if crc != 0:
+            line, _ = last_error([os.path.join(task, "check.txt")])
+            reason = f"done check failed (exit {crc})" + (f": {short(line, 100)}" if line else "")
+            append_meta(task, last_error=reason, log_path=os.path.abspath(os.path.join(task, "check.txt")))
+            try:
+                write_usage(task, cfg)
+            except Exception:
+                pass
+            finish(task, crc, f"failed: {reason}")
+            return crc
     try:
         write_usage(task, cfg)
     except Exception as e:  # usage is best effort; the task result matters more
@@ -683,10 +868,11 @@ def main():
         sys.exit(1 if probs else 0)
     if cmd == "run" and len(args) >= 3:
         opts = dict(zip(args[3::2], args[4::2]))
-        if len(args) % 2 == 0 or set(opts) - {"--after", "--priority"}:
+        if len(args) % 2 == 0 or set(opts) - {"--after", "--priority", "--check"}:
             sys.exit(__doc__)
         after = [a for a in opts.get("--after", "").split(",") if a]
-        sys.exit(run(cfg, *args[:3], after=after, priority=int(opts.get("--priority", "0"))))
+        sys.exit(run(cfg, *args[:3], after=after, priority=int(opts.get("--priority", "0")),
+                     check=opts.get("--check") or None))
     if cmd == "cancel" and len(args) in (1, 2):
         sys.exit(cancel(args[0], args[1] if len(args) == 2 else ""))
     if cmd == "usage" and len(args) == 1:
