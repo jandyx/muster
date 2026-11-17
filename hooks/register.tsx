@@ -259,7 +259,14 @@ export const register: Register = on => {
     const configPath = expand((await $.env.get('MUSTER_CONFIG')) ?? '~/.muster/config.json')
     const config = await $.fs
       .read(configPath)
-      .then(t => JSON.parse(typeof t === 'string' ? t : '{}') as { runsDir?: string }, () => ({}) as { runsDir?: string })
+      // `//` comments allowed, stripped outside strings: same pattern as JSON_COMMENT in muster.py.
+      .then(
+        t =>
+          JSON.parse((typeof t === 'string' ? t : '{}').replace(/"(?:\\.|[^"\\\n])*"|\/\/[^\n]*/g, m => (m[0] === '"' ? m : ''))) as {
+            runsDir?: string
+          },
+        () => ({}) as { runsDir?: string },
+      )
       .catch(() => ({}) as { runsDir?: string })
     const root = expand(config.runsDir ?? '~/.muster/runs')
     // Runs are bound to the session that dispatched them (muster.py records it).

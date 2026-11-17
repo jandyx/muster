@@ -145,7 +145,8 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
                     "args": ["--dangerously-skip-permissions"], "billing": "metered" }
   },
   "routing": [                                  // first match on the task's cwd wins
-    { "match": "~/workspace/work-*", "workers": ["codex-work", "codex", "deepseek"] },
+    { "match": "~/workspace/work-*", "workers": ["codex-work", "codex", "deepseek"],
+      "preamble": ["Open pull requests with the repo's pr.sh."] },   // added to prompts for these repos only
     { "match": "*",                  "workers": ["codex", "deepseek"] }
   ],
   "only":  { "codex-work": ["~/workspace/work-*"] },   // this worker refuses any other repo
@@ -154,7 +155,7 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
 }
 ```
 
-Check it with `python3 <plugin>/skills/muster/muster.py doctor` (one line per problem, `ok` when usable), list workers with `workers`, and see what the machine offers with `detect`.
+`//` comments are allowed, and `doctor` ignores keys starting with `_` at the top level, in a worker and in a `routing` entry, so they can hold notes. Check it with `python3 <plugin>/skills/muster/muster.py doctor` (one line per problem, `ok` when usable: broken JSON with its line, unknown keys such as a misspelled `preambel`, wrong types, unknown workers), list workers with `workers`, and see what the machine offers with `detect`.
 
 <details>
 <summary>Worker types</summary>
@@ -174,7 +175,7 @@ Check it with `python3 <plugin>/skills/muster/muster.py doctor` (one line per pr
 | `routing` | picks workers in that order, falls back on quota errors | not checked |
 | `only` | never plans a fenced worker elsewhere | refuses outside its globs (exit 3) |
 | `caps` | passes each task its whole worker list | queues while every listed worker is full, starts on the first to free a slot (priority, then launch order); counts live processes only |
-| `preamble` | adds the lines to every prompt | not checked |
+| `preamble` | adds the lines to every prompt, then the first matching `routing` entry's `preamble` | only its shape (`doctor`) |
 
 When a worker fails, `status` reads `failed: <reason>`: the last error line of its log (secrets such as `sk-…` or `Bearer …` masked, cut to 160 characters), or `exit <code>` when there is none. `meta` keeps it as `last_error`, with the log's path as `log_path`, and the pane shows both. A worker that ran out of disk shows `failed: disk full (ENOSPC), …` and its `result.md` ends with the command to rerun it.
 

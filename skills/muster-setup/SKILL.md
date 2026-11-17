@@ -37,7 +37,7 @@ Use AskUserQuestion, at most one round of up to four questions, each with a reco
 - Which repos or folders should each worker prefer? (Offer the folders under the user's usual workspace, such as `~/workspace/*`, grouped by prefix.)
 - Should any worker be limited to certain repos only (`only`)? Mention that the runner enforces it.
 - Parallel caps per account: keep 3 / 5, or change?
-- Any rule every worker prompt should carry (`preamble`)? For example, how pull requests are opened in their repos.
+- Any rule worker prompts should carry? Global ones go in `preamble`; rules for one group of repos (for example, how pull requests are opened there) go in that `routing` entry's `preamble`.
 
 If the user already said these things in this conversation, do not ask again.
 

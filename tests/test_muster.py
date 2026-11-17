@@ -1,6 +1,6 @@
 """Self-check for skills/muster/muster.py: usage math and a full run with a fake claude worker.
 Run: python3 -m unittest discover -s tests"""
-import datetime, importlib.util, json, os, pathlib, stat, sys, tempfile, unittest
+import datetime, importlib.util, time, unittest.mock, json, os, pathlib, re, stat, sys, tempfile, unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("muster", ROOT / "skills/muster/muster.py")
@@ -269,18 +269,32 @@ class Queue(unittest.TestCase):
 
 class Setup(unittest.TestCase):
     def test_doctor_names_each_problem(self):
+        self.assertIn("only: expected", "\n".join(M.doctor({"workers": {}, "only": ["x"], "caps": [1]})))
         cfg = {"workers": {"a": {"type": "codex", "codexHome": "/nonexistent", "command": sys.executable},
                            "b": {"type": "cli"}},
-               "routing": [{"match": "~/x/*", "workers": ["a", "ghost"]}],
-               "only": {"nobody": ["*"]}, "caps": {"a": 0}}
+               "routing": [{"match": "~/x/*", "workers": ["a", "ghost"], "preamble": "one line"}],
+               "only": {"nobody": ["*"]}, "caps": {"a": 0}, "preamble": [1]}
         probs = "\n".join(M.doctor(cfg))
         for needle in ("workers.a.codexHome", "workers.b.type", "unknown worker 'ghost'",
-                       "no '*' fallback", "only.nobody", "caps.a"):
+                       "no '*' fallback", "only.nobody", "caps.a",
+                       "preamble: expected", "routing[0] (~/x/*).preamble: expected"):
             self.assertIn(needle, probs)
+
+    def test_doctor_catches_typos_and_wrong_shapes(self):
+        cfg = {"workers": {"c": {"type": "claude", "command": sys.executable, "arg": ["-x"], "billing": "free"}},
+               "routing": [{"match": "*", "workers": "c", "preambel": ["x"]}],
+               "only": {"c": "~/w/*"}, "preambel": ["x"], "_note": "kept"}
+        probs = "\n".join(M.doctor(cfg))
+        for needle in ("preambel: unknown key", "workers.c.arg: unknown key", "workers.c.billing",
+                       "routing[0].preambel: unknown key", "routing[0] (*).workers: expected", "only.c: expected"):
+            self.assertIn(needle, probs)
+        self.assertNotIn("_note", probs)
 
     def test_doctor_passes_a_good_config(self):
         cfg = {"workers": {"c": {"type": "claude", "command": sys.executable}},
-               "routing": [{"match": "*", "workers": ["c"]}], "caps": {"claude": 2}}
+               "routing": [{"match": "~/w/*", "workers": ["c"], "preamble": ["Open PRs with pr.sh."]},
+                           {"match": "*", "workers": ["c"]}],
+               "caps": {"claude": 2}, "preamble": ["No secrets."]}
         self.assertEqual(M.doctor(cfg), [])
 
     def test_detect_finds_wrappers_and_skips_backups(self):
@@ -518,7 +532,7 @@ class Cli(unittest.TestCase):
         import subprocess
         with tempfile.TemporaryDirectory() as d:
             p = pathlib.Path(d, "config.json")
-            p.write_text(json.dumps(cfg))
+            p.write_text(cfg if isinstance(cfg, str) else json.dumps(cfg))
             return subprocess.run([sys.executable, str(ROOT / "skills/muster/muster.py"), *args],
                                   env=dict(os.environ, MUSTER_CONFIG=str(p)), capture_output=True, text=True)
 
@@ -530,6 +544,26 @@ class Cli(unittest.TestCase):
         r = self.run_cli({"workers": {}}, "doctor")
         self.assertEqual(r.returncode, 1)
         self.assertIn("workers: none configured", r.stdout)
+
+    def test_config_allows_comments(self):
+        text = ('{ // workers\n  "workers": {"c": {"type": "claude", "command": "%s"}}, // trailing\n'
+                '  "routing": [{"match": "*", "workers": ["c"], "preamble": ["see https://x.test/a//b"]}]\n}' % sys.executable)
+        r = self.run_cli(text, "doctor")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_readme_example_config_parses(self):
+        readme = (ROOT / "README.md").read_text()
+        block = re.search(r'```jsonc?\n(\{\n  "runsDir".*?\n\})\n```', readme, re.S)
+        self.assertIsNotNone(block, "README config example not found")
+        r = self.run_cli(block[1], "workers")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("codex-work", r.stdout)
+
+    def test_broken_json_names_the_line(self):
+        r = self.run_cli('{\n  "workers": {},\n  "caps": {"codex": 3,}\n}', "doctor")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not valid JSON", r.stderr)
+        self.assertIn("line 3", r.stderr)
 
     def test_workers_lists_names(self):
         r = self.run_cli({"workers": {"alpha": {"type": "claude", "command": "x"}}}, "workers")

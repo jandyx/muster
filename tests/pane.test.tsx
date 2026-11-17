@@ -208,6 +208,15 @@ test('runsDir comes from the config file', async ($, on) => {
   await ui.unmount()
 })
 
+test('runsDir is read from a config with // comments', async ($, on) => {
+  await mountWith($, on, tree('/data/runs', { '20261105-0900-custom': { A: task('done') } }), {
+    config: '{\n  // where runs go\n  "runsDir": "/data/runs" // not "~/x"\n}',
+  })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Button', text: /custom/ }))?.text).toMatch(/20261105-0900-custom/)
+  await ui.unmount()
+})
+
 test('a finished run starts folded, a running one open', async ($, on) => {
   await mountWith(
     $,
