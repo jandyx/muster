@@ -714,6 +714,49 @@ class MoreGuards(unittest.TestCase):
             self.assertEqual(M.run(cfg, "w", str(task), d), 0)  # type cap 0 would refuse; the worker's own cap wins
 
 
+class Clean(unittest.TestCase):
+    def test_lists_old_runs_worktrees_and_branches_and_deletes_nothing(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            d = os.path.realpath(d)
+            repo = pathlib.Path(d, "repo")
+            repo.mkdir()
+            g = lambda *a, cwd=repo: subprocess.run(["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@t", *a],
+                                                    check=True, capture_output=True)
+            g("init", "-q", "-b", "main")
+            (repo / "a.txt").write_text("a\n")
+            g("add", ".")
+            g("commit", "-qm", "base")
+            done_wt, open_wt = pathlib.Path(d, "repo-done"), pathlib.Path(d, "repo-open")
+            g("worktree", "add", "-q", str(done_wt), "-b", "muster/done")
+            (done_wt / "b.txt").write_text("b\n")
+            g("add", ".", cwd=done_wt)
+            g("commit", "-qm", "done work", cwd=done_wt)
+            g("cherry-pick", "muster/done")  # merged by content, as a rebase or cherry-pick merge leaves it
+            g("worktree", "add", "-q", str(open_wt), "-b", "muster/open")
+            (open_wt / "c.txt").write_text("c\n")
+            g("add", ".", cwd=open_wt)
+            g("commit", "-qm", "open work", cwd=open_wt)
+            g("branch", "muster/old-merged", "main~1")
+            g("branch", "muster/old-merged-2", "main~1")
+            runs = pathlib.Path(d, "runs")
+            for name, cwd, age in (("20260101-0000-old", repo, 40), ("20261117-0000-new", done_wt, 0)):
+                t = runs / name / "task-a"
+                t.mkdir(parents=True)
+                (t / "status").write_text("done\n")
+                (t / "meta").write_text(f"cwd={cwd}\n")
+                for f in (t / "status", t / "meta", t, t.parent):
+                    os.utime(f, (time.time() - age * 86400,) * 2)
+            out = M.clean({"runsDir": str(runs)}, days=14)
+            self.assertIn("20260101-0000-old", out)
+            self.assertNotIn("20261117-0000-new", out)
+            self.assertRegex(out, r"worktree .*repo-done \[muster/done\]: merged, .*   git -C .* worktree remove")
+            self.assertRegex(out, r"worktree .*repo-open \[muster/open\]: 1 commits not in main, .*# keep or check first")
+            self.assertIn("all 2 merged branches without a worktree", out)
+            self.assertTrue(done_wt.is_dir() and (runs / "20260101-0000-old").is_dir())  # nothing deleted
+            self.assertIn("muster/old-merged", subprocess.run(["git", "-C", str(repo), "branch"], capture_output=True, text=True).stdout)
+
+
 class Cli(unittest.TestCase):
     def run_cli(self, cfg, *args):
         import subprocess

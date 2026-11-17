@@ -8,6 +8,9 @@
                                               exit 3 refused (`only`), 5 dependency failed
     muster.py cancel <task-dir> [reason]      stop a queued or running task; status becomes "canceled: reason"
     muster.py usage <task-dir>                (re)compute <task-dir>/usage for a finished task
+    muster.py clean [--days N]                list what could be removed (runs untouched for N days, default 14;
+                                              task worktrees; muster/* branches) with the command for each; deletes
+                                              nothing
     muster.py workers                         list configured workers
     muster.py detect                          JSON: Codex homes and claude-like CLIs found on this machine
     muster.py doctor                          check the config; exit 1 when something is wrong
@@ -503,6 +506,106 @@ def doctor(cfg):
     return probs
 
 
+# ---------- clean (lists, never deletes) ----------
+
+def du_mb(path):
+    out = subprocess.run(["du", "-sk", path], capture_output=True, text=True).stdout.split()
+    return int(out[0]) // 1024 if out and out[0].isdigit() else 0
+
+
+def trunk_of(repo):
+    """The branch work lands on: origin's HEAD, else main or master."""
+    ref = (git(repo, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD") or "").strip()
+    if ref:
+        return ref
+    for b in ("main", "master"):
+        if git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{b}") is not None:
+            return b
+    return None
+
+
+def unmerged(repo, trunk, branch):
+    """Commits of branch with no equivalent in trunk (by patch, so rebased and cherry-picked work counts as merged),
+    or None when git cannot tell."""
+    out = git(repo, "cherry", trunk, branch)
+    return None if out is None else sum(1 for line in out.splitlines() if line.startswith("+"))
+
+
+def clean(cfg, days=14):
+    """What could be removed: runs untouched for `days`, task worktrees and muster/* branches, each with the command
+    that would remove it. Deletes nothing; the user picks."""
+    runs = expand(cfg.get("runsDir", "~/.muster/runs"))
+    cutoff, lines = time.time() - days * 86400, []
+    old, total, repos, task_cwds = [], 0, {}, set()
+    for name in sorted(os.listdir(runs)) if os.path.isdir(runs) else []:
+        d = os.path.join(runs, name)
+        if not os.path.isdir(d):
+            continue
+        tasks = [t for t in sorted(glob.glob(os.path.join(d, "*"))) if os.path.isdir(t)]
+        busy = False
+        for t in tasks:
+            m = read_meta(t)
+            st = os.path.join(t, "status")
+            busy = busy or live(m, read_text(st).strip() if os.path.isfile(st) else "")
+            cwd = m.get("cwd")
+            if cwd and os.path.isdir(cwd):
+                task_cwds.add(os.path.realpath(cwd))
+                common = git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+                if common:
+                    repos.setdefault(os.path.dirname(common.strip().rstrip("/")), set())
+        size = du_mb(d)
+        total += size
+        newest = max((os.path.getmtime(f) for f in glob.glob(os.path.join(d, "**"), recursive=True)), default=0)
+        if newest < cutoff and not busy:
+            old.append((name, int((time.time() - newest) // 86400), size, len(tasks)))
+    lines.append(f"Runs in {runs}: {total} MB in all. Untouched for {days}+ days, none running:")
+    lines += [f"  {n}  {age}d  {mb} MB  {k} tasks   rm -rf {shlex.quote(os.path.join(runs, n))}" for n, age, mb, k in old] \
+        or ["  none"]
+    for repo in sorted(repos):
+        trunk = trunk_of(repo)
+        lines.append(f"\n{repo} (trunk {trunk or 'unknown'}):")
+        listed, seen_branches, merged = [], set(), []
+        porcelain = git(repo, "worktree", "list", "--porcelain") or ""
+        for block in porcelain.strip().split("\n\n")[1:]:  # the first one is the main checkout
+            kv = dict(line.split(" ", 1) for line in block.splitlines() if " " in line)
+            path, branch = kv.get("worktree", ""), kv.get("branch", "").removeprefix("refs/heads/")
+            if not (branch.startswith("muster/") or os.path.realpath(path) in task_cwds):
+                continue
+            seen_branches.add(branch)
+            if not os.path.isdir(path):
+                listed.append(f"  worktree {path}: folder is gone   git -C {shlex.quote(repo)} worktree prune")
+                continue
+            dirty = len((git(path, "status", "--porcelain") or "").splitlines())
+            n = unmerged(repo, trunk, branch) if trunk and branch else None
+            state = ("merged" if n == 0 else f"{n} commits not in {trunk}" if n else "merge state unknown") + \
+                (f", {dirty} uncommitted changes" if dirty else "")
+            cmd = f"git -C {shlex.quote(repo)} worktree remove {shlex.quote(path)}" + \
+                (f" && git -C {shlex.quote(repo)} branch -D {shlex.quote(branch)}" if n == 0 and branch else "")
+            listed.append(f"  worktree {path} [{branch or 'detached'}]: {state}, {du_mb(path)} MB   "
+                          + (cmd if n == 0 and not dirty else f"# keep or check first: {cmd}"))
+        refs = git(repo, "for-each-ref", "--format=%(refname:short)\t%(committerdate:unix)", "refs/heads/muster/") or ""
+        for line in refs.splitlines():
+            branch, when = line.split("\t")
+            if branch in seen_branches:
+                continue
+            n = unmerged(repo, trunk, branch) if trunk else None
+            age = int((time.time() - int(when)) // 86400)
+            cmd = f"git -C {shlex.quote(repo)} branch -D {shlex.quote(branch)}"
+            if n == 0:
+                merged.append(branch)
+            listed.append(f"  branch {branch}: " + ("merged" if n == 0 else f"{n} commits not in {trunk}" if n else
+                                                     "merge state unknown") + f", last commit {age}d ago   "
+                          + (cmd if n == 0 else f"# keep or check first: {cmd}"))
+        lines += listed or ["  nothing to clean"]
+        if len(merged) > 1:
+            lines.append(f"  all {len(merged)} merged branches without a worktree:   git -C {shlex.quote(repo)} branch -D "
+                         + " ".join(shlex.quote(b) for b in merged))
+    lines.append("\nNothing was deleted. Lines starting with a command are safe to run; '# keep or check first' ones "
+                 "hold work that is not in the trunk or not committed. Snapshot objects from changes.diff need no "
+                 "cleanup: git's gc drops them.")
+    return "\n".join(lines)
+
+
 # ---------- running ----------
 
 QUEUE_POLL_S = 2.0
@@ -877,6 +980,9 @@ def main():
         sys.exit(cancel(args[0], args[1] if len(args) == 2 else ""))
     if cmd == "usage" and len(args) == 1:
         print(json.dumps(write_usage(args[0], cfg)))
+        return
+    if cmd == "clean" and len(args) in (0, 2) and (not args or args[0] == "--days"):
+        print(clean(cfg, int(args[1]) if args else 14))
         return
     if cmd == "workers":
         for name, w in cfg["workers"].items():
