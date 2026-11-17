@@ -6,26 +6,82 @@ on:
 
 permissions:
   contents: write
+  pull-requests: read
+
+# One release at a time: two quick pushes must not both bump the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  tag:
-    name: tag and release the manifest version
+  release:
+    name: bump, tag and release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # The version bump is the release; this only records it as a tag and a GitHub Release.
-      - name: Tag and release
+      - name: Bump, tag and release
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
-          version=$(python3 -c 'import json; print(json.load(open(".claude-plugin/plugin.json"))["version"])')
-          tag="v$version"
-          if git rev-parse -q --verify "refs/tags/$tag"; then
-            echo "$tag already exists"
+          set -euo pipefail
+          version() { python3 -c 'import json; print(json.load(open(".claude-plugin/plugin.json"))["version"])'; }
+          release() {
+            git tag "v$1"
+            git push origin "v$1"
+            gh release create "v$1" --title "v$1" --generate-notes
+          }
+
+          # A version bumped by hand and not released yet: release it as it is.
+          current=$(version)
+          if ! git rev-parse -q --verify "refs/tags/v$current" >/dev/null; then
+            release "$current"
             exit 0
           fi
-          git tag "$tag"
-          git push origin "$tag"
-          gh release create "$tag" --title "$tag" --generate-notes
+
+          # Only changes to what the plugin runs make a release; docs, tests and CI alone do not.
+          last="v$current"
+          paths=(skills hooks types prices.json .claude-plugin)
+          if [ -z "$(git log --format=%H "$last..HEAD" -- "${paths[@]}")" ]; then
+            echo "nothing the plugin runs changed since $last"
+            exit 0
+          fi
+
+          # The level comes from labels on the pull requests merged since the last release:
+          # major > minor > patch, and minor when none of them carries a label.
+          labels=""
+          for sha in $(git log --format=%H "$last..HEAD"); do
+            labels+=" $(gh api "repos/$REPO/commits/$sha/pulls" --jq '.[].labels[].name' 2>/dev/null | tr '\n' ' ')"
+          done
+          level=minor
+          case " $labels " in
+            *" major "*) level=major ;;
+            *" minor "*) level=minor ;;
+            *" patch "*) level=patch ;;
+          esac
+
+          next=$(python3 - "$current" "$level" <<'PY'
+          import sys
+          major, minor, patch = (int(x) for x in sys.argv[1].split("."))
+          level = sys.argv[2]
+          print(f"{major + 1}.0.0" if level == "major" else f"{major}.{minor + 1}.0" if level == "minor" else f"{major}.{minor}.{patch + 1}")
+          PY
+          )
+          echo "$current -> $next ($level)"
+
+          python3 - "$next" <<'PY'
+          import json, sys
+          path = ".claude-plugin/plugin.json"
+          text = open(path).read()
+          old = json.loads(text)["version"]
+          open(path, "w").write(text.replace(f'"version": "{old}"', f'"version": "{sys.argv[1]}"', 1))
+          assert json.load(open(path))["version"] == sys.argv[1]
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -qam "Bump version to $next"
+          # A push made with the workflow token starts no workflow, so this bump does not release itself again.
+          git push origin HEAD:main
+          release "$next"
