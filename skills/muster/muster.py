@@ -205,6 +205,30 @@ def usage_claude(task, prices, billing, started_utc):
                 billing=billing, peak=peak, is_error=bool(d.get("is_error")))
 
 
+def record_model(task, kind):
+    """meta `model` and `effort`, from the head of the worker's own log: codex prints `model:` and
+    `reasoning effort:` before it starts; a claude worker names its model in the stream's init event."""
+    found = {}
+    try:
+        if kind == "codex":
+            head = read_text(os.path.join(task, "log.txt"), 8192)
+            for key, label in (("model", "model"), ("effort", "reasoning effort")):
+                hit = re.search(rf"^{label}: (\S+)", head, re.M)
+                if hit:
+                    found[key] = hit[1]
+        else:
+            with open(os.path.join(task, "stream.jsonl"), errors="replace") as f:
+                for _, line in zip(range(200), f):
+                    o = json.loads(line) if line.startswith("{") else {}
+                    if o.get("type") == "system" and o.get("subtype") == "init" and isinstance(o.get("model"), str):
+                        found["model"] = o["model"]
+                        break
+    except (OSError, ValueError):
+        pass
+    if found:
+        append_meta(task, **found)
+
+
 def write_usage(task, cfg):
     meta = read_meta(task)
     worker = cfg["workers"].get(meta.get("worker", ""), {})
@@ -451,10 +475,14 @@ def doctor(cfg):
             del workers[name]
             continue
         unknown(f"workers.{name}.", w, "worker")
-        if not strings(w.get("args")):
+        if "args" in w and not (isinstance(w["args"], list) and strings(w["args"])):
             probs.append(f"workers.{name}.args: expected a list of strings")
         if w.get("billing") not in (None, "metered", "subscription"):
             probs.append(f"workers.{name}.billing: {w['billing']!r}, expected 'metered' or 'subscription'")
+        for key in ("command", "codexHome"):
+            if key in w and not isinstance(w[key], str):
+                probs.append(f"workers.{name}.{key}: expected a path string")
+                w = {k: v for k, v in w.items() if k != key}
         kind = w.get("type")
         if kind not in ("codex", "claude"):
             probs.append(f"workers.{name}.type: {kind!r}, expected 'codex' or 'claude'")
@@ -526,9 +554,17 @@ def trunk_of(repo):
 
 def unmerged(repo, trunk, branch):
     """Commits of branch with no equivalent in trunk (by patch, so rebased and cherry-picked work counts as merged),
-    or None when git cannot tell."""
+    or None when git cannot tell. `git cherry` skips merge commits, so a branch with merges of its own counts as
+    merged only when trunk already contains it."""
+    if git(repo, "merge-base", "--is-ancestor", branch, trunk, ok=(0, 1)) is None:
+        return None
+    if git(repo, "merge-base", "--is-ancestor", branch, trunk) is not None:
+        return 0
+    merges = git(repo, "rev-list", "--merges", f"{trunk}..{branch}")
     out = git(repo, "cherry", trunk, branch)
-    return None if out is None else sum(1 for line in out.splitlines() if line.startswith("+"))
+    if merges is None or out is None:
+        return None
+    return sum(1 for line in out.splitlines() if line.startswith("+")) + len(merges.split())
 
 
 def clean(cfg, days=14):
@@ -615,12 +651,12 @@ _child = None  # the worker process, once started; one task per runner process
 CHANGES_MAX = 5 * 1024 * 1024  # changes.diff is cut here; meta says so and how to see the rest
 
 
-def git(cwd, *args, ok=(0,), env=None, timeout=120):
+def git(cwd, *args, ok=(0,), env=None, timeout=120, input=None):
     """stdout of a git command in cwd, or None when cwd is not a repo or git fails. No optional locks, so it never
     races a worker's own git commands for index.lock."""
     try:
         r = subprocess.run(["git", "-C", cwd, "-c", "color.ui=never", *args], capture_output=True, text=True,
-                           errors="replace", timeout=timeout,
+                           errors="replace", timeout=timeout, input=input,
                            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", **(env or {})})
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -642,6 +678,12 @@ def snapshot(top):
         else:
             os.unlink(tmp)  # a repo with no index yet: git starts an empty one
         env = {"GIT_INDEX_FILE": tmp}
+        # assume-unchanged entries would hide real edits from `add -A`; clear the flag in the copy only.
+        # skip-worktree stays: sparse checkout uses it for files that are not on disk at all.
+        hidden = [e[2:] for e in (git(top, "ls-files", "-v", "-z", env=env) or "").split("\0") if e[:1].islower()]
+        if hidden and git(top, "update-index", "--no-assume-unchanged", "-z", "--stdin", env=env,
+                          input="\0".join(hidden)) is None:
+            return None
         if git(top, "add", "-A", env=env, timeout=600) is None:
             return None
         tree = git(top, "write-tree", env=env)
@@ -693,13 +735,14 @@ CHECK_FILES = {"make": "Makefile", "npm": "package.json", "pnpm": "package.json"
                "bun": "package.json", "cargo": "Cargo.toml", "swift": "Package.swift"}
 
 
-def tests_touched(names, check):
+def tests_touched(names, check, top=""):
     """Changed files that are tests, or that the --check command names or runs through."""
     try:
         words = shlex.split(check or "")
     except ValueError:
         words = (check or "").split()
-    named = {w.lstrip("./") for w in words if "/" in w or "." in w} | {CHECK_FILES[w] for w in words if w in CHECK_FILES}
+    named = {os.path.relpath(w, top) if top and os.path.isabs(w) else w.removeprefix("./")
+             for w in words if "/" in w or "." in w} | {CHECK_FILES[w] for w in words if w in CHECK_FILES}
     return [n for n in names if TEST_PATH.search(n) or any(n == w or n.endswith("/" + w) for w in named)]
 
 
@@ -733,7 +776,12 @@ def write_changes(task, check=None):
                 proc.kill()
                 break
         proc.stdout.close()
-        proc.wait()
+        failed = proc.wait() != 0 and not cut
+    if failed:
+        os.unlink(path)
+        append_meta(task, changes="unavailable: git diff failed")
+        return
+    with open(path, "ab") as out:
         if cut:
             note = (f"\n… cut at {CHANGES_MAX // 1048576} MB. Full diff: "
                     f"git -C {shlex.quote(top)} diff {base} {end}\n").encode()
@@ -748,8 +796,13 @@ def write_changes(task, check=None):
     commits = (git(top, "rev-list", "--max-count=100", f"{m['base_head']}..{head}") or "").split() \
         if m.get("base_head") and head else []
     extra = {"branch": branch, "branch_start": m.get("branch", "")} if branch != m.get("branch", "") else {}
+    # The snapshot holds a submodule as its commit; edits not committed inside it are not in the diff.
+    gitlinks = [line.split("\t", 1)[1] for line in (git(top, "ls-files", "-s") or "").splitlines() if line.startswith("160000 ")]
+    dirty = [p for p in gitlinks if (git(os.path.join(top, p), "status", "--porcelain") or "").strip()]
+    if dirty:
+        extra["changes_missing"] = "uncommitted edits inside submodules " + ",".join(dirty[:10])
     names = (git(top, "diff", "--name-only", "--no-renames", "-z", base, end) or "").split("\0")
-    touched = tests_touched([n for n in names if n], check)
+    touched = tests_touched([n for n in names if n], check, top)
     if touched:
         extra["tests_touched"] = ",".join(touched[:20]) + (f",+{len(touched) - 20} more" if len(touched) > 20 else "")
     shared = overlapping(task, top)
@@ -783,16 +836,38 @@ def write_status(task, status):
         f.write(status + "\n")
 
 
+def descendants(pid):
+    """Every process below pid, children first, from `pgrep -P`; empty when pgrep is missing."""
+    found, todo = [], [pid]
+    while todo:
+        try:
+            out = subprocess.run(["pgrep", "-P", str(todo.pop())], capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            break
+        kids = [int(k) for k in out.split()]
+        found += kids
+        todo += kids
+    return found
+
+
 def on_stop(task):
     """If the runner is told to stop, queued or running, stop the worker and still record a final status:
     `canceled: …` when `muster.py cancel` asked for it, `failed: interrupted` otherwise."""
     def stop(signum, _frame):
         if _child is not None:
-            _child.terminate()
-            try:
-                _child.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                _child.kill()
+            # Stop the whole tree the worker or check started (a test runner, a `sleep &`), not just the shell on top.
+            tree = [_child.pid] + descendants(_child.pid)
+            for sig, wait in ((signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+                for pid in tree:
+                    try:
+                        os.kill(pid, sig)
+                    except OSError:
+                        pass
+                try:
+                    _child.wait(timeout=wait)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         reason = read_meta(task).get("canceled")
         if reason is None:
             finish(task, 128 + signum, f"failed: interrupted ({signal.Signals(signum).name})")
@@ -919,6 +994,12 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None):
         write_changes(task, check)
     except Exception as e:  # best effort, like usage; meta says why there is no diff
         append_meta(task, changes=f"unavailable: {short(str(e), 80)}")
+    record_model(task, kind)
+    try:  # before the check, so a check that is interrupted cannot cost the worker's usage and result
+        write_usage(task, cfg)
+    except Exception as e:  # usage is best effort; the task result matters more
+        with open(os.path.join(task, "log.txt"), "a") as log:
+            log.write(f"\nmuster: usage not recorded: {e}\n")
     if rc != 0 and check:
         append_meta(task, check="skipped: the worker failed")
     if rc == 0 and check:
@@ -927,17 +1008,8 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None):
             line, _ = last_error([os.path.join(task, "check.txt")])
             reason = f"done check failed (exit {crc})" + (f": {short(line, 100)}" if line else "")
             append_meta(task, last_error=reason, log_path=os.path.abspath(os.path.join(task, "check.txt")))
-            try:
-                write_usage(task, cfg)
-            except Exception:
-                pass
             finish(task, crc, f"failed: {reason}")
             return crc
-    try:
-        write_usage(task, cfg)
-    except Exception as e:  # usage is best effort; the task result matters more
-        with open(os.path.join(task, "log.txt"), "a") as log:
-            log.write(f"\nmuster: usage not recorded: {e}\n")
     if rc == 0:
         finish(task, 0, "done")
         return 0

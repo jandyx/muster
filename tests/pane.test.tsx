@@ -481,12 +481,16 @@ test('a done task with a recorded diff shows needs review until review.md approv
       stale: { ...task('done', meta), title: 'Stale review' },
       good: { ...task('done', meta), title: 'Good review' },
       template: { ...task('done', meta), title: 'Template copied' },
+      quoted: { ...task('done', meta), title: 'Quoted approval' },
+      bold: { ...task('done', meta), title: 'Bold label' },
       legacy: { ...task('done'), title: 'Legacy task' }, // before muster recorded diffs: no review state
       live: { ...task('running', meta), title: 'Still going' },
     },
   })
   t['/h/.muster/runs/20261117-1000-rev/stale/review.md'] = `Verdict: Approved\nchanges-sha256: ${'c'.repeat(64)}\n`
   t['/h/.muster/runs/20261117-1000-rev/good/review.md'] = `Reviewer: subagent\nVerdict: Approved\nchanges-sha256: ${sha}\n`
+  t['/h/.muster/runs/20261117-1000-rev/quoted/review.md'] = `> Verdict: Approved\nVerdict: Needs fixes\nchanges-sha256: ${sha}\n`
+  t['/h/.muster/runs/20261117-1000-rev/bold/review.md'] = `**Verdict**: Approved\nchanges-sha256: ${sha}\n`
   t['/h/.muster/runs/20261117-1000-rev/template/review.md'] = `Verdict: <Approved, or Needs fixes>\nchanges-sha256: ${sha}\n`
   await mountWith($, on, t)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -495,6 +499,8 @@ test('a done task with a recorded diff shows needs review until review.md approv
   expect(await line(/Stale review/)).toMatch(/needs review/)
   expect(await line(/Good review/)).not.toMatch(/needs review/)
   expect(await line(/Template copied/)).toMatch(/needs review/)
+  expect(await line(/Quoted approval/)).toMatch(/needs review/)
+  expect(await line(/Bold label/)).not.toMatch(/needs review/)
   expect(await line(/Legacy task/)).not.toMatch(/needs review/)
   expect(await line(/Still going/)).not.toMatch(/needs review/)
   await ui.unmount()
