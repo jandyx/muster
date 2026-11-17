@@ -36,3 +36,8 @@ claude plugin validate .                  # manifest, hooks module, marketplace
 - Prices in `prices.json` carry their source and check date in `_note`; update both together.
 - Keep user data out of the repo: no real account names, paths, repos or branches in docs, tests or screenshots. `assets/screenshot.html` is the source of `assets/screenshot.png`.
 - Workers run with approvals off. Do not widen what the runner does without saying so in the README's Safety section.
+
+## Releases
+
+Automatic: do not bump the version by hand. On every push to `main`, `.github/workflows/release.yml` checks whether anything the plugin runs changed since the last tag (`skills/`, `hooks/`, `types/`, `prices.json`, `.claude-plugin/`; docs, tests and CI alone do not release). If so, it commits "Bump version to x.y.z", tags `vx.y.z` and creates the GitHub Release. The level comes from labels on the merged pull requests: `major`, `minor` or `patch`; none means minor. A version bumped by hand and not yet tagged is released as it is.
+
