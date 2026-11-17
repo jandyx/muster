@@ -14,7 +14,7 @@ A Claude Code plugin with three parts:
 | Pane and band (Claude Code mod) | `hooks/register.tsx`, `types/index.d.ts` | TypeScript, Claude Code hooks API |
 | Prices | `prices.json` | JSON, USD per 1M tokens |
 
-The runner and the pane talk only through files in a task folder: `prompt.md`, `meta` (key=value), `status`, `log.txt` or `stream.jsonl`, `result.md`, `usage` (JSON). A change to any of these is a change to both sides.
+The runner and the pane talk only through files in a task folder: `prompt.md`, `meta` (key=value), `status`, `log.txt` or `stream.jsonl`, `result.md`, `usage` (JSON), `review.md` (written by Claude; the pane reads its `Verdict:` and `changes-sha256:` to mark a task reviewed). A change to any of these is a change to both sides. The runner also writes `changes.diff` and `check.txt` for the skill; the pane does not read them.
 
 ## Checks
 

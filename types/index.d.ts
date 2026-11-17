@@ -5,6 +5,8 @@ export type Task = {
   branch: string
   session: string
   status: string
+  // 'reviewed' or 'needs review' for a done task with a recorded diff (review.md vs meta's changes_sha256); else ''.
+  review: string
   startedMs: number
   queuedMs: number
   after: string[]

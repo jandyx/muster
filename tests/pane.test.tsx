@@ -471,3 +471,31 @@ test('a long note wraps to at most three lines, a long command to two', async ($
   for (const r of rows.slice(start, cmdStart + 2)) expect([...r].length).toBeLessThanOrEqual(50)
   await ui.unmount()
 })
+
+test('a done task with a recorded diff shows needs review until review.md approves that diff', async ($, on) => {
+  const sha = 'a'.repeat(64)
+  const meta = `changes=2 files +5 -1\nchanges_sha256=${sha}\n`
+  const t = tree('/h/.muster/runs', {
+    '20261117-1000-rev': {
+      fresh: { ...task('done', meta), title: 'Fresh fix' },
+      stale: { ...task('done', meta), title: 'Stale review' },
+      good: { ...task('done', meta), title: 'Good review' },
+      template: { ...task('done', meta), title: 'Template copied' },
+      legacy: { ...task('done'), title: 'Legacy task' }, // before muster recorded diffs: no review state
+      live: { ...task('running', meta), title: 'Still going' },
+    },
+  })
+  t['/h/.muster/runs/20261117-1000-rev/stale/review.md'] = `Verdict: Approved\nchanges-sha256: ${'c'.repeat(64)}\n`
+  t['/h/.muster/runs/20261117-1000-rev/good/review.md'] = `Reviewer: subagent\nVerdict: Approved\nchanges-sha256: ${sha}\n`
+  t['/h/.muster/runs/20261117-1000-rev/template/review.md'] = `Verdict: <Approved, or Needs fixes>\nchanges-sha256: ${sha}\n`
+  await mountWith($, on, t)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const line = async (title: RegExp) => (await ui.find({ type: 'Text', text: title }))?.text ?? ''
+  expect(await line(/Fresh fix/)).toMatch(/needs review/)
+  expect(await line(/Stale review/)).toMatch(/needs review/)
+  expect(await line(/Good review/)).not.toMatch(/needs review/)
+  expect(await line(/Template copied/)).toMatch(/needs review/)
+  expect(await line(/Legacy task/)).not.toMatch(/needs review/)
+  expect(await line(/Still going/)).not.toMatch(/needs review/)
+  await ui.unmount()
+})

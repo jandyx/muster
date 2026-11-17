@@ -8,7 +8,7 @@ const TITLE = 'Muster'
 const POLL_MS = 5000
 
 // Change a tag when its value's fields change, so a reload declines old values.
-const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-9' })
+const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-10' })
 // The session's own subagents (`$.agent.list()`), refreshed every poll. They are not Muster runs: no worker,
 // no cost; the list is already bound to this session, so it needs no session filter.
 const agentsAtom = atom({ plugin: 'muster', key: 'agents' } as const, [] as Agent[], { shape: 'agents-1' })
@@ -305,12 +305,13 @@ export const register: Register = on => {
       return Promise.all(
         dirs.map(async (id): Promise<Task> => {
           const dir = `${root}/${name}/${id}`
-          const [status, meta, result, prompt, usageText] = await Promise.all([
+          const [status, meta, result, prompt, usageText, reviewText] = await Promise.all([
             readText(`${dir}/status`),
             readText(`${dir}/meta`),
             readText(`${dir}/result.md`),
             readText(`${dir}/prompt.md`),
             readText(`${dir}/usage`),
+            readText(`${dir}/review.md`),
           ])
           let usage: Usage | null = null
           try {
@@ -353,8 +354,16 @@ export const register: Register = on => {
           // muster.py records why in meta (`last_error`); older runs: result.md says why, or the log's error line.
           const failed = isOrphan || status.trim().startsWith('failed')
           const reason = !failed ? '' : (kv.last_error ?? '') || (tidy === '' ? failureLine(await readText(`${dir}/log.txt`)) : '')
+          // A done task whose diff muster recorded counts as reviewed once review.md approves that same diff: its
+          // `Verdict:` line and meta's `changes_sha256`, so a review of an earlier diff does not count. Older tasks
+          // (no `changes` in meta) show no review state.
+          const approved =
+            /^\W*Verdict:\W*(Approved|User override)\W*$/im.test(reviewText) &&
+            (!kv.changes_sha256 || reviewText.includes(kv.changes_sha256))
+          const review = status.trim() !== 'done' || kv.changes === undefined ? '' : approved ? 'reviewed' : 'needs review'
           return {
             id,
+            review,
             branch,
             session: kv.session ?? '',
             title: titleOf(prompt, id),
@@ -628,6 +637,7 @@ export const register: Register = on => {
                 <Box flexDirection="column" marginTop={1}>
                   <Text color={markColor(t)}>
                     {'  '}{mark(t)} {t.title}
+                    {t.review === 'needs review' && <Text color="warning"> · needs review</Text>}
                   </Text>
                   <Text dimColor>
                     {'    '}{t.id} · {Worker(t.worker)} · {place.has(t) ? t.status.replace(/^queued/, `queued #${place.get(t)}`) : t.status}{t.after.length > 0 ? ` · after ${t.after.join(', ')}` : ''}{t.priority !== 0 ? ` · priority ${t.priority}` : ''}{t.startedMs > 0 ? ` · ${fmtElapsed((t.finishedMs || now) - t.startedMs)}` : ''}{t.branch ? ` · ⎇ ${t.branch}` : ''}
@@ -710,6 +720,7 @@ export const register: Register = on => {
         {active.map((r, i) => {
           // Only running tasks get a row; finished ones collapse to counts.
           const done = r.tasks.filter(t => t.status === 'done').length
+          const unreviewed = r.tasks.filter(t => t.review === 'needs review').length
           const failed = r.tasks.filter(isFailed).length
           const queued = r.tasks.filter(isQueued).length
           const canceled = r.tasks.filter(isCanceled).length
@@ -726,6 +737,7 @@ export const register: Register = on => {
               ))}
               {queued > 0 && <Text color="cyan">○{queued} </Text>}
               {done > 0 && <Text color="green">✓{done} </Text>}
+              {unreviewed > 0 && <Text color="warning">{unreviewed} unreviewed </Text>}
               {failed > 0 && <Text color="red">✗{failed} </Text>}
               {canceled > 0 && <Text dimColor>⊘{canceled} </Text>}
             </Text>

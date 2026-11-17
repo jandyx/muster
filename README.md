@@ -63,7 +63,7 @@ Muster turns that into a habit Claude already knows and a screen you can glance 
 
 ## Features
 
-- **A `muster` skill.** Plan → isolate → self-contained prompts → launch in the background → verify → one report table. The same loop every time.
+- **A `muster` skill.** Plan → isolate → self-contained prompts → launch in the background → run the done check itself (`--check`) → review the whole diff (`changes.diff`, written by the runner) into `review.md`; the pane marks unreviewed tasks → one report table. The same loop every time.
 - **Any number of workers.** Each Codex account is a `codex` worker with its own `CODEX_HOME`; any Claude Code compatible CLI is a `claude` worker. Several tasks can run on one account at once.
 - **Routing you write once.** Per-repo worker priority with quota fallbacks, workers fenced to certain repos, parallel caps. The fences and caps are enforced by the runner, not left to Claude's memory.
 - **A live pane and band.** Task title, worker, elapsed time, the worker's latest note and command, a red warning after 2 minutes of silence, a one-line result, foldable runs — and the session's own Claude subagents, running first, finished ones folded.
