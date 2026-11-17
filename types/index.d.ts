@@ -2,6 +2,8 @@ export type Task = {
   id: string
   title: string
   worker: string
+  // The worker's model and reasoning effort when known, e.g. 'gpt-6-astra high'; else ''.
+  model: string
   branch: string
   session: string
   status: string

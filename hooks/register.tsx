@@ -8,7 +8,7 @@ const TITLE = 'Muster'
 const POLL_MS = 5000
 
 // Change a tag when its value's fields change, so a reload declines old values.
-const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-10' })
+const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-11' })
 // The session's own subagents (`$.agent.list()`), refreshed every poll. They are not Muster runs: no worker,
 // no cost; the list is already bound to this session, so it needs no session filter.
 const agentsAtom = atom({ plugin: 'muster', key: 'agents' } as const, [] as Agent[], { shape: 'agents-1' })
@@ -227,6 +227,23 @@ const wrapCells = (text: string, cols: number, max: number) => {
   return kept
 }
 
+// The worker's model from its log while it runs: codex prints `model:` in its header, a claude worker names it
+// in the stream's init event.
+const liveModel = (text: string, isStream: boolean) => {
+  if (!isStream) return /^model: (\S+)/m.exec(text.slice(0, 8192))?.[1] ?? ''
+  for (const line of text.split('\n', 200)) {
+    if (!line.includes('"init"')) continue
+    try {
+      const o = JSON.parse(line) as { type?: string; subtype?: string; model?: unknown }
+      if (o.type === 'system' && o.subtype === 'init' && typeof o.model === 'string') return o.model
+    } catch {
+      // not a JSON line
+    }
+  }
+  return ''
+}
+const liveEffort = (text: string) => /^reasoning effort: (\S+)/m.exec(text.slice(0, 8192))?.[1] ?? ''
+
 const fmtElapsed = (ms: number) => {
   if (ms <= 0) return ''
   const s = Math.floor(ms / 1000)
@@ -326,7 +343,7 @@ export const register: Register = on => {
           const tidy = first
             .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1') // [report.md](/long/path) -> report.md
             .replace(/`?(\/[^\s`]+\/)([^\s`/]+)`?/g, '$2') // /abs/path/report.md -> report.md
-            .replace(/[`*_]/g, '')
+            .replace(/[`*]/g, '') // underscores stay: DONE_WITH_CONCERNS is a word, not emphasis
             .replace(/\s+/g, ' ')
             .trim()
           const branch = await readBranch(kv.cwd)
@@ -371,6 +388,8 @@ export const register: Register = on => {
             title: titleOf(prompt, id),
             // A queued task has no `worker` yet, only the `workers` it may start on.
             worker: kv.worker ?? (kv.workers ? kv.workers.split(',').join('|') : '?'),
+            // meta once the worker is done (muster.py reads it from the log head); while it runs, the log itself.
+            model: [kv.model ?? usage?.model ?? liveModel(liveText, isStream), kv.effort ?? liveEffort(liveText)].filter(Boolean).join(' '),
             status: isOrphan ? 'failed: lost (runner exited without a final status)' : status.trim() || 'pending',
             startedMs: parseTime(kv.started),
             queuedMs: parseTime(kv.queued),
@@ -642,7 +661,7 @@ export const register: Register = on => {
                     {t.review === 'needs review' && <Text color="warning"> · needs review</Text>}
                   </Text>
                   <Text dimColor>
-                    {'    '}{t.id} · {Worker(t.worker)} · {place.has(t) ? t.status.replace(/^queued/, `queued #${place.get(t)}`) : t.status}{t.after.length > 0 ? ` · after ${t.after.join(', ')}` : ''}{t.priority !== 0 ? ` · priority ${t.priority}` : ''}{t.startedMs > 0 ? ` · ${fmtElapsed((t.finishedMs || now) - t.startedMs)}` : ''}{t.branch ? ` · ⎇ ${t.branch}` : ''}
+                    {'    '}{t.id} · {Worker(t.worker)}{t.model ? ` · ${t.model}` : ''} · {place.has(t) ? t.status.replace(/^queued/, `queued #${place.get(t)}`) : t.status}{t.after.length > 0 ? ` · after ${t.after.join(', ')}` : ''}{t.priority !== 0 ? ` · priority ${t.priority}` : ''}{t.startedMs > 0 ? ` · ${fmtElapsed((t.finishedMs || now) - t.startedMs)}` : ''}{t.branch ? ` · ⎇ ${t.branch}` : ''}
                   </Text>
                   {isFailed(t) &&
                     t.reason !== '' &&

@@ -196,7 +196,7 @@ Above the runs, **Claude agents** lists the subagents this Claude Code session s
 | `e` · `c` | expand all · collapse all |
 | `esc` | back to the prompt |
 
-Finished runs fold to one line with their totals. A toast tells you when a task ends. Each worker keeps one color everywhere.
+Finished runs fold to one line with their totals. A toast tells you when a task ends. Each worker keeps one color everywhere, and each task names the model it ran on (with its reasoning effort for Codex).
 
 ## Tokens and cost
 
