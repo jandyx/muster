@@ -195,7 +195,7 @@ When a worker fails, `status` reads `failed: <reason>`: the last error line of i
 
 ## The pane
 
-The pane opens by itself when a prompt starts with `muster:` or `/muster`. `/muster-panel` opens it and gives it the keyboard. While tasks run, a band above the prompt lists them.
+The pane opens by itself when a prompt starts with `muster:` or `/muster`. `/muster-panel` opens it and gives it the keyboard. While tasks run or wait for review, a one-line band above the prompt counts them across runs, most urgent first, behind a progress bar: green is accepted work, amber waits for review or fixes, red failed, and the number counts accepted tasks only. A task's own percentage comes only from a `Progress: 12/40` or `Progress: 45%` line its worker prints.
 
 Above the runs, **Claude agents** lists the subagents this Claude Code session spawned — the Agent tool's, including plugin agents such as `oh-my-claudecode:executor-high`. Running and waiting ones show with their status and, while they work, their latest tool call (`$ …`); finished ones fold into a count. The engine supplies the list (`$.agent.list()`), so they carry no worker, tokens or cost.
 
