@@ -115,7 +115,7 @@ test('the band above the prompt colors each running run', async ($, on) => {
   const ui = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
 
   expect(await ui.find({ type: 'Text', text: /codex-a/ })).toBeUndefined()
-  expect((await ui.find({ type: 'Text', text: /^✓ done/ }))?.text).toMatch(/^✓ done ×1/)
+  expect((await ui.find({ type: 'Text', text: /1\/4/ }))?.text).toMatch(/1\/4/)
   expect((await ui.find({ type: 'Text', text: /running/ }))?.text).toMatch(/◐ running ×2/)
   await ui.unmount()
 })
@@ -348,7 +348,7 @@ test('queued tasks show their dependencies and priority, in the order they will 
   await ui.unmount()
   const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
   expect((await band.find({ type: 'Text', text: /^○ queued/ }))?.text).toMatch(/^○ queued ×5/)
-  expect((await band.find({ type: 'Text', text: /^⊘ canceled/ }))?.text).toMatch(/^⊘ canceled ×1/)
+  expect(await band.find({ type: 'Text', text: /canceled/ })).toBeUndefined()
   await band.unmount()
 })
 
@@ -518,7 +518,7 @@ test('the band sums every run on one line and folds several running tasks into a
   expect((await band.find({ type: 'Text', text: /running/ }))?.text).toMatch(/◐ running ×3/)
   expect(await band.find({ type: 'Text', text: /First long task/ })).toBeUndefined()
   expect((await band.find({ type: 'Text', text: /^✗ failed/ }))?.text).toMatch(/^✗ failed ×2/)
-  expect((await band.find({ type: 'Text', text: /0\/5/ }))?.text).toMatch(/█{4}░{4} 0\/5 · 2 runs/)
+  expect((await band.find({ type: 'Text', text: /0\/5/ }))?.text).toMatch(/█{4}░{4} 0\/5/)
   await band.unmount()
 })
 
@@ -589,7 +589,7 @@ test('a task needing review or fixes gets its own section and count, and is not 
   expect((await ui.find({ type: 'Text', text: /Unread work/ }))?.text).toMatch(/Unread work/)
   await ui.unmount()
   const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
-  expect((await band.find({ type: 'Text', text: /^✓ done/ }))?.text).toMatch(/^✓ done ×2/)
+  expect((await band.find({ type: 'Text', text: /2\/5/ }))?.text).toMatch(/2\/5/)
   expect((await band.find({ type: 'Text', text: /! fix/ }))?.text).toMatch(/! fix ×1/)
   expect((await band.find({ type: 'Text', text: /review/ }))?.text).toMatch(/\? review ×2/)
   await band.unmount()

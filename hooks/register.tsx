@@ -756,7 +756,8 @@ export const register: Register = on => {
     if (e.props.hasSurvey || (active.length === 0 && activeAgents.length === 0)) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
-    // One line across all runs, most urgent first; the pane has the per-run detail.
+    // One line across all runs, short enough for a docked pane: what needs you, most urgent first. The bar's number
+    // already says what is accepted; the pane has the per-run detail.
     const tasks = active.flatMap(r => r.tasks)
     const running = tasks.filter(isRunning)
     // Canceled work is no longer planned. Only accepted work fills green, so a full green bar means all of it passed;
@@ -774,8 +775,6 @@ export const register: Register = on => {
       [isFailed, '✗', 'failed', 'red'],
       [needsFixes, '!', 'fix', 'error'],
       [needsReview, '?', 'review', 'warning'],
-      [isDone, '✓', 'done', 'green'],
-      [isCanceled, '⊘', 'canceled', undefined],
     ] as const).map(([test, sign, label, color]) => ({ n: tasks.filter(test).length, sign, label, color })).filter(c => c.n > 0)
     const only = running.length === 1 ? running[0]! : undefined
     const parts = [
@@ -786,7 +785,6 @@ export const register: Register = on => {
           <Text color="red">{'█'.repeat(red - amber)}</Text>
           <Text dimColor>{'░'.repeat(BAND_BAR - red)}</Text>
           <Text> {accepted}/{planned}</Text>
-          {active.length > 1 && <Text dimColor> · {active.length} runs</Text>}
         </Text>
       ),
       only && (
@@ -800,7 +798,7 @@ export const register: Register = on => {
       running.length > 1 && (
         <Text>
           <Text color="yellow">◐ running</Text>
-          <Text dimColor> ×{running.length} {fmtElapsed(now - Math.min(...running.map(t => t.startedMs)))}</Text>
+          <Text dimColor> ×{running.length}</Text>
         </Text>
       ),
       ...counts.map(c => (
@@ -816,12 +814,10 @@ export const register: Register = on => {
         <Text color="cyan" bold>⇉ muster </Text>
         {parts.map((part, i) => (
           <Text>
-            {i > 0 && <Text dimColor> | </Text>}
             {part}
+            {i < parts.length - 1 && <Text dimColor> | </Text>}
           </Text>
         ))}
-        <Text dimColor> </Text>
-        <Text dimColor>· /muster-panel</Text>
       </Box>
     )
   })
