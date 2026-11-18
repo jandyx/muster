@@ -8,7 +8,7 @@ const TITLE = 'Muster'
 const POLL_MS = 5000
 
 // Change a tag when its value's fields change, so a reload declines old values.
-const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-12' })
+const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-13' })
 // The session's own subagents (`$.agent.list()`), refreshed every poll. They are not Muster runs: no worker,
 // no cost; the list is already bound to this session, so it needs no session filter.
 const agentsAtom = atom({ plugin: 'muster', key: 'agents' } as const, [] as Agent[], { shape: 'agents-1' })
@@ -44,6 +44,46 @@ const startOrder = (a: Task, b: Task) => {
   const [x, y] = [rank(a), rank(b)]
   return x[0]! - y[0]! || x[1]! - y[1]! || x[2]! - y[2]!
 }
+// A rerun is the same work again. As in a CI retry, the newest attempt decides how that work stands and the earlier
+// ones are history. The runner records the link (`--retry-of`), across names and runs; tasks from before it was
+// recorded fall back to the `x`, `x-r2`, `x-r3` naming inside one run.
+const attemptOf = (id: string) => {
+  const m = /^(.+)-r(\d+)$/.exec(id)
+  return { work: m ? m[1]! : id, round: m ? Number(m[2]) : 1 }
+}
+const lineage = (runs: Run[]) => {
+  const byKey = new Map(runs.flatMap(r => r.tasks.map(t => [`${r.name}/${t.id}`, t] as const)))
+  const runOf = new Map(runs.flatMap(r => r.tasks.map(t => [t, r.name] as const)))
+  // `seen` stops at a link that loops back, which hand-edited meta could hold.
+  const trace = (t: Task, seen: Set<Task>): { work: string; round: number } => {
+    const parent = byKey.get(t.retryOf)
+    if (parent && !seen.has(parent)) {
+      const up = trace(parent, seen.add(parent))
+      return { work: up.work, round: up.round + 1 }
+    }
+    const { work, round } = attemptOf(t.id)
+    return { work: `${runOf.get(t)}/${work}`, round }
+  }
+  const workOf = new Map<Task, string>()
+  const newest = new Map<string, { task: Task; round: number }>()
+  for (const t of runs.flatMap(r => r.tasks)) {
+    const { work, round } = trace(t, new Set([t]))
+    workOf.set(t, work)
+    const seen = newest.get(work)
+    // A canceled attempt never replaces one that ran: canceling a rerun leaves the last real result standing.
+    const isNewer = !seen
+      || (isCanceled(seen.task) !== isCanceled(t) ? isCanceled(seen.task)
+        : round !== seen.round ? round > seen.round
+        : (t.startedMs || t.queuedMs) > (seen.task.startedMs || seen.task.queuedMs))
+    if (isNewer) newest.set(work, { task: t, round })
+  }
+  const latest = new Set([...newest.values()].map(n => n.task))
+  return { latest, newestOf: (t: Task) => newest.get(workOf.get(t)!)!.task }
+}
+type Lineage = ReturnType<typeof lineage>
+const retriedAttempts = (tasks: Task[], attempts: Lineage) => tasks.filter(t => !attempts.latest.has(t) && isFinished(t))
+// Something in the run still runs, or its newest work waits for a review or fixes.
+const isOpen = (run: Run, attempts: Lineage) => run.tasks.some(t => isActive(t) || (attempts.latest.has(t) && needsAttention(t)))
 // Pane sections inside a run, in display order; a task falls into the first whose test it passes.
 const SECTIONS: [string, string | undefined, (t: Task) => boolean][] = [
   ['Running', 'yellow', isRunning],
@@ -53,6 +93,8 @@ const SECTIONS: [string, string | undefined, (t: Task) => boolean][] = [
   ['Needs review', 'warning', needsReview],
   ['Canceled', undefined, isCanceled],
   ['Done', 'green', () => true],
+  // Filled from retriedAttempts, which needs the whole run; folded until opened.
+  ['Retried', undefined, () => false],
 ]
 const mark = (t: Task) => (needsFixes(t) ? '!' : needsReview(t) ? '◇' : t.status === 'done' ? '✓' : isRunning(t) ? '…' : isFailed(t) ? '✗' : isCanceled(t) ? '⊘' : '○')
 const markColor = (t: Task) => (needsFixes(t) ? 'error' : needsReview(t) ? 'warning' : t.status === 'done' ? 'green' : isRunning(t) ? 'yellow' : isFailed(t) ? 'red' : isQueued(t) ? 'cyan' : undefined)
@@ -405,7 +447,9 @@ export const register: Register = on => {
           const coversDiff = !kv.changes_sha256 || reviewText.includes(kv.changes_sha256)
           const approved = (verdict === 'approved' || verdict === 'user override') && coversDiff
           const fixes = verdict === 'needs fixes' && coversDiff
-          const review = status.trim() !== 'done' || kv.changes === undefined ? '' : approved ? 'reviewed' : fixes ? 'needs fixes' : 'needs review'
+          // A task that changed nothing was a read-only review: its verdict is about what it read, and the review is done.
+          const readOnly = kv.changes?.startsWith('0 files') ?? false
+          const review = status.trim() !== 'done' || kv.changes === undefined ? '' : approved || (fixes && readOnly) ? 'reviewed' : fixes ? 'needs fixes' : 'needs review'
           // After the worker exits its log goes quiet on purpose; meta says what the runner is doing instead.
           const phase = !isLive ? '' : kv.check_started ? 'running done check' : kv.check_waiting ? 'waiting for done check' : kv.worker_exited ? 'saving results' : ''
           return {
@@ -423,6 +467,7 @@ export const register: Register = on => {
             queuedMs: parseTime(kv.queued),
             after: (kv.after ?? '').split(',').filter(Boolean),
             priority: Number(kv.priority ?? 0) || 0,
+            retryOf: kv.retry_of ?? '',
             finishedMs: parseTime(kv.finished),
             summary: tidy.slice(0, 400),
             reason,
@@ -564,7 +609,8 @@ export const register: Register = on => {
       )
     }
     const folds = await read($, foldsAtom)
-    const isFolded = (run: Run) => folds[run.name] ?? !run.tasks.some(t => isActive(t) || needsAttention(t))
+    const attempts = lineage(runs)
+    const isFolded = (run: Run) => folds[run.name] ?? !isOpen(run, attempts)
     const isAgentsFolded = folds.agents ?? !agents.some(isAgentActive)
     const isFinishedAgentsFolded = folds['agents/finished'] ?? true
     const finishedAgents = agents.filter(isAgentFinished)
@@ -592,9 +638,10 @@ export const register: Register = on => {
       )
     }
     const count = (run: Run) => {
-      const n = (test: (t: Task) => boolean) => run.tasks.filter(test).length
-      const extra = [[n(needsFixes), 'needs fixes'], [n(needsReview), 'needs review'], [n(isQueued), 'queued'], [n(isCanceled), 'canceled']].filter(([k]) => k).map(([k, l]) => ` · ${k} ${l}`).join('')
-      return `${n(isRunning)} running · ${n(isDone)} done · ${n(isFailed)} failed${extra}`
+      const latest = run.tasks.filter(t => attempts.latest.has(t))
+      const n = (test: (t: Task) => boolean) => latest.filter(test).length
+      const extra = [[n(needsFixes), 'needs fixes'], [n(needsReview), 'needs review'], [n(isQueued), 'queued'], [n(isCanceled), 'canceled'], [retriedAttempts(run.tasks, attempts).length, 'retried']].filter(([k]) => k).map(([k, l]) => ` · ${k} ${l}`).join('')
+      return `${run.tasks.filter(isRunning).length} running · ${n(isDone)} done · ${n(isFailed)} failed${extra}`
     }
     // Subagent rows: running first, then waiting; finished ones sit under their own fold.
     const agentRows = (list: Agent[]) =>
@@ -663,7 +710,8 @@ export const register: Register = on => {
               })}
             {!isFolded(run) &&
               SECTIONS.flatMap(([label, color], i) => {
-                const tasks = run.tasks.filter(t => SECTIONS.findIndex(([, , test]) => test(t)) === i)
+                const retried = retriedAttempts(run.tasks, attempts)
+                const tasks = label === 'Retried' ? retried : run.tasks.filter(t => !retried.includes(t) && SECTIONS.findIndex(([, , test]) => test(t)) === i)
                 if (label === 'Queued') tasks.sort(startOrder)
                 // Place in its worker's line, for tasks only a slot holds back (not a dependency, not unlaunched).
                 const place = new Map<Task, number>()
@@ -676,14 +724,15 @@ export const register: Register = on => {
                 }
                 if (tasks.length === 0) return []
                 const key = `${run.name}/${label}`
+                const isSectionFolded = folds[key] ?? label === 'Retried'
                 const header = (
                   <Box marginTop={1}>
-                    <Button key={`section:${key}`} plain onPress={() => void update($, foldsAtom, old => ({ ...old, [key]: !old[key] }))}>
-                      <Text bold color={color}>{'  '}{folds[key] ? '▸' : '▾'} {label} · {tasks.length}</Text>
+                    <Button key={`section:${key}`} plain onPress={() => void update($, foldsAtom, old => ({ ...old, [key]: !isSectionFolded }))}>
+                      <Text bold color={color}>{'  '}{isSectionFolded ? '▸' : '▾'} {label} · {tasks.length}</Text>
                     </Button>
                   </Box>
                 )
-                if (folds[key]) return [header]
+                if (isSectionFolded) return [header]
                 return [header, ...tasks.map(t => (
                 <Box flexDirection="column" marginTop={1}>
                   <Text color={markColor(t)}>
@@ -768,8 +817,10 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    // A run stays in the band while a task runs or a finished one still needs review or fixes.
-    const active = (await read($, runsAtom)).filter(r => r.tasks.some(t => isActive(t) || needsAttention(t)))
+    // A run stays in the band while a task runs or its newest work still needs review or fixes.
+    const runs = await read($, runsAtom)
+    const attempts = lineage(runs)
+    const active = runs.filter(r => isOpen(r, attempts))
     // Claude's own subagents count while one is still going; a finished one leaves the band quiet.
     const activeAgents = (await read($, agentsAtom)).filter(isAgentActive)
     if (e.props.hasSurvey || (active.length === 0 && activeAgents.length === 0)) return next(e)
@@ -777,18 +828,13 @@ export const register: Register = on => {
     const now = await $.clock.now()
     // One line across all runs, short enough for a docked pane: what needs you, most urgent first. The bar's number
     // already says what is accepted; the pane has the per-run detail.
-    const tasks = active.flatMap(r => r.tasks)
-    const running = tasks.filter(isRunning)
-    // Canceled work is no longer planned. Only accepted work fills green, so a full green bar means all of it passed;
-    // the ceilings keep a small count of waiting or failed tasks visible.
+    const inBand = active.flatMap(r => r.tasks)
+    const tasks = [...new Set(inBand.map(attempts.newestOf))]
+    const running = inBand.filter(isRunning)
+    // Canceled work is no longer planned. Only accepted work fills the bar, so a full bar means all of it passed.
     const planned = tasks.length - tasks.filter(isCanceled).length
     const accepted = tasks.filter(isDone).length
-    const waiting = tasks.filter(needsAttention).length
-    const failedCount = tasks.filter(isFailed).length
-    const cell = (n: number, round: (x: number) => number) => (planned > 0 ? round((n / planned) * BAND_BAR) : 0)
-    const green = cell(accepted, Math.floor)
-    const amber = waiting > 0 ? cell(accepted + waiting, Math.ceil) : green
-    const red = failedCount > 0 ? cell(accepted + waiting + failedCount, Math.ceil) : amber
+    const filled = planned > 0 ? Math.floor((accepted / planned) * BAND_BAR) : 0
     const counts = ([
       [isQueued, '○', 'queued', 'cyan'],
       [isFailed, '✗', 'failed', 'red'],
@@ -799,10 +845,8 @@ export const register: Register = on => {
     const parts = [
       planned > 0 && (
         <Text>
-          <Text color="green">{'█'.repeat(green)}</Text>
-          <Text color="warning">{'█'.repeat(amber - green)}</Text>
-          <Text color="red">{'█'.repeat(red - amber)}</Text>
-          <Text dimColor>{'░'.repeat(BAND_BAR - red)}</Text>
+          <Text color="green">{'█'.repeat(filled)}</Text>
+          <Text dimColor>{'░'.repeat(BAND_BAR - filled)}</Text>
           <Text> {accepted}/{planned}</Text>
         </Text>
       ),

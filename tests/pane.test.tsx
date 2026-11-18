@@ -532,11 +532,11 @@ test('the band sums every run on one line and folds several running tasks into a
   expect((await band.find({ type: 'Text', text: /running/ }))?.text).toMatch(/◐ running ×3/)
   expect(await band.find({ type: 'Text', text: /First long task/ })).toBeUndefined()
   expect((await band.find({ type: 'Text', text: /^✗ failed/ }))?.text).toMatch(/^✗ failed ×2/)
-  expect((await band.find({ type: 'Text', text: /0\/5/ }))?.text).toMatch(/█{4}░{4} 0\/5/)
+  expect((await band.find({ type: 'Text', text: /0\/5/ }))?.text).toMatch(/░{8} 0\/5/)
   await band.unmount()
 })
 
-test('the band bar fills green only for accepted work and leaves canceled tasks out', async ($, on) => {
+test('the band bar fills only for accepted work and leaves canceled tasks out', async ($, on) => {
   const sha = 'a'.repeat(64)
   const t = tree('/h/.muster/runs', {
     '20261117-1400-bar': {
@@ -549,14 +549,83 @@ test('the band bar fills green only for accepted work and leaves canceled tasks 
   })
   await mountWith($, on, t)
   const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
-  expect((await band.find({ type: 'Text', text: /1\/4/ }))?.text).toMatch(/█{6}░{2} 1\/4/)
+  expect((await band.find({ type: 'Text', text: /1\/4/ }))?.text).toMatch(/█{2}░{6} 1\/4/)
   await band.unmount()
 })
 
-test('the band bar draws no amber or red cell when no task is waiting or failed', async ($, on) => {
-  await mountWith($, on, tree('/h/.muster/runs', { '20261117-1500-bar': { ok: task('done'), a: task('running'), b: task('running') } }))
+test('fix rounds count as one piece of work and the newest attempt decides', async ($, on) => {
+  const run = '20261118-0900-rounds'
+  await mountWith($, on, tree('/h/.muster/runs', {
+    [run]: {
+      fixed: task('failed: exit 1'),
+      'fixed-r2': task('done'),
+      broken: task('done'),
+      'broken-r2': task('done'),
+      'broken-r3': task('failed: done check failed'),
+      dropped: task('canceled: not needed'),
+      kept: task('done'),
+      'kept-r2': task('canceled: fix round dropped'),
+      gone: task('canceled: wrong worker'),
+      'gone-r2': task('failed: exit 1'),
+      'gone-r3': task('done'),
+      live: task('running'),
+    },
+  }))
   const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
-  expect((await band.findAll({ type: 'Text', text: /^█+$/ })).map((r: any) => r.text)).toEqual(['██'])
+  expect((await band.find({ type: 'Text', text: /3\/5/ }))?.text).toMatch(/█{4}░{4} 3\/5/)
+  expect((await band.find({ type: 'Text', text: /^✗ failed/ }))?.text).toMatch(/^✗ failed ×1/)
+  await band.unmount()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Button', text: new RegExp(run) }))?.text).toMatch(/1 running · 3 done · 1 failed · 1 canceled · 6 retried$/)
+  expect((await ui.find({ type: 'Button', text: /Retried/ }))?.text).toMatch(/▸ Retried · 6/)
+  expect((await ui.find({ type: 'Button', text: /Failed/ }))?.text).toMatch(/Failed · 1/)
+  expect(await ui.find({ type: 'Text', text: /^\s+fixed · / })).toBeUndefined()
+  await ui.press({ key: `section:${run}/Retried` })
+  expect((await ui.find({ type: 'Text', text: /^\s+fixed · / }))?.text).toMatch(/fixed · w1/)
+  await ui.unmount()
+})
+
+test('a rerun under another name in another run replaces the attempt it names', async ($, on) => {
+  const [first, second] = ['20261118-0800-first', '20261118-0900-second']
+  await mountWith($, on, tree('/h/.muster/runs', {
+    [first]: { login: task('failed: exit 1'), other: task('done') },
+    [second]: {
+      'login-again': task('done', `retry_of=${first}/login\n`),
+      'same-name': task('failed: exit 1', 'retry_of=20261118-0000-gone/nothing\n'),
+      loop: task('failed: exit 1', `retry_of=${second}/pool\n`),
+      pool: task('failed: exit 1', `retry_of=${second}/loop\n`),
+      live: task('running'),
+    },
+  }))
+  const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
+  expect((await band.find({ type: 'Text', text: /^✗ failed/ }))?.text).toMatch(/^✗ failed ×3/)
+  expect((await band.find({ type: 'Text', text: /1\/5/ }))?.text).toMatch(/1\/5/)
+  await band.unmount()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Button', text: new RegExp(first) }))?.text).toMatch(/0 running · 1 done · 0 failed · 1 retried$/)
+  expect((await ui.find({ type: 'Button', text: new RegExp(second) }))?.text).toMatch(/1 running · 1 done · 3 failed$/)
+  await ui.unmount()
+})
+
+test('a read-only review is finished whatever it found, and a fixed task leaves the band', async ($, on) => {
+  const sha = 'b'.repeat(64)
+  const t = tree('/h/.muster/runs', {
+    '20261118-1000-readonly': { audit: { ...task('done', `changes=0 files +0 -0\nchanges_sha256=${sha}\n`), title: 'Audit the PR' } },
+    '20261118-1100-fixed': {
+      work: task('done', `changes=2 files +3 -1\nchanges_sha256=${sha}\n`),
+      'work-r2': task('done', `changes=1 files +1 -0\nchanges_sha256=${sha}\n`),
+    },
+  })
+  t['/h/.muster/runs/20261118-1000-readonly/audit/review.md'] = `Verdict: Needs fixes\nchanges-sha256: ${sha}\n`
+  t['/h/.muster/runs/20261118-1100-fixed/work/review.md'] = `Verdict: Needs fixes\nchanges-sha256: ${sha}\n`
+  t['/h/.muster/runs/20261118-1100-fixed/work-r2/review.md'] = `Verdict: Approved\nchanges-sha256: ${sha}\n`
+  on('ui.render', ($: any, e: any) => {
+    const { Text } = $.ui.resolve(e)
+    return <Text>engine</Text>
+  })
+  await mountWith($, on, t)
+  const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
+  expect((await band.find({ type: 'Text' }))?.text).toBe('engine')
   await band.unmount()
 })
 

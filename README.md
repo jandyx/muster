@@ -195,7 +195,7 @@ When a worker fails, `status` reads `failed: <reason>`: the last error line of i
 
 ## The pane
 
-The pane opens by itself when a prompt starts with `muster:` or `/muster`. `/muster-panel` opens it and gives it the keyboard. While tasks run or wait for review, a one-line band above the prompt counts them across runs, most urgent first, behind a progress bar: green is accepted work, amber waits for review or fixes, red failed, and the number counts accepted tasks only. A task's own percentage comes only from a `Progress: 12/40` or `Progress: 45%` line its worker prints.
+The pane opens by itself when a prompt starts with `muster:` or `/muster`. `/muster-panel` opens it and gives it the keyboard. While tasks run or wait for review, a one-line band above the prompt counts them across runs, most urgent first, behind a progress bar that fills only with accepted work. A rerun launched with `--retry-of <task-dir>` is the same piece of work as the attempt it names, even under another id or in another run, and its newest attempt decides, as with a CI retry; older tasks fall back to `x`, `x-r2`, `x-r3` inside one run. Canceled work leaves the total. A task's own percentage comes only from a `Progress: 12/40` or `Progress: 45%` line its worker prints.
 
 Above the runs, **Claude agents** lists the subagents this Claude Code session spawned — the Agent tool's, including plugin agents such as `oh-my-claudecode:executor-high`. Running and waiting ones show with their status and, while they work, their latest tool call (`$ …`); finished ones fold into a count. The engine supplies the list (`$.agent.list()`), so they carry no worker, tokens or cost.
 
@@ -208,7 +208,7 @@ Above the runs, **Claude agents** lists the subagents this Claude Code session s
 | `e` · `c` | expand all · collapse all |
 | `esc` | back to the prompt |
 
-Inside a run, tasks are grouped as Running, Queued, Failed, Needs fixes, Needs review, Canceled and Done. Done holds only reviewed work (and older tasks with no recorded diff); the `status` file still says `done` for the others, because the worker and its check succeeded.
+Inside a run, tasks are grouped as Running, Queued, Failed, Needs fixes, Needs review, Canceled and Done; earlier attempts of reworked tasks fold under Retried. A task that changed nothing counts as a finished read-only review once `review.md` covers it, whatever its verdict. Done holds only reviewed work (and older tasks with no recorded diff); the `status` file still says `done` for the others, because the worker and its check succeeded.
 
 Finished runs fold to one line with their totals; a run with work left to review or fix stays open. A toast tells you when a task ends. Each worker keeps one color everywhere, and each task names the model it ran on (with its reasoning effort for Codex).
 

@@ -14,6 +14,8 @@ export type Task = {
   queuedMs: number
   after: string[]
   priority: number
+  // `<run>/<task>` of the attempt this task reruns (meta's `retry_of`); else ''.
+  retryOf: string
   finishedMs: number
   summary: string
   reason: string
