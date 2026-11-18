@@ -483,6 +483,22 @@ class Queue(unittest.TestCase):
         self.assertEqual(M.run(self.cfg, "w", str(t2), str(self.d), after=["L"]), 5)
         self.assertEqual((t2 / "status").read_text().strip(), "canceled: L lost")
 
+    def test_retry_of_records_the_attempt_it_reruns(self):
+        self.task("A", "failed: exit 1")
+        old, t = self.task("O", "failed: exit 1"), self.task("B")
+        self.assertEqual(M.run(self.cfg, "w", str(t), str(self.d), after=["A"], retry_of=str(old)), 5)
+        self.assertIn(f"retry_of={old.parent.name}/O\n", (t / "meta").read_text())
+
+    def test_retry_of_refuses_itself_a_missing_task_and_another_runs_folder(self):
+        t = self.task("B")
+        other = pathlib.Path(self.d, "elsewhere/deep/run/X")
+        other.mkdir(parents=True)
+        (other / "prompt.md").write_text("# x\n")
+        for target in (t, t.parent / "nope", other):
+            with self.assertRaises(SystemExit):
+                M.run(self.cfg, "w", str(t), str(self.d), retry_of=str(target))
+        self.assertFalse((t / "meta").exists())
+
     def test_unknown_dependency_exits(self):
         with self.assertRaises(SystemExit):
             M.run(self.cfg, "w", str(self.task("B")), str(self.d), after=["nope"])

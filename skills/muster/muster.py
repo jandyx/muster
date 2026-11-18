@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Muster worker runner: run one task on one configured worker and record what happened.
 
-    muster.py run <worker[,worker…]> <task-dir> <cwd> [--after A,B] [--priority N] [--check CMD]
+    muster.py run <worker[,worker…]> <task-dir> <cwd> [--after A,B] [--priority N] [--check CMD] [--retry-of TASK-DIR]
                                               queue until deps are done and one of the workers has a free slot
                                               (first in the list wins a tie), then run prompt.md on it; then run
                                               CMD (sh -c, in cwd) and fail the task if it fails;
@@ -985,7 +985,17 @@ def watch(run_dir, stall_min=10):
         time.sleep(QUEUE_POLL_S)
 
 
-def run(cfg, names, task, cwd, after=(), priority=0, check=None):
+def retry_ref(task, target):
+    """`<run>/<task>` of the attempt this task reruns, for the pane to count both as one piece of work."""
+    old, new = os.path.realpath(target), os.path.realpath(task)
+    if old == new or not os.path.isfile(os.path.join(old, "prompt.md")):
+        sys.exit(f"muster: --retry-of {target}: not another task")
+    if os.path.dirname(os.path.dirname(old)) != os.path.dirname(os.path.dirname(new)):
+        sys.exit(f"muster: --retry-of {target}: not in the same runs folder as {task}")
+    return f"{os.path.basename(os.path.dirname(old))}/{os.path.basename(old)}"
+
+
+def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None):
     # `names`: one worker or several ("a,b"); the task waits for whichever frees a slot first.
     names = [n for n in (names.split(",") if isinstance(names, str) else names) if n]
     for name in names:
@@ -1002,6 +1012,7 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None):
     for dep in after:
         if not os.path.isdir(os.path.join(os.path.dirname(task), dep)):
             sys.exit(f"muster: --after {dep}: no task {dep} next to {task}")
+    retried = retry_ref(task, retry_of) if retry_of else ""
     fenced = [n for n in names if not allowed_here(cfg, n, cwd)]
     names = [n for n in names if n not in fenced]
     if not names:
@@ -1017,7 +1028,7 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None):
     # `worker` and `type` are written when the task starts; until then `workers` lists where it may go.
     with open(os.path.join(task, "meta"), "w") as f:
         f.write(f"workers={','.join(names)}\ncwd={cwd}\nsession={os.environ.get('CLAUDE_CODE_SESSION_ID', '')}\n"
-                f"pid={os.getpid()}\nqueued={now()}\nafter={','.join(after)}\npriority={priority}\n")
+                f"pid={os.getpid()}\nqueued={now()}\nafter={','.join(after)}\npriority={priority}\nretry_of={retried}\n")
     write_status(task, "queued")
     on_stop(task)
     shown, name = "queued", None
@@ -1133,11 +1144,11 @@ def main():
         sys.exit(1 if probs else 0)
     if cmd == "run" and len(args) >= 3:
         opts = dict(zip(args[3::2], args[4::2]))
-        if len(args) % 2 == 0 or set(opts) - {"--after", "--priority", "--check"}:
+        if len(args) % 2 == 0 or set(opts) - {"--after", "--priority", "--check", "--retry-of"}:
             sys.exit(__doc__)
         after = [a for a in opts.get("--after", "").split(",") if a]
         sys.exit(run(cfg, *args[:3], after=after, priority=int(opts.get("--priority", "0")),
-                     check=opts.get("--check") or None))
+                     check=opts.get("--check") or None, retry_of=opts.get("--retry-of") or None))
     if cmd == "cancel" and len(args) in (1, 2):
         sys.exit(cancel(args[0], args[1] if len(args) == 2 else ""))
     if cmd == "usage" and len(args) == 1:
