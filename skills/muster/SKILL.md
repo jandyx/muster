@@ -41,6 +41,7 @@ Metered workers on a peak-priced model (`prices.json`; DeepSeek costs double wee
    - Do not commit, push, rebase, or open a pull request unless this task says so.
    - Never write CI skip markers ([skip ci], [ci skip], [no ci], [skip actions], [actions skip], skip-checks: true) in a commit message unless this task says the commit is meant to skip CI.
    - No new dependencies unless this task says so.
+   - When a planned step finishes, print a line of its own: `Progress: <steps done>/<steps planned>`.
    - Change only what this task needs, plus files the change strictly requires (callers, tests, types); list each extra file with its reason. Never edit what "Not this task" lists. Report BLOCKED instead of guessing when the task needs a design choice it does not settle, or more than a few files beyond the expected ones.
    - Follow the codebase's patterns and reuse its helpers. No refactors, renames or cleanups outside the task; no options, abstractions or fallbacks "for later".
    - Tests check real behavior, not mocks, and fail if the change is reverted. Never weaken, skip or delete a test to make it pass. A flaky test is not fixed by rerunning, sleeps or retries: find the cause, or leave it failing and say why.

@@ -115,8 +115,8 @@ test('the band above the prompt colors each running run', async ($, on) => {
   const ui = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
 
   expect(await ui.find({ type: 'Text', text: /codex-a/ })).toBeUndefined()
-  expect((await ui.find({ type: 'Text', text: /^✓1/ }))?.text).toMatch(/✓1/)
-  expect((await ui.find({ type: 'Text', text: /^… B/ }))?.text).toMatch(/^… B deepseek/)
+  expect((await ui.find({ type: 'Text', text: /^✓ done/ }))?.text).toMatch(/^✓ done ×1/)
+  expect((await ui.find({ type: 'Text', text: /running/ }))?.text).toMatch(/◐ running ×2/)
   await ui.unmount()
 })
 
@@ -251,12 +251,12 @@ test('a prompt with no title line shows its first prose line, not the bare task 
   await ui.unmount()
 })
 
-test('a running task shows the progress it printed, and a path is not progress', async ($, on) => {
+test('a running task shows only the progress it declared, not numbers from command output', async ($, on) => {
   const t = tree('/h/.muster/runs', {
     '20261105-1000-x': { A: { ...task('running', 'pid=0\n'), title: 'building' }, B: { ...task('running', 'pid=0\n'), title: 'reading' } },
   })
-  t['/h/.muster/runs/20261105-1000-x/A/log.txt'] = 'codex\nbuilding\nStep 12/40: compiling serde\n'
-  t['/h/.muster/runs/20261105-1000-x/B/log.txt'] = 'reading /Users/x/sessions/2026/11/05/log.txt\nversion 1.2/3 ok\n'
+  t['/h/.muster/runs/20261105-1000-x/A/log.txt'] = 'codex\nbuilding\nProgress: 12/40\nStep 39/40: compiling serde\n/dev/disk3s1 460Gi 350Gi 70Gi 84% 6.3M 735M 1% /System/Volumes/Data\n'
+  t['/h/.muster/runs/20261105-1000-x/B/log.txt'] = 'reading /Users/x/sessions/2026/11/05/log.txt\nversion 1.2/3 ok\nStep 3/7 done, 45% cached\n'
   await mountWith($, on, t)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /▰ 12\/40 \(30%\)/ }))?.text).toMatch(/▰ 12\/40 \(30%\)$/)
@@ -347,8 +347,8 @@ test('queued tasks show their dependencies and priority, in the order they will 
   expect((await ui.find({ type: 'Button', text: /20261105-1000-q/ }))?.text).toMatch(/1 running · 0 done · 0 failed · 5 queued · 1 canceled/)
   await ui.unmount()
   const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
-  expect((await band.find({ type: 'Text', text: /^○/ }))?.text).toMatch(/○5/)
-  expect((await band.find({ type: 'Text', text: /^⊘/ }))?.text).toMatch(/⊘1/)
+  expect((await band.find({ type: 'Text', text: /^○ queued/ }))?.text).toMatch(/^○ queued ×5/)
+  expect((await band.find({ type: 'Text', text: /^⊘ canceled/ }))?.text).toMatch(/^⊘ canceled ×1/)
   await band.unmount()
 })
 
@@ -429,7 +429,7 @@ test('the band counts the Claude agents still running', async ($, on) => {
     ],
   })
   const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
-  expect((await band.find({ type: 'Text', text: /1 agent/ }))?.text).toMatch(/1 agent/)
+  expect((await band.find({ type: 'Text', text: /agents/ }))?.text).toMatch(/◐ agents ×1/)
   await band.unmount()
 })
 
@@ -509,12 +509,49 @@ test('a done task with a recorded diff shows needs review until review.md approv
   await ui.unmount()
 })
 
+test('the band sums every run on one line and folds several running tasks into a count', async ($, on) => {
+  await mountWith($, on, tree('/h/.muster/runs', {
+    '20261117-1200-a': { one: { ...task('running'), title: 'First long task' }, two: task('running'), bad: task('failed') },
+    '20261117-1300-b': { three: task('running'), worse: task('failed') },
+  }))
+  const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
+  expect((await band.find({ type: 'Text', text: /running/ }))?.text).toMatch(/◐ running ×3/)
+  expect(await band.find({ type: 'Text', text: /First long task/ })).toBeUndefined()
+  expect((await band.find({ type: 'Text', text: /^✗ failed/ }))?.text).toMatch(/^✗ failed ×2/)
+  expect((await band.find({ type: 'Text', text: /0\/5/ }))?.text).toMatch(/█{4}░{4} 0\/5 · 2 runs/)
+  await band.unmount()
+})
+
+test('the band bar fills green only for accepted work and leaves canceled tasks out', async ($, on) => {
+  const sha = 'a'.repeat(64)
+  const t = tree('/h/.muster/runs', {
+    '20261117-1400-bar': {
+      ok: task('done'),
+      wait: task('done', `changes=1 files +1 -0\nchanges_sha256=${sha}\n`),
+      bad: task('failed'),
+      live: task('running'),
+      gone: task('canceled'),
+    },
+  })
+  await mountWith($, on, t)
+  const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
+  expect((await band.find({ type: 'Text', text: /1\/4/ }))?.text).toMatch(/█{6}░{2} 1\/4/)
+  await band.unmount()
+})
+
+test('the band bar draws no amber or red cell when no task is waiting or failed', async ($, on) => {
+  await mountWith($, on, tree('/h/.muster/runs', { '20261117-1500-bar': { ok: task('done'), a: task('running'), b: task('running') } }))
+  const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
+  expect((await band.findAll({ type: 'Text', text: /^█+$/ })).map((r: any) => r.text)).toEqual(['██'])
+  await band.unmount()
+})
+
 test('the band keeps a finished run that still has unreviewed tasks', async ($, on) => {
   await mountWith($, on, tree('/h/.muster/runs', {
     '20261117-1100-band': { done: task('done', `changes=1 files +1 -0\nchanges_sha256=${'a'.repeat(64)}\n`) },
   }))
   const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
-  expect((await band.find({ type: 'Text', text: /unreviewed/ }))?.text).toMatch(/1 unreviewed/)
+  expect((await band.find({ type: 'Text', text: /review/ }))?.text).toMatch(/\? review ×1/)
   await band.unmount()
 })
 
@@ -552,9 +589,9 @@ test('a task needing review or fixes gets its own section and count, and is not 
   expect((await ui.find({ type: 'Text', text: /Unread work/ }))?.text).toMatch(/Unread work/)
   await ui.unmount()
   const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
-  expect((await band.find({ type: 'Text', text: /^✓/ }))?.text).toMatch(/^✓2/)
-  expect((await band.find({ type: 'Text', text: /needs fixes/ }))?.text).toMatch(/1 needs fixes/)
-  expect((await band.find({ type: 'Text', text: /unreviewed/ }))?.text).toMatch(/2 unreviewed/)
+  expect((await band.find({ type: 'Text', text: /^✓ done/ }))?.text).toMatch(/^✓ done ×2/)
+  expect((await band.find({ type: 'Text', text: /! fix/ }))?.text).toMatch(/! fix ×1/)
+  expect((await band.find({ type: 'Text', text: /review/ }))?.text).toMatch(/\? review ×2/)
   await band.unmount()
 })
 

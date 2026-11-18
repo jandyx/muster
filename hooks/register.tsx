@@ -17,6 +17,9 @@ const agentsAtom = atom({ plugin: 'muster', key: 'agents' } as const, [] as Agen
 const foldsAtom = atom({ plugin: 'muster', key: 'folds' } as const, {}, { shape: 'folds-1' })
 const notifiedAtom = atom({ plugin: 'muster', key: 'notified' } as const, [], { shape: 'notified-1' })
 
+// Cells in the band's overall progress bar.
+const BAND_BAR = 8
+
 const isRunning = (t: Task) => t.status === 'running'
 const isFailed = (t: Task) => t.status.startsWith('failed')
 const isCanceled = (t: Task) => t.status.startsWith('canceled')
@@ -153,24 +156,16 @@ const callText = (e: Record<string, unknown>) => {
   return text.replace(/\s+/g, ' ').trim().slice(0, 200)
 }
 
-// Progress the worker printed, newest plausible reading in the last 400 lines: "45%", "12/40", "[3/7]".
-// shortcut: dates, clock stamps and version numbers are only partly filtered out (a bare `3/15` after a clock
-// accepts); tighten the guards if a worker's output starts reading as progress.
+// Progress the worker declared on its own line: "Progress: 45%" or "Progress: 12/40". Any other number in a log
+// belongs to a command's output (`df` printed 1% for a task half done), so it is not read as the task's progress.
 const readPct = (text: string): { pct: number; text: string } | null => {
   const lines = text.split('\n').slice(-400)
   for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i]!
-    const at = [...line.matchAll(/(?<![\d.])(\d{1,3})%(?!\d)/g)].pop()
-    if (at) {
-      const n = Number(at[1])
-      if (n <= 100) return { pct: n, text: `${n}%` }
-    }
-    // A fraction glued to a digit, dot, slash or letter is part of a path, a date or a version, not progress.
-    const frac = [...line.matchAll(/(?<![\d.\w/])(\d{1,6})\s*\/\s*(\d{1,6})(?![\d.\w/])/g)].pop()
-    if (frac) {
-      const [a, b] = [Number(frac[1]), Number(frac[2])]
-      if (a > 0 && a <= b) return { pct: Math.round((a / b) * 100), text: `${a}/${b} (${Math.round((a / b) * 100)}%)` }
-    }
+    const at = /(?:^|"text":\s*")\s*progress:\s*(?:(\d{1,3})%|(\d{1,6})\s*\/\s*(\d{1,6}))\s*(?:$|\\n|")/i.exec(lines[i]!)
+    if (!at) continue
+    if (at[1] !== undefined && Number(at[1]) <= 100) return { pct: Number(at[1]), text: `${Number(at[1])}%` }
+    const [done, total] = [Number(at[2]), Number(at[3])]
+    if (done > 0 && done <= total) return { pct: Math.round((done / total) * 100), text: `${done}/${total} (${Math.round((done / total) * 100)}%)` }
   }
   return null
 }
@@ -761,38 +756,71 @@ export const register: Register = on => {
     if (e.props.hasSurvey || (active.length === 0 && activeAgents.length === 0)) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
+    // One line across all runs, most urgent first; the pane has the per-run detail.
+    const tasks = active.flatMap(r => r.tasks)
+    const running = tasks.filter(isRunning)
+    // Canceled work is no longer planned. Only accepted work fills green, so a full green bar means all of it passed;
+    // the ceilings keep a small count of waiting or failed tasks visible.
+    const planned = tasks.length - tasks.filter(isCanceled).length
+    const accepted = tasks.filter(isDone).length
+    const waiting = tasks.filter(needsAttention).length
+    const failedCount = tasks.filter(isFailed).length
+    const cell = (n: number, round: (x: number) => number) => (planned > 0 ? round((n / planned) * BAND_BAR) : 0)
+    const green = cell(accepted, Math.floor)
+    const amber = waiting > 0 ? cell(accepted + waiting, Math.ceil) : green
+    const red = failedCount > 0 ? cell(accepted + waiting + failedCount, Math.ceil) : amber
+    const counts = ([
+      [isQueued, '○', 'queued', 'cyan'],
+      [isFailed, '✗', 'failed', 'red'],
+      [needsFixes, '!', 'fix', 'error'],
+      [needsReview, '?', 'review', 'warning'],
+      [isDone, '✓', 'done', 'green'],
+      [isCanceled, '⊘', 'canceled', undefined],
+    ] as const).map(([test, sign, label, color]) => ({ n: tasks.filter(test).length, sign, label, color })).filter(c => c.n > 0)
+    const only = running.length === 1 ? running[0]! : undefined
+    const parts = [
+      planned > 0 && (
+        <Text>
+          <Text color="green">{'█'.repeat(green)}</Text>
+          <Text color="warning">{'█'.repeat(amber - green)}</Text>
+          <Text color="red">{'█'.repeat(red - amber)}</Text>
+          <Text dimColor>{'░'.repeat(BAND_BAR - red)}</Text>
+          <Text> {accepted}/{planned}</Text>
+          {active.length > 1 && <Text dimColor> · {active.length} runs</Text>}
+        </Text>
+      ),
+      only && (
+        <Text>
+          <Text color="yellow">◐ {only.title.length > 20 ? `${only.title.slice(0, 19)}…` : only.title}</Text>
+          <Text> </Text>
+          <Text bold color={workerColor(only.worker)}>{only.worker}</Text>
+          <Text dimColor> {fmtElapsed(now - only.startedMs)}</Text>
+        </Text>
+      ),
+      running.length > 1 && (
+        <Text>
+          <Text color="yellow">◐ running</Text>
+          <Text dimColor> ×{running.length} {fmtElapsed(now - Math.min(...running.map(t => t.startedMs)))}</Text>
+        </Text>
+      ),
+      ...counts.map(c => (
+        <Text>
+          <Text color={c.color} dimColor={!c.color}>{c.sign} {c.label}</Text>
+          <Text dimColor> ×{c.n}</Text>
+        </Text>
+      )),
+      activeAgents.length > 0 && <Text color="cyan">◐ agents<Text dimColor> ×{activeAgents.length}</Text></Text>,
+    ].filter(Boolean)
     return (
       <Box flexDirection="row" flexWrap="wrap">
         <Text color="cyan" bold>⇉ muster </Text>
-        {active.map((r, i) => {
-          // Only running tasks get a row; finished ones collapse to counts.
-          const done = r.tasks.filter(isDone).length
-          const unreviewed = r.tasks.filter(needsReview).length
-          const fixes = r.tasks.filter(needsFixes).length
-          const failed = r.tasks.filter(isFailed).length
-          const queued = r.tasks.filter(isQueued).length
-          const canceled = r.tasks.filter(isCanceled).length
-          return (
-            <Text>
-              {i > 0 && <Text dimColor>| </Text>}
-              {r.tasks.filter(isRunning).map(t => (
-                <Text>
-                  <Text color="yellow">… {t.title.length > 30 ? `${t.title.slice(0, 29)}…` : t.title}</Text>
-                  <Text> </Text>
-                  <Text bold color={workerColor(t.worker)}>{t.worker}</Text>
-                  <Text dimColor> {fmtElapsed(now - t.startedMs)}  </Text>
-                </Text>
-              ))}
-              {queued > 0 && <Text color="cyan">○{queued} </Text>}
-              {done > 0 && <Text color="green">✓{done} </Text>}
-              {fixes > 0 && <Text color="error">{fixes} needs fixes </Text>}
-              {unreviewed > 0 && <Text color="warning">{unreviewed} unreviewed </Text>}
-              {failed > 0 && <Text color="red">✗{failed} </Text>}
-              {canceled > 0 && <Text dimColor>⊘{canceled} </Text>}
-            </Text>
-          )
-        })}
-        {activeAgents.length > 0 && <Text color="cyan">{activeAgents.length} agent{activeAgents.length === 1 ? '' : 's'} </Text>}
+        {parts.map((part, i) => (
+          <Text>
+            {i > 0 && <Text dimColor> | </Text>}
+            {part}
+          </Text>
+        ))}
+        <Text dimColor> </Text>
         <Text dimColor>· /muster-panel</Text>
       </Box>
     )
