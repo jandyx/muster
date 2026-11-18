@@ -54,9 +54,9 @@ test('the pane shows each task of the newest run', async ($, on) => {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.find({ type: 'Button', text: /20261105-1130-x/ }))?.text).toMatch(/▾ 20261105-1130-x/)
     expect((await ui.find({ type: 'Text', text: /add retry/ }))?.text).toMatch(/✓ add retry backoff/)
-    expect((await ui.find({ type: 'Text', text: /A · codex-a/ }))?.text).toMatch(/A · codex-a · gpt-6-astra · done · 1m40s · ⎇ feat\/retry/)
+    expect((await ui.find({ type: 'Text', text: /A · codex-a/ }))?.text).toMatch(/A · codex-a · gpt-6-astra · 1m40s · ⎇ feat\/retry/)
     expect((await ui.find({ type: 'Text', text: /retry logic/ }))?.text).toMatch(/↳ retry logic added, see report\.md$/)
-    expect((await ui.find({ type: 'Text', text: /B · deepseek/ }))?.text).toMatch(/B · deepseek · deepseek-flash · running/)
+    expect((await ui.find({ type: 'Text', text: /B · deepseek/ }))?.text).toMatch(/B · deepseek · deepseek-flash · \d/)
     expect((await ui.find({ type: 'Button', text: /20261101-0900-old/ }))?.text).toMatch(/[▸▾] 20261101-0900-old 0 running · 1 done/)
     expect(await ui.find({ type: 'Button', text: /foreign/ })).toBeUndefined()
     expect((await ui.find({ type: 'Text', text: /in 1\.51M/ }))?.text).toMatch(/in 1\.51M \(95% cached\) · out 14k · ≈\$2\.91/)
@@ -75,7 +75,7 @@ test('the pane shows each task of the newest run', async ($, on) => {
     const heads = (await ui.findAll({ type: 'Button' })).map((r: any) => r.text as string).filter(r => /^\s*▾ \w+ · \d+$/.test(r))
     expect(heads.slice(0, 4).map(h => h.trim())).toEqual(['▾ Running · 2', '▾ Queued · 1', '▾ Failed · 1', '▾ Done · 1'])
     // A task with no meta yet has no start time, so no elapsed time is shown.
-    expect((await ui.find({ type: 'Text', text: /P · / }))?.text).toMatch(/P · \? · pending$/)
+    expect((await ui.find({ type: 'Text', text: /P · / }))?.text).toMatch(/P · \? · pending · P0$/)
     expect((await ui.find({ type: 'Text', text: /○/ }))?.text).toMatch(/○ /)
     // A section folds on its own; the rest of the run stays.
     await ui.press({ key: 'section:20261105-1130-x/Done' })
@@ -264,6 +264,19 @@ test('a running task shows only the progress it declared, not numbers from comma
   await ui.unmount()
 })
 
+test('a claude worker\'s progress comes from its own text, on any line, and never from a tool result', async ($, on) => {
+  const meta = 'worker=w1\ntype=claude\nsession=S1\nstarted=2026-11-05 11:00:00\npid=0\n'
+  const t = tree('/h/.muster/runs', { '20261105-1000-x': { A: { status: 'running\n', meta, title: 'claude worker' } } })
+  t['/h/.muster/runs/20261105-1000-x/A/stream.jsonl'] = [
+    { type: 'assistant', message: { content: [{ type: 'text', text: 'Finished the parser.\nProgress: 3/5' }] } },
+    { type: 'user', message: { content: [{ type: 'tool_result', content: 'Progress: 99%' }] } },
+  ].map(e => JSON.stringify(e)).join('\n') + '\n'
+  await mountWith($, on, t)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /▰/ }))?.text).toMatch(/▰ 3\/5 \(60%\)$/)
+  await ui.unmount()
+})
+
 test('a refused task shows as failed with its reason', async ($, on) => {
   await mountWith(
     $,
@@ -325,7 +338,7 @@ test('queued tasks show their dependencies and priority, in the order they will 
     on,
     tree('/h/.muster/runs', {
       '20261105-1000-q': {
-        A: { ...task('running', 'pid=0\n'), title: 'base work' },
+        A: { ...task('running', 'pid=0\npriority=7\n'), title: 'base work' },
         B: { ...q('queued, waiting for A', 'queued=2026-11-05 10:00:01\nafter=A\npriority=9\n'), title: 'needs base' },
         C: { ...q('queued, w1 runs 3 of 3', 'queued=2026-11-05 10:00:05\n'), title: 'late plain' },
         D: { ...q('queued, w1 runs 3 of 3', 'queued=2026-11-05 10:00:09\npriority=5\n'), title: 'urgent' },
@@ -338,9 +351,10 @@ test('queued tasks show their dependencies and priority, in the order they will 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   const titles = (await ui.findAll({ type: 'Text' })).map((r: any) => r.text as string).filter(t => /^\s*○ /.test(t)).map(t => t.trim())
   expect(titles).toEqual(['○ urgent', '○ early plain', '○ late plain', '○ either worker', '○ needs base'])
-  expect((await ui.find({ type: 'Text', text: /H · / }))?.text).toMatch(/H · w1\|w2 · queued #1, w1 runs 3 of 3, w2 runs 1 of 1$/)
-  expect((await ui.find({ type: 'Text', text: /B · / }))?.text).toMatch(/B · w1 · queued, waiting for A · after A · priority 9$/)
-  expect((await ui.find({ type: 'Text', text: /D · / }))?.text).toMatch(/D · w1 · queued #1, w1 runs 3 of 3 · priority 5$/)
+  expect((await ui.find({ type: 'Text', text: /H · / }))?.text).toMatch(/H · w1\|w2 · queued #1, w1 runs 3 of 3, w2 runs 1 of 1 · P0$/)
+  expect((await ui.find({ type: 'Text', text: /B · / }))?.text).toMatch(/B · w1 · queued, waiting for A · after A · P9$/)
+  expect((await ui.find({ type: 'Text', text: /D · / }))?.text).toMatch(/D · w1 · queued #1, w1 runs 3 of 3 · P5$/)
+  expect((await ui.find({ type: 'Text', text: /^\s+A · w1/ }))?.text).not.toMatch(/P7|running/)
   expect((await ui.find({ type: 'Text', text: /C · / }))?.text).toMatch(/C · w1 · queued #3, /)
   expect((await ui.find({ type: 'Text', text: /old approach/ }))?.text).toMatch(/⊘ old approach/)
   expect((await ui.find({ type: 'Button', text: /Canceled/ }))?.text).toMatch(/Canceled · 1/)
@@ -551,7 +565,7 @@ test('the band keeps a finished run that still has unreviewed tasks', async ($, 
     '20261117-1100-band': { done: task('done', `changes=1 files +1 -0\nchanges_sha256=${'a'.repeat(64)}\n`) },
   }))
   const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
-  expect((await band.find({ type: 'Text', text: /review/ }))?.text).toMatch(/\? review ×1/)
+  expect((await band.find({ type: 'Text', text: /review/ }))?.text).toMatch(/◇ review ×1/)
   await band.unmount()
 })
 
@@ -578,8 +592,8 @@ test('a task needing review or fixes gets its own section and count, and is not 
   const heads = (await ui.findAll({ type: 'Button' })).map((r: any) => (r.text as string).trim()).filter(r => /· \d+$/.test(r))
   expect(heads).toEqual(['▾ Needs fixes · 1', '▾ Needs review · 2', '▾ Done · 2'])
   expect((await ui.find({ type: 'Text', text: /Rejected work/ }))?.text).toMatch(/! Rejected work · needs fixes$/)
-  expect((await ui.find({ type: 'Text', text: /Rejected older diff/ }))?.text).toMatch(/\? Rejected older diff · needs review$/)
-  expect((await ui.find({ type: 'Text', text: /Unread work/ }))?.text).toMatch(/\? Unread work · needs review$/)
+  expect((await ui.find({ type: 'Text', text: /Rejected older diff/ }))?.text).toMatch(/◇ Rejected older diff · needs review$/)
+  expect((await ui.find({ type: 'Text', text: /Unread work/ }))?.text).toMatch(/◇ Unread work · needs review$/)
   expect((await ui.find({ type: 'Text', text: /Approved work/ }))?.text).toMatch(/✓ Approved work$/)
   expect((await ui.find({ type: 'Text', text: /Legacy work/ }))?.text).toMatch(/✓ Legacy work$/)
   expect((await ui.find({ type: 'Text', text: /^\s+bad · / }))?.text).toMatch(/bad · w1 · needs fixes/)
@@ -591,7 +605,7 @@ test('a task needing review or fixes gets its own section and count, and is not 
   const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
   expect((await band.find({ type: 'Text', text: /2\/5/ }))?.text).toMatch(/2\/5/)
   expect((await band.find({ type: 'Text', text: /! fix/ }))?.text).toMatch(/! fix ×1/)
-  expect((await band.find({ type: 'Text', text: /review/ }))?.text).toMatch(/\? review ×2/)
+  expect((await band.find({ type: 'Text', text: /review/ }))?.text).toMatch(/◇ review ×2/)
   await band.unmount()
 })
 
@@ -640,9 +654,9 @@ test('each task shows the model it ran on, from meta when done and from the log 
   t['/h/.muster/runs/20261117-1200-model/fin/result.md'] = 'Status: DONE_WITH_CONCERNS\n'
   await mountWith($, on, t)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /^\s+fin · / }))?.text).toMatch(/fin · w1 · gpt-6-astra high · done/)
-  expect((await ui.find({ type: 'Text', text: /^\s+live · / }))?.text).toMatch(/live · w1 · gpt-6-mini low · running/)
-  expect((await ui.find({ type: 'Text', text: /^\s+noisy · / }))?.text).toMatch(/noisy · w1 · gpt-6-nova medium · running/)
+  expect((await ui.find({ type: 'Text', text: /^\s+fin · / }))?.text).toMatch(/fin · w1 · gpt-6-astra high · \d/)
+  expect((await ui.find({ type: 'Text', text: /^\s+live · / }))?.text).toMatch(/live · w1 · gpt-6-mini low · \d/)
+  expect((await ui.find({ type: 'Text', text: /^\s+noisy · / }))?.text).toMatch(/noisy · w1 · gpt-6-nova medium · \d/)
   expect((await ui.find({ type: 'Text', text: /DONE_WITH_CONCERNS/ }))?.text).toBeTruthy()
   await ui.unmount()
 })

@@ -32,6 +32,8 @@ const needsAttention = (t: Task) => needsReview(t) || needsFixes(t)
 // Reviewed, or from before muster recorded diffs (no review state).
 const isDone = (t: Task) => t.status === 'done' && !needsAttention(t)
 const shownStatus = (t: Task) => (needsAttention(t) ? t.review : t.status)
+// A task row leaves out what its section heading already says.
+const rowStatus = (t: Task) => (isRunning(t) || isDone(t) ? '' : shownStatus(t))
 // Queued by the runner (waiting for a slot or a dependency), or `pending`: the folder exists, no runner yet.
 const isQueued = (t: Task) => !isRunning(t) && !isFinished(t)
 const isActive = (t: Task) => isRunning(t) || isQueued(t)
@@ -52,7 +54,7 @@ const SECTIONS: [string, string | undefined, (t: Task) => boolean][] = [
   ['Canceled', undefined, isCanceled],
   ['Done', 'green', () => true],
 ]
-const mark = (t: Task) => (needsFixes(t) ? '!' : needsReview(t) ? '?' : t.status === 'done' ? '✓' : isRunning(t) ? '…' : isFailed(t) ? '✗' : isCanceled(t) ? '⊘' : '○')
+const mark = (t: Task) => (needsFixes(t) ? '!' : needsReview(t) ? '◇' : t.status === 'done' ? '✓' : isRunning(t) ? '…' : isFailed(t) ? '✗' : isCanceled(t) ? '⊘' : '○')
 const markColor = (t: Task) => (needsFixes(t) ? 'error' : needsReview(t) ? 'warning' : t.status === 'done' ? 'green' : isRunning(t) ? 'yellow' : isFailed(t) ? 'red' : isQueued(t) ? 'cyan' : undefined)
 
 // A subagent's lifecycle: the engine reports `running`, `completed`, `failed`, `killed`, and its own
@@ -156,12 +158,24 @@ const callText = (e: Record<string, unknown>) => {
   return text.replace(/\s+/g, ' ').trim().slice(0, 200)
 }
 
+// What a claude-type worker itself wrote, one text block after another. Tool results stay out: a file or command
+// output that says "Progress: 99%" is not the worker's progress.
+const streamText = (text: string) =>
+  text.split('\n').slice(-400).flatMap(line => {
+    try {
+      const event = JSON.parse(line) as { type?: string; message?: { content?: { type?: string; text?: string }[] } }
+      return event.type === 'assistant' ? (event.message?.content ?? []).filter(c => c.type === 'text' && c.text).map(c => c.text!) : []
+    } catch {
+      return []
+    }
+  }).join('\n')
+
 // Progress the worker declared on its own line: "Progress: 45%" or "Progress: 12/40". Any other number in a log
 // belongs to a command's output (`df` printed 1% for a task half done), so it is not read as the task's progress.
 const readPct = (text: string): { pct: number; text: string } | null => {
   const lines = text.split('\n').slice(-400)
   for (let i = lines.length - 1; i >= 0; i--) {
-    const at = /(?:^|"text":\s*")\s*progress:\s*(?:(\d{1,3})%|(\d{1,6})\s*\/\s*(\d{1,6}))\s*(?:$|\\n|")/i.exec(lines[i]!)
+    const at = /^\s*progress:\s*(?:(\d{1,3})%|(\d{1,6})\s*\/\s*(\d{1,6}))\s*$/i.exec(lines[i]!)
     if (!at) continue
     if (at[1] !== undefined && Number(at[1]) <= 100) return { pct: Number(at[1]), text: `${Number(at[1])}%` }
     const [done, total] = [Number(at[2]), Number(at[3])]
@@ -377,7 +391,7 @@ export const register: Register = on => {
             : isStream
               ? parseStream(liveText)
               : parseProgress(liveText)
-          const measure = isLive ? readPct(liveText) : null
+          const measure = isLive ? readPct(isStream ? streamText(liveText) : liveText) : null
           const etaMs = measure === null ? 0 : etaOf(`${name}/${id}`, measure.pct, Date.now())
           const logMs = isLive ? ((await $.fs.stat(liveFile).catch(() => undefined))?.mtimeMs ?? 0) : 0
           // muster.py records why in meta (`last_error`); older runs: result.md says why, or the log's error line.
@@ -677,8 +691,13 @@ export const register: Register = on => {
                     {needsReview(t) && <Text color="warning"> · needs review</Text>}
                     {needsFixes(t) && <Text color="error"> · needs fixes</Text>}
                   </Text>
-                  <Text dimColor>
-                    {'    '}{t.id} · {Worker(t.worker)}{t.model ? ` · ${t.model}` : ''} · {place.has(t) ? t.status.replace(/^queued/, `queued #${place.get(t)}`) : shownStatus(t)}{t.after.length > 0 ? ` · after ${t.after.join(', ')}` : ''}{t.priority !== 0 ? ` · priority ${t.priority}` : ''}{t.startedMs > 0 ? ` · ${fmtElapsed((t.finishedMs || now) - t.startedMs)}` : ''}{t.branch ? ` · ⎇ ${t.branch}` : ''}
+                  <Text>
+                    <Text dimColor>
+                      {'    '}{t.id} · {Worker(t.worker)}{t.model ? ` · ${t.model}` : ''}{place.has(t) ? ` · ${t.status.replace(/^queued/, `queued #${place.get(t)}`)}` : rowStatus(t) ? ` · ${rowStatus(t)}` : ''}{t.after.length > 0 ? ` · after ${t.after.join(', ')}` : ''}
+                    </Text>
+                    {isQueued(t) && <Text dimColor> · </Text>}
+                    {isQueued(t) && (t.priority !== 0 ? <Text color="warning" bold>P{t.priority}</Text> : <Text dimColor>P0</Text>)}
+                    <Text dimColor>{t.startedMs > 0 ? ` · ${fmtElapsed((t.finishedMs || now) - t.startedMs)}` : ''}{t.branch ? ` · ⎇ ${t.branch}` : ''}</Text>
                   </Text>
                   {isFailed(t) &&
                     t.reason !== '' &&
@@ -774,7 +793,7 @@ export const register: Register = on => {
       [isQueued, '○', 'queued', 'cyan'],
       [isFailed, '✗', 'failed', 'red'],
       [needsFixes, '!', 'fix', 'error'],
-      [needsReview, '?', 'review', 'warning'],
+      [needsReview, '◇', 'review', 'warning'],
     ] as const).map(([test, sign, label, color]) => ({ n: tasks.filter(test).length, sign, label, color })).filter(c => c.n > 0)
     const only = running.length === 1 ? running[0]! : undefined
     const parts = [
