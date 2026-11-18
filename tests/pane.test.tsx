@@ -149,7 +149,7 @@ const mountWith = async (
   $: any,
   on: any,
   tree: Record<string, string>,
-  opts: { config?: string; session?: string; clock?: boolean; agents?: any[] } = {},
+  opts: { config?: string; session?: string; clock?: boolean; agents?: any[]; toasts?: string[] } = {},
 ) => {
   const dirs = new Map<string, Set<string>>()
   for (const path of Object.keys(tree)) {
@@ -179,7 +179,10 @@ const mountWith = async (
     on('clock.now', () => ({ value: new Date('2026-11-05T11:32:00').getTime() }))
   }
   on('ui.status', () => ({ value: undefined }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_: any, e: any) => {
+    opts.toasts?.push(JSON.stringify(e))
+    return { value: undefined }
+  })
   on('session.id', () => ({ value: opts.session ?? 'S1' }))
   on('agent.list', () => ({ value: opts.agents ?? [] }))
   on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '' } }))
@@ -499,7 +502,7 @@ test('a done task with a recorded diff shows needs review until review.md approv
   expect(await line(/Stale review/)).toMatch(/needs review/)
   expect(await line(/Good review/)).not.toMatch(/needs review/)
   expect(await line(/Template copied/)).toMatch(/needs review/)
-  expect(await line(/Quoted approval/)).toMatch(/needs review/)
+  expect(await line(/Quoted approval/)).toMatch(/needs fixes/)
   expect(await line(/Bold label/)).not.toMatch(/needs review/)
   expect(await line(/Legacy task/)).not.toMatch(/needs review/)
   expect(await line(/Still going/)).not.toMatch(/needs review/)
@@ -515,19 +518,94 @@ test('the band keeps a finished run that still has unreviewed tasks', async ($, 
   await band.unmount()
 })
 
+test('a task needing review or fixes gets its own section and count, and is not done', async ($, on) => {
+  const sha = 'a'.repeat(64)
+  const meta = `changes=2 files +5 -1\nchanges_sha256=${sha}\n`
+  const run = '20261118-1000-sections'
+  const t = tree('/h/.muster/runs', {
+    [run]: {
+      ok: { ...task('done', meta), title: 'Approved work' },
+      legacy: { ...task('done'), title: 'Legacy work' },
+      open: { ...task('done', meta), title: 'Unread work' },
+      bad: { ...task('done', meta), title: 'Rejected work' },
+      old: { ...task('done', meta), title: 'Rejected older diff' },
+    },
+  })
+  t[`/h/.muster/runs/${run}/ok/review.md`] = `Verdict: Approved\nchanges-sha256: ${sha}\n`
+  t[`/h/.muster/runs/${run}/bad/review.md`] = `Verdict: Needs fixes\nchanges-sha256: ${sha}\n`
+  t[`/h/.muster/runs/${run}/old/review.md`] = `Verdict: Needs fixes\nchanges-sha256: ${'c'.repeat(64)}\n`
+  await mountWith($, on, t)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // Nothing runs, yet the run stays open and does not read as all done.
+  expect((await ui.find({ type: 'Button', text: new RegExp(run) }))?.text).toMatch(/^▾ .* 0 running · 2 done · 0 failed · 1 needs fixes · 2 needs review$/)
+  const heads = (await ui.findAll({ type: 'Button' })).map((r: any) => (r.text as string).trim()).filter(r => /· \d+$/.test(r))
+  expect(heads).toEqual(['▾ Needs fixes · 1', '▾ Needs review · 2', '▾ Done · 2'])
+  expect((await ui.find({ type: 'Text', text: /Rejected work/ }))?.text).toMatch(/! Rejected work · needs fixes$/)
+  expect((await ui.find({ type: 'Text', text: /Rejected older diff/ }))?.text).toMatch(/\? Rejected older diff · needs review$/)
+  expect((await ui.find({ type: 'Text', text: /Unread work/ }))?.text).toMatch(/\? Unread work · needs review$/)
+  expect((await ui.find({ type: 'Text', text: /Approved work/ }))?.text).toMatch(/✓ Approved work$/)
+  expect((await ui.find({ type: 'Text', text: /Legacy work/ }))?.text).toMatch(/✓ Legacy work$/)
+  expect((await ui.find({ type: 'Text', text: /^\s+bad · / }))?.text).toMatch(/bad · w1 · needs fixes/)
+  expect((await ui.find({ type: 'Text', text: /^\s+open · / }))?.text).toMatch(/open · w1 · needs review/)
+  await ui.press({ key: `section:${run}/Needs fixes` })
+  expect(await ui.find({ type: 'Text', text: /Rejected work/ })).toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: /Unread work/ }))?.text).toMatch(/Unread work/)
+  await ui.unmount()
+  const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
+  expect((await band.find({ type: 'Text', text: /^✓/ }))?.text).toMatch(/^✓2/)
+  expect((await band.find({ type: 'Text', text: /needs fixes/ }))?.text).toMatch(/1 needs fixes/)
+  expect((await band.find({ type: 'Text', text: /unreviewed/ }))?.text).toMatch(/2 unreviewed/)
+  await band.unmount()
+})
+
+test('the toast names the review state of a task that finishes unreviewed', async ($, on) => {
+  const toasts: string[] = []
+  const clock = mock.clock(on, { now: new Date('2026-11-05T11:32:00').getTime() })
+  const t = tree('/h/.muster/runs', { '20261118-1100-toast': { A: { ...task('running', 'pid=0\n'), title: 'Toasted' } } })
+  await mountWith($, on, t, { clock: true, toasts })
+  await clock.settle()
+  t['/h/.muster/runs/20261118-1100-toast/A/status'] = 'done\n'
+  t['/h/.muster/runs/20261118-1100-toast/A/meta'] += 'changes=1 files +1 -0\n'
+  await clock.advance(5000)
+  expect(toasts.join('\n')).toMatch(/Toasted \(w1\): needs review/)
+})
+
+test('a running task past its worker shows the done check instead of a silence warning', async ($, on) => {
+  on('fs.stat', () => ({ value: { kind: 'file', size: 0, isLink: false, mtimeMs: new Date('2026-11-05T11:20:00').getTime() } }))
+  await mountWith($, on, tree('/h/.muster/runs', {
+    '20261118-1200-phase': {
+      quiet: { ...task('running', 'pid=0\n'), title: 'Silent worker' },
+      saving: { ...task('running', 'pid=0\nworker_exited=2026-11-05 11:31:50\n'), title: 'Saving' },
+      waits: { ...task('running', 'pid=0\nworker_exited=2026-11-05 11:25:00\ncheck_waiting=2026-11-05 11:30:00\n'), title: 'Waiting' },
+      checks: { ...task('running', 'pid=0\nworker_exited=2026-11-05 11:25:00\ncheck_waiting=2026-11-05 11:28:00\ncheck_started=2026-11-05 11:28:52\n'), title: 'Checking' },
+    },
+  }))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const rows = (await ui.findAll({ type: 'Text' })).map((r: any) => (r.text as string).trim())
+  expect(rows.filter(r => r.startsWith('no output for'))).toEqual(['no output for 12m00s'])
+  expect(rows).toContain('running done check · 3m08s')
+  expect(rows).toContain('waiting for done check · 2m00s')
+  expect(rows).toContain('saving results · 10s')
+  await ui.unmount()
+})
+
 test('each task shows the model it ran on, from meta when done and from the log while running', async ($, on) => {
   const t = tree('/h/.muster/runs', {
     '20261117-1200-model': {
       fin: { ...task('done', 'model=gpt-6-astra\neffort=high\n'), title: 'Finished one' },
       live: { status: 'running\n', meta: 'worker=w1\ntype=codex\nsession=S1\nstarted=2026-11-05 11:00:00\n', title: 'Live one' },
+      noisy: { status: 'running\n', meta: 'worker=w1\ntype=codex\nsession=S2\nstarted=2026-11-05 11:00:00\n', title: 'Noisy one' },
     },
   })
+  t['/h/.muster/runs/20261117-1200-model/noisy/log.txt'] =
+    'ERROR rmcp transport failed\n'.repeat(400) + 'OpenAI Codex\n--------\nmodel: gpt-6-nova\nreasoning effort: medium\n--------\n'
   t['/h/.muster/runs/20261117-1200-model/live/log.txt'] = 'OpenAI Codex\n--------\nmodel: gpt-6-mini\nreasoning effort: low\n--------\n'
   t['/h/.muster/runs/20261117-1200-model/fin/result.md'] = 'Status: DONE_WITH_CONCERNS\n'
   await mountWith($, on, t)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /^\s+fin · / }))?.text).toMatch(/fin · w1 · gpt-6-astra high · done/)
   expect((await ui.find({ type: 'Text', text: /^\s+live · / }))?.text).toMatch(/live · w1 · gpt-6-mini low · running/)
+  expect((await ui.find({ type: 'Text', text: /^\s+noisy · / }))?.text).toMatch(/noisy · w1 · gpt-6-nova medium · running/)
   expect((await ui.find({ type: 'Text', text: /DONE_WITH_CONCERNS/ }))?.text).toBeTruthy()
   await ui.unmount()
 })

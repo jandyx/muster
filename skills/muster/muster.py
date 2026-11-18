@@ -5,8 +5,11 @@
                                               queue until deps are done and one of the workers has a free slot
                                               (first in the list wins a tie), then run prompt.md on it; then run
                                               CMD (sh -c, in cwd) and fail the task if it fails;
-                                              exit 3 refused (`only`), 5 dependency failed
+                                              exit 3 refused (`only`), 5 dependency failed, 1 the worker reported
+                                              BLOCKED or NEEDS_CONTEXT
     muster.py cancel <task-dir> [reason]      stop a queued or running task; status becomes "canceled: reason"
+    muster.py watch <run-dir> [--stall-min N] wait until every task has finished or a running worker's log has been
+                                              silent for N minutes (default 10), and say which; stops nothing
     muster.py usage <task-dir>                (re)compute <task-dir>/usage for a finished task
     muster.py clean [--days N]                list what could be removed (runs untouched for N days, default 14;
                                               task worktrees; muster/* branches) with the command for each; deletes
@@ -206,12 +209,14 @@ def usage_claude(task, prices, billing, started_utc):
 
 
 def record_model(task, kind):
-    """meta `model` and `effort`, from the head of the worker's own log: codex prints `model:` and
-    `reasoning effort:` before it starts; a claude worker names its model in the stream's init event."""
+    """meta `model` and `effort`, from the worker's own log: codex prints `model:` and `reasoning effort:`
+    in a header after its banner (MCP errors can precede it, and no banner means no header); a claude worker names its model in the stream's init event."""
     found = {}
     try:
         if kind == "codex":
-            head = read_text(os.path.join(task, "log.txt"), 8192)
+            text = read_text(os.path.join(task, "log.txt"))
+            banner = re.search(r"^OpenAI Codex", text, re.M)
+            head = text[banner.start():][:8192] if banner else ""
             for key, label in (("model", "model"), ("effort", "reasoning effort")):
                 hit = re.search(rf"^{label}: (\S+)", head, re.M)
                 if hit:
@@ -645,6 +650,7 @@ def clean(cfg, days=14):
 # ---------- running ----------
 
 QUEUE_POLL_S = 2.0
+WATCH_GRACE_S = 30.0  # how long `watch` waits for a launched task's runner to write its first status
 _child = None  # the worker process, once started; one task per runner process
 
 
@@ -819,10 +825,27 @@ def run_check(task, cwd, check, env, runs):
     with open(os.path.join(task, "check.txt"), "w") as out, open(os.path.join(runs, ".check.lock"), "a") as lock:
         out.write(f"$ {check}\n")
         out.flush()
+        append_meta(task, check_waiting=now())
         fcntl.flock(lock, fcntl.LOCK_EX)  # released when the file closes, also if the runner dies
+        append_meta(task, check_started=now())
         rc = supervise(task, ["/bin/sh", "-c", check], stdout=out, stderr=subprocess.STDOUT, cwd=cwd, env=env)
     append_meta(task, check="pass" if rc == 0 else f"fail (signal {-rc})" if rc < 0 else f"fail (exit {rc})")
     return rc
+
+
+# The report's first line, decorated or not, as the pane reads a review's `Verdict:` line.
+REPORT_STOP = re.compile(r"\W*Status\W*:\W*(BLOCKED|NEEDS_CONTEXT)\W*", re.I)
+
+
+def reported_stop(task):
+    """BLOCKED or NEEDS_CONTEXT when the first non-empty line of result.md says the worker could not finish, else None.
+    Only that line counts, so a prompt quoted further down cannot trigger it."""
+    try:
+        lines = read_text(os.path.join(task, "result.md")).splitlines()
+    except OSError:
+        return None
+    hit = REPORT_STOP.fullmatch(next((line for line in lines if line.strip()), ""))
+    return hit[1].upper() if hit else None
 
 
 def finish(task, rc, status):
@@ -904,6 +927,62 @@ def cancel(task, reason=""):
             time.sleep(0.1)
     finish(task, 0, f"canceled: {reason}" if reason else "canceled")
     return 0
+
+
+def stalled_log(task, m, stall_min):
+    """(log path, mtime) when this running task's worker has been silent for stall_min minutes and that silence has
+    not been reported yet. After the worker exits (saving results, done check) the log is meant to be quiet."""
+    if "worker_exited" in m or "started" not in m:
+        return None
+    log = os.path.join(task, "stream.jsonl" if m.get("type") == "claude" else "log.txt")
+    try:
+        mtime = os.path.getmtime(log)
+    except OSError:
+        return None  # the worker has not started yet
+    started = datetime.datetime.strptime(m["started"], "%Y-%m-%d %H:%M:%S").timestamp()
+    if mtime < started or time.time() - mtime < stall_min * 60 or m.get("stall_reported") == str(mtime):
+        return None  # an older round's log counts as not started
+    return log, mtime
+
+
+def watch(run_dir, stall_min=10):
+    """Wait for something the main agent must act on: a silent worker (one block per stall, each reported once through
+    meta's `stall_reported`) or the end of the run. Reports only: it never stops or changes a task."""
+    if not os.path.isdir(run_dir):
+        sys.exit(f"muster: no run folder {run_dir}")
+    grace = time.time() + WATCH_GRACE_S
+    while True:
+        tasks, waiting, stalls = [], False, []
+        for task in sorted(d for d in glob.glob(os.path.join(run_dir, "*")) if os.path.isdir(d)):
+            m = read_meta(task)
+            try:
+                status = read_text(os.path.join(task, "status")).strip()
+            except OSError:
+                status = ""
+            if live(m, status):
+                waiting = True
+                hit = stalled_log(task, m, stall_min) if status == "running" else None
+                if hit:
+                    stalls.append((task, m, *hit))
+            elif not status and (time.time() < grace or pid_alive(int(m.get("pid", "0") or 0))):
+                waiting = True  # launched a moment ago, or caught while the runner rewrites `status`
+            tasks.append((task, "failed: lost" if status.startswith(("queued", "running")) and not live(m, status) else status))
+        for task, m, log, mtime in stalls:
+            silent = int(time.time() - mtime)
+            print(f"stalled: {os.path.basename(task)} on {m.get('worker', '?')}, silent for {silent // 60}m{silent % 60:02d}s")
+            print(f"log: {os.path.abspath(log)}")
+            for line in [ln for ln in tail_lines(log) if ln.strip()][-5:]:
+                print(f"  {short(line)}")
+            sys.stdout.flush()
+            append_meta(task, stall_reported=mtime)
+        if stalls:
+            return 0
+        if not waiting:
+            print("all tasks finished")
+            for task, status in tasks:
+                print(f"{os.path.basename(task)}: {short(status) or 'not started'}")
+            return 0
+        time.sleep(QUEUE_POLL_S)
 
 
 def run(cfg, names, task, cwd, after=(), priority=0, check=None):
@@ -990,6 +1069,7 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None):
                 rc = supervise(task, cmd, stdin=stdin, stdout=out, stderr=log, cwd=cwd, env=env)
         else:
             sys.exit(f"muster: worker {name!r} has unknown type {kind!r} (codex or claude)")
+    append_meta(task, worker_exited=now())
     try:
         write_changes(task, check)
     except Exception as e:  # best effort, like usage; meta says why there is no diff
@@ -1000,8 +1080,16 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None):
     except Exception as e:  # usage is best effort; the task result matters more
         with open(os.path.join(task, "log.txt"), "a") as log:
             log.write(f"\nmuster: usage not recorded: {e}\n")
+    stopped = reported_stop(task) if rc == 0 else None
     if rc != 0 and check:
         append_meta(task, check="skipped: the worker failed")
+    if stopped:
+        reason = f"worker reported {stopped}"
+        if check:
+            append_meta(task, check=f"skipped: the worker reported {stopped}")
+        append_meta(task, last_error=reason, log_path=os.path.abspath(os.path.join(task, "result.md")))
+        finish(task, 1, f"failed: {reason}")
+        return 1
     if rc == 0 and check:
         crc = run_check(task, cwd, check, env, expand(cfg.get("runsDir", "~/.muster/runs")))
         if crc != 0:
@@ -1036,6 +1124,8 @@ def main():
     if cmd == "detect":  # works before any config exists
         print(json.dumps(detect(), indent=2))
         return
+    if cmd == "watch" and (len(args) == 1 or (len(args) == 3 and args[1] == "--stall-min")):  # reads only the run folder
+        sys.exit(watch(args[0], float(args[2]) if len(args) == 3 else 10))
     cfg = load_config()
     if cmd == "doctor":
         probs = doctor(cfg)

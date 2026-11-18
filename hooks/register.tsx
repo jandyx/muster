@@ -8,7 +8,7 @@ const TITLE = 'Muster'
 const POLL_MS = 5000
 
 // Change a tag when its value's fields change, so a reload declines old values.
-const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-11' })
+const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-12' })
 // The session's own subagents (`$.agent.list()`), refreshed every poll. They are not Muster runs: no worker,
 // no cost; the list is already bound to this session, so it needs no session filter.
 const agentsAtom = atom({ plugin: 'muster', key: 'agents' } as const, [] as Agent[], { shape: 'agents-1' })
@@ -20,7 +20,15 @@ const notifiedAtom = atom({ plugin: 'muster', key: 'notified' } as const, [], { 
 const isRunning = (t: Task) => t.status === 'running'
 const isFailed = (t: Task) => t.status.startsWith('failed')
 const isCanceled = (t: Task) => t.status.startsWith('canceled')
+// The runner is through with the task. `done` on disk means the worker and its check succeeded, not that the work
+// is accepted: isDone is that.
 const isFinished = (t: Task) => t.status === 'done' || isFailed(t) || isCanceled(t)
+const needsReview = (t: Task) => t.review === 'needs review'
+const needsFixes = (t: Task) => t.review === 'needs fixes'
+const needsAttention = (t: Task) => needsReview(t) || needsFixes(t)
+// Reviewed, or from before muster recorded diffs (no review state).
+const isDone = (t: Task) => t.status === 'done' && !needsAttention(t)
+const shownStatus = (t: Task) => (needsAttention(t) ? t.review : t.status)
 // Queued by the runner (waiting for a slot or a dependency), or `pending`: the folder exists, no runner yet.
 const isQueued = (t: Task) => !isRunning(t) && !isFinished(t)
 const isActive = (t: Task) => isRunning(t) || isQueued(t)
@@ -36,11 +44,13 @@ const SECTIONS: [string, string | undefined, (t: Task) => boolean][] = [
   ['Running', 'yellow', isRunning],
   ['Queued', 'cyan', isQueued],
   ['Failed', 'red', isFailed],
+  ['Needs fixes', 'error', needsFixes],
+  ['Needs review', 'warning', needsReview],
   ['Canceled', undefined, isCanceled],
   ['Done', 'green', () => true],
 ]
-const mark = (t: Task) => (t.status === 'done' ? '✓' : isRunning(t) ? '…' : isFailed(t) ? '✗' : isCanceled(t) ? '⊘' : '○')
-const markColor = (t: Task) => (t.status === 'done' ? 'green' : isRunning(t) ? 'yellow' : isFailed(t) ? 'red' : isQueued(t) ? 'cyan' : undefined)
+const mark = (t: Task) => (needsFixes(t) ? '!' : needsReview(t) ? '?' : t.status === 'done' ? '✓' : isRunning(t) ? '…' : isFailed(t) ? '✗' : isCanceled(t) ? '⊘' : '○')
+const markColor = (t: Task) => (needsFixes(t) ? 'error' : needsReview(t) ? 'warning' : t.status === 'done' ? 'green' : isRunning(t) ? 'yellow' : isFailed(t) ? 'red' : isQueued(t) ? 'cyan' : undefined)
 
 // A subagent's lifecycle: the engine reports `running`, `completed`, `failed`, `killed`, and its own
 // waiting states. A waiting one is still active, so it stays in the pane.
@@ -227,10 +237,17 @@ const wrapCells = (text: string, cols: number, max: number) => {
   return kept
 }
 
+// A codex log's header: the 8192 characters from its banner (MCP errors can precede it). No banner, no header,
+// since the log also echoes the prompt.
+const codexHeader = (text: string) => {
+  const i = text.search(/^OpenAI Codex/m)
+  return i < 0 ? '' : text.slice(i, i + 8192)
+}
+
 // The worker's model from its log while it runs: codex prints `model:` in its header, a claude worker names it
 // in the stream's init event.
 const liveModel = (text: string, isStream: boolean) => {
-  if (!isStream) return /^model: (\S+)/m.exec(text.slice(0, 8192))?.[1] ?? ''
+  if (!isStream) return /^model: (\S+)/m.exec(codexHeader(text))?.[1] ?? ''
   for (const line of text.split('\n', 200)) {
     if (!line.includes('"init"')) continue
     try {
@@ -242,7 +259,7 @@ const liveModel = (text: string, isStream: boolean) => {
   }
   return ''
 }
-const liveEffort = (text: string) => /^reasoning effort: (\S+)/m.exec(text.slice(0, 8192))?.[1] ?? ''
+const liveEffort = (text: string) => /^reasoning effort: (\S+)/m.exec(codexHeader(text))?.[1] ?? ''
 
 const fmtElapsed = (ms: number) => {
   if (ms <= 0) return ''
@@ -376,10 +393,12 @@ export const register: Register = on => {
           // (no `changes` in meta) show no review state.
           // The last `Verdict:` line counts, so a quoted or earlier approval cannot outvote a later "Needs fixes".
           const verdict = ([...reviewText.matchAll(/^\W*Verdict\W*:\W*(.*?)\W*$/gim)].at(-1)?.[1] ?? '').toLowerCase()
-          const approved =
-            (verdict === 'approved' || verdict === 'user override') &&
-            (!kv.changes_sha256 || reviewText.includes(kv.changes_sha256))
-          const review = status.trim() !== 'done' || kv.changes === undefined ? '' : approved ? 'reviewed' : 'needs review'
+          const coversDiff = !kv.changes_sha256 || reviewText.includes(kv.changes_sha256)
+          const approved = (verdict === 'approved' || verdict === 'user override') && coversDiff
+          const fixes = verdict === 'needs fixes' && coversDiff
+          const review = status.trim() !== 'done' || kv.changes === undefined ? '' : approved ? 'reviewed' : fixes ? 'needs fixes' : 'needs review'
+          // After the worker exits its log goes quiet on purpose; meta says what the runner is doing instead.
+          const phase = !isLive ? '' : kv.check_started ? 'running done check' : kv.check_waiting ? 'waiting for done check' : kv.worker_exited ? 'saving results' : ''
           return {
             id,
             review,
@@ -406,6 +425,8 @@ export const register: Register = on => {
             pctText: measure?.text ?? '',
             etaMs,
             logMs,
+            phase,
+            phaseMs: phase === '' ? 0 : parseTime(kv.check_started ?? kv.check_waiting ?? kv.worker_exited),
           }
         }),
       )
@@ -463,7 +484,7 @@ export const register: Register = on => {
       } else {
         const seen = new Set(await read($, notifiedAtom))
         const fresh = all.flatMap(r => r.tasks.filter(t => isFinished(t) && !seen.has(key(r, t))).map(t => ({ r, t })))
-        for (const { r, t } of fresh) $.ui.toast(`muster ${t.title} (${t.worker}): ${t.status}`)
+        for (const { r, t } of fresh) $.ui.toast(`muster ${t.title} (${t.worker}): ${shownStatus(t)}`)
         if (fresh.length) await update($, notifiedAtom, old => [...old, ...fresh.map(({ r, t }) => key(r, t))].slice(-500))
       }
 
@@ -534,7 +555,7 @@ export const register: Register = on => {
       )
     }
     const folds = await read($, foldsAtom)
-    const isFolded = (run: Run) => folds[run.name] ?? !run.tasks.some(isActive)
+    const isFolded = (run: Run) => folds[run.name] ?? !run.tasks.some(t => isActive(t) || needsAttention(t))
     const isAgentsFolded = folds.agents ?? !agents.some(isAgentActive)
     const isFinishedAgentsFolded = folds['agents/finished'] ?? true
     const finishedAgents = agents.filter(isAgentFinished)
@@ -563,8 +584,8 @@ export const register: Register = on => {
     }
     const count = (run: Run) => {
       const n = (test: (t: Task) => boolean) => run.tasks.filter(test).length
-      const extra = [[n(isQueued), 'queued'], [n(isCanceled), 'canceled']].filter(([k]) => k).map(([k, l]) => ` · ${k} ${l}`).join('')
-      return `${n(isRunning)} running · ${n(t => t.status === 'done')} done · ${n(isFailed)} failed${extra}`
+      const extra = [[n(needsFixes), 'needs fixes'], [n(needsReview), 'needs review'], [n(isQueued), 'queued'], [n(isCanceled), 'canceled']].filter(([k]) => k).map(([k, l]) => ` · ${k} ${l}`).join('')
+      return `${n(isRunning)} running · ${n(isDone)} done · ${n(isFailed)} failed${extra}`
     }
     // Subagent rows: running first, then waiting; finished ones sit under their own fold.
     const agentRows = (list: Agent[]) =>
@@ -658,10 +679,11 @@ export const register: Register = on => {
                 <Box flexDirection="column" marginTop={1}>
                   <Text color={markColor(t)}>
                     {'  '}{mark(t)} {t.title}
-                    {t.review === 'needs review' && <Text color="warning"> · needs review</Text>}
+                    {needsReview(t) && <Text color="warning"> · needs review</Text>}
+                    {needsFixes(t) && <Text color="error"> · needs fixes</Text>}
                   </Text>
                   <Text dimColor>
-                    {'    '}{t.id} · {Worker(t.worker)}{t.model ? ` · ${t.model}` : ''} · {place.has(t) ? t.status.replace(/^queued/, `queued #${place.get(t)}`) : t.status}{t.after.length > 0 ? ` · after ${t.after.join(', ')}` : ''}{t.priority !== 0 ? ` · priority ${t.priority}` : ''}{t.startedMs > 0 ? ` · ${fmtElapsed((t.finishedMs || now) - t.startedMs)}` : ''}{t.branch ? ` · ⎇ ${t.branch}` : ''}
+                    {'    '}{t.id} · {Worker(t.worker)}{t.model ? ` · ${t.model}` : ''} · {place.has(t) ? t.status.replace(/^queued/, `queued #${place.get(t)}`) : shownStatus(t)}{t.after.length > 0 ? ` · after ${t.after.join(', ')}` : ''}{t.priority !== 0 ? ` · priority ${t.priority}` : ''}{t.startedMs > 0 ? ` · ${fmtElapsed((t.finishedMs || now) - t.startedMs)}` : ''}{t.branch ? ` · ⎇ ${t.branch}` : ''}
                   </Text>
                   {isFailed(t) &&
                     t.reason !== '' &&
@@ -708,7 +730,10 @@ export const register: Register = on => {
                       {t.pct === 100 ? ' · finishing' : t.etaMs > 0 ? ` · ${fmtEta(t.etaMs)}` : ''}
                     </Text>
                   )}
-                  {isRunning(t) && t.logMs > 0 && now - t.logMs > 120000 && (
+                  {isRunning(t) && t.phase !== '' && (
+                    <Text dimColor>{'    '}{[t.phase, fmtElapsed(now - t.phaseMs)].filter(Boolean).join(' · ')}</Text>
+                  )}
+                  {isRunning(t) && t.phase === '' && t.logMs > 0 && now - t.logMs > 120000 && (
                     <Text color="error">{'    '}no output for {fmtElapsed(now - t.logMs)}</Text>
                   )}
                   {t.summary !== '' &&
@@ -729,8 +754,8 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    // A run stays in the band while a task runs or a finished one still needs review.
-    const active = (await read($, runsAtom)).filter(r => r.tasks.some(t => isActive(t) || t.review === 'needs review'))
+    // A run stays in the band while a task runs or a finished one still needs review or fixes.
+    const active = (await read($, runsAtom)).filter(r => r.tasks.some(t => isActive(t) || needsAttention(t)))
     // Claude's own subagents count while one is still going; a finished one leaves the band quiet.
     const activeAgents = (await read($, agentsAtom)).filter(isAgentActive)
     if (e.props.hasSurvey || (active.length === 0 && activeAgents.length === 0)) return next(e)
@@ -741,8 +766,9 @@ export const register: Register = on => {
         <Text color="cyan" bold>⇉ muster </Text>
         {active.map((r, i) => {
           // Only running tasks get a row; finished ones collapse to counts.
-          const done = r.tasks.filter(t => t.status === 'done').length
-          const unreviewed = r.tasks.filter(t => t.review === 'needs review').length
+          const done = r.tasks.filter(isDone).length
+          const unreviewed = r.tasks.filter(needsReview).length
+          const fixes = r.tasks.filter(needsFixes).length
           const failed = r.tasks.filter(isFailed).length
           const queued = r.tasks.filter(isQueued).length
           const canceled = r.tasks.filter(isCanceled).length
@@ -759,6 +785,7 @@ export const register: Register = on => {
               ))}
               {queued > 0 && <Text color="cyan">○{queued} </Text>}
               {done > 0 && <Text color="green">✓{done} </Text>}
+              {fixes > 0 && <Text color="error">{fixes} needs fixes </Text>}
               {unreviewed > 0 && <Text color="warning">{unreviewed} unreviewed </Text>}
               {failed > 0 && <Text color="red">✗{failed} </Text>}
               {canceled > 0 && <Text dimColor>⊘{canceled} </Text>}

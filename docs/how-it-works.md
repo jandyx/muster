@@ -58,10 +58,15 @@ stateDiagram-v2
     running --> running: ↻ new note / $ new command
     running --> quiet: no output for 2 min
     quiet --> running: output again
-    running --> done: exit 0 and check passes
-    running --> failed: exit ≠ 0, or check fails
-    done --> reviewed: review.md approves this changes.diff
-    reviewed --> [*]
+    running --> checking: worker exits, done check runs
+    checking --> needs_review: check passes
+    running --> needs_review: exit 0, no check
+    running --> failed: exit ≠ 0, or the worker reports BLOCKED / NEEDS_CONTEXT
+    checking --> failed: check fails
+    needs_review --> needs_fixes: review.md asks for fixes on this changes.diff
+    needs_review --> done: review.md approves this changes.diff
+    needs_fixes --> done: a later review approves it
+    done --> [*]
     failed --> running: Claude reruns it (same or next worker)
 ```
 
@@ -81,9 +86,9 @@ flowchart TB
     prompt --> row1["✓ / … / ✗  title"]
     status --> row1
     meta --> row2["id · worker · model · status · elapsed · ⎇ branch"]
-    review --> row1b["· needs review (until it approves this diff)"]
+    review --> row1b["section and mark: Needs review, Needs fixes, or Done once it approves this diff"]
     usage --> row3["in 3.65M (97% cached) · out 12k · ≈$5.17"]
-    live --> row4["↻ latest note<br/>$ latest command<br/>no output for … (stall)"]
+    live --> row4["↻ latest note<br/>$ latest command<br/>no output for … (stall)<br/>running done check · 3m08s (from meta)"]
     result --> row5["↳ one-line result"]
     meta -- "session = this session?" --> filter{shown}
 ```
