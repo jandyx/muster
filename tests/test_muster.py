@@ -1,6 +1,6 @@
 """Self-check for skills/muster/muster.py: usage math and a full run with a fake claude worker.
 Run: python3 -m unittest discover -s tests"""
-import datetime, importlib.util, time, unittest.mock, json, os, pathlib, re, stat, sys, tempfile, unittest
+import contextlib, datetime, importlib.util, io, threading, time, unittest.mock, json, os, pathlib, re, stat, sys, tempfile, unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("muster", ROOT / "skills/muster/muster.py")
@@ -336,6 +336,21 @@ class Run(unittest.TestCase):
                                                 '{"type":"system","subtype":"init","model":"deepseek-flash[1m]"}\n')
             M.record_model(str(other), "claude")
             self.assertEqual(M.read_meta(str(other))["model"], "deepseek-flash[1m]")
+
+    def test_record_model_skips_noise_before_the_banner_and_ignores_headerless_logs(self):
+        with tempfile.TemporaryDirectory() as d:
+            noisy = pathlib.Path(d, "a")
+            noisy.mkdir()
+            (noisy / "log.txt").write_text("ERROR rmcp transport failed\n" * 400
+                                           + "OpenAI Codex v0.169.0\n--------\nmodel: gpt-6-astra\nreasoning effort: high\n--------\n")
+            M.record_model(str(noisy), "codex")
+            meta = M.read_meta(str(noisy))
+            self.assertEqual((meta["model"], meta["effort"]), ("gpt-6-astra", "high"))
+            bare = pathlib.Path(d, "b")
+            bare.mkdir()
+            (bare / "log.txt").write_text("user prompt\nmodel: foo\nreasoning effort: low\n")
+            M.record_model(str(bare), "codex")
+            self.assertNotIn("model", M.read_meta(str(bare)))
 
     def test_sigterm_still_records_a_final_status(self):
         import signal, subprocess, time
@@ -777,6 +792,118 @@ class Failures(unittest.TestCase):
     def test_reason_is_short_and_redacted(self):
         self.assertEqual(len(M.short("error " * 100)), 160)
         self.assertEqual(M.redact("token=abc ghp_XYZ123 xoxb-1-2 api_key: k"), "token=*** ghp_*** xoxb-*** api_key: ***")
+
+
+class WorkerReport(unittest.TestCase):
+    def launch(self, d, report, check=None, exit_code=0):
+        worker = fake_cli(d, "w", f"cat >/dev/null\ncat > report.json <<'EOF'\n{json.dumps({'type': 'result', 'result': report})}\nEOF\n"
+                                  f"cat report.json\nrm report.json\nexit {exit_code}\n")
+        task = make_task(d)
+        return M.run({"runsDir": d, "workers": {"w": {"type": "claude", "command": worker}}}, "w", str(task), d, check=check), task
+
+    def test_a_blocked_worker_fails_without_the_check_and_cancels_dependents(self):
+        for word in ("BLOCKED", "NEEDS_CONTEXT"):
+            with tempfile.TemporaryDirectory() as d:
+                marker = pathlib.Path(d, "check-ran")
+                rc, task = self.launch(d, f"\nStatus: {word}\nNo schema was given.", check=f"touch {marker}")
+                self.assertEqual(rc, 1)
+                self.assertFalse(marker.exists())
+                self.assertEqual((task / "status").read_text().strip(), f"failed: worker reported {word}")
+                meta = M.read_meta(str(task))
+                self.assertEqual(meta["check"], f"skipped: the worker reported {word}")
+                self.assertEqual(meta["last_error"], f"worker reported {word}")
+                self.assertEqual(meta["log_path"], os.path.abspath(task / "result.md"))
+                self.assertEqual(M.dep_state(str(task.parent / "B"), ["A"]), "broken: A failed")
+
+    def test_only_the_reports_first_line_counts(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, task = self.launch(d, "Status: DONE\nThe brief said to report:\nStatus: BLOCKED\n", check="true")
+            self.assertEqual((rc, (task / "status").read_text().strip()), (0, "done"))
+            self.assertEqual(M.read_meta(str(task))["check"], "pass")
+
+    def test_a_decorated_status_line_counts_and_prose_does_not(self):
+        with tempfile.TemporaryDirectory() as d:
+            for text, want in (("**Status: BLOCKED**\n", "BLOCKED"), ("Status: BLOCKED by nothing, all fine\n", None),
+                               ("Status: DONE_WITH_CONCERNS\n", None), ("", None)):
+                pathlib.Path(d, "result.md").write_text(text)
+                self.assertEqual(M.reported_stop(d), want, text)
+
+    def test_the_check_records_when_it_waits_and_when_it_starts(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, task = self.launch(d, "Status: DONE", check="true")
+            keys = [line.split("=")[0] for line in (task / "meta").read_text().splitlines()]
+            self.assertLess(keys.index("worker_exited"), keys.index("check_waiting"))
+            self.assertLess(keys.index("check_waiting"), keys.index("check_started"))
+
+
+class Watch(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.run_dir = pathlib.Path(self.tmp.name, "run")
+        for name, value in (("QUEUE_POLL_S", 0.01), ("WATCH_GRACE_S", 0.05)):
+            patcher = unittest.mock.patch.object(M, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def task(self, tid, status="running", kind="codex", silent=3600, pid=None, extra=""):
+        t = self.run_dir / tid
+        t.mkdir(parents=True)
+        (t / "status").write_text(status + "\n")
+        started = datetime.datetime.fromtimestamp(time.time() - 7200).strftime("%Y-%m-%d %H:%M:%S")
+        (t / "meta").write_text(f"worker=w1\ntype={kind}\npid={pid or os.getpid()}\nstarted={started}\n{extra}")
+        log = t / ("stream.jsonl" if kind == "claude" else "log.txt")
+        log.write_text("first line\nlast line token=abc\n")
+        os.utime(log, (time.time() - silent,) * 2)
+        return t
+
+    def watch(self, stall_min=10):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(M.watch(str(self.run_dir), stall_min), 0)
+        return out.getvalue()
+
+    def finish_soon(self, t):
+        timer = threading.Timer(0.2, lambda: (t / "status").write_text("done\n"))
+        timer.start()
+        self.addCleanup(timer.join)
+
+    def test_a_silent_worker_is_reported_once_until_it_speaks_and_stops_again(self):
+        t = self.task("a", kind="claude")
+        out = self.watch()
+        self.assertRegex(out, r"stalled: a on w1, silent for 60m\d\ds")
+        self.assertIn(os.path.abspath(t / "stream.jsonl"), out)
+        self.assertIn("last line token=***", out)
+        self.assertEqual((t / "status").read_text().strip(), "running")  # nothing was stopped
+        self.finish_soon(t)
+        self.assertTrue(self.watch().startswith("all tasks finished"))  # the same silence is not news
+        (t / "status").write_text("running\n")
+        os.utime(t / "stream.jsonl", (time.time() - 1800,) * 2)
+        self.assertIn("stalled: a", self.watch())
+
+    def test_quiet_phases_queued_tasks_and_dead_runners_are_not_stalls(self):
+        check = self.task("check", extra="worker_exited=x\ncheck_started=x\n")
+        self.task("queued", status="queued, w1 runs 3 of 3")
+        self.task("dead", pid=999999)
+        self.task("fresh", silent=5)
+        for name in ("queued", "fresh"):
+            self.finish_soon(self.run_dir / name)
+        self.finish_soon(check)
+        out = self.watch()
+        self.assertNotIn("stalled", out)
+        self.assertIn("dead: failed: lost", out)
+
+    def test_it_waits_for_a_launched_task_then_gives_up_on_one_never_started(self):
+        (self.run_dir / "never").mkdir(parents=True)
+        self.assertIn("never: not started", self.watch())
+
+    def test_the_cli_needs_no_config_and_reads_the_threshold(self):
+        import subprocess
+        self.task("a", silent=120)
+        r = subprocess.run([sys.executable, str(ROOT / "skills/muster/muster.py"), "watch", str(self.run_dir), "--stall-min", "1"],
+                           env=dict(os.environ, MUSTER_CONFIG="/nonexistent/config.json"), capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("stalled: a", r.stdout)
 
 
 class MoreGuards(unittest.TestCase):

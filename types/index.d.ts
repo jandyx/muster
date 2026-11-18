@@ -7,7 +7,8 @@ export type Task = {
   branch: string
   session: string
   status: string
-  // 'reviewed' or 'needs review' for a done task with a recorded diff (review.md vs meta's changes_sha256); else ''.
+  // 'reviewed', 'needs review' or 'needs fixes' for a done task with a recorded diff (review.md vs meta's
+  // changes_sha256); else ''.
   review: string
   startedMs: number
   queuedMs: number
@@ -25,6 +26,9 @@ export type Task = {
   pctText: string
   etaMs: number
   logMs: number
+  // What a running task does once its worker has exited (the done check, saving results), and since when; else ''.
+  phase: string
+  phaseMs: number
 }
 export type Usage = {
   model: string

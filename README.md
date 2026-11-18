@@ -32,7 +32,7 @@ You talk to one Claude Code session. Claude splits the job, hands each piece to 
     general-purpose · running
     $ Read runs/20261117-1635-test-tiering/a/changes.diff
 
-▾ 20261117-1635-test-tiering 1 running · 2 done · 0 failed
+▾ 20261117-1635-test-tiering 1 running · 1 done · 0 failed · 1 needs review
   Σ 4.12M tokens · $0.06 billed · ≈$5.48 sub
     codex: 2.30M tokens · ≈$3.41 sub
     codex-work: 1.40M tokens · ≈$2.07 sub
@@ -45,10 +45,10 @@ You talk to one Claude Code session. Claude splits the job, hands each piece to 
     ↻ Mapping changed files to the suites that cover them…
     $ npm test -- tests/affected
 
-  ▾ Done · 2
+  ▾ Needs review · 1
 
-  ✓ Test tiers: registry and tags · needs review
-    A · codex-work · gpt-6-astra high · done · 9m14s · ⎇ muster/tt-A
+  ? Test tiers: registry and tags · needs review
+    A · codex-work · gpt-6-astra high · needs review · 9m14s · ⎇ muster/tt-A
     in 1.40M (95% cached) · out 11k · ≈$2.07
     ↳ Status: DONE
 ```
@@ -75,9 +75,10 @@ Muster turns that into a habit Claude already knows and a screen you can glance 
 - **Any number of workers.** Each Codex account is a `codex` worker with its own `CODEX_HOME`; any Claude Code compatible CLI is a `claude` worker. Several tasks can run on one account at once.
 - **Routing you write once.** Per-repo worker priority with quota fallbacks, workers fenced to certain repos, parallel caps. The fences and caps are enforced by the runner, not left to Claude's memory.
 - **Evidence, not claims.** Around each task the runner snapshots the repo and writes `changes.diff` with only that worker's changes, runs the done check itself (`--check`), and flags edits to tests (`tests_touched`) and other tasks in the same repo (`shared_with`). Claude reviews against the brief and records `review.md`.
-- **A live pane and band.** Task title, worker, the model it runs on, elapsed time, the worker's latest note and command, a red warning after 2 minutes of silence, a one-line result, `needs review` on a done task nobody has reviewed, foldable runs — and the session's own Claude subagents, running first, finished ones folded.
+- **A live pane and band.** Task title, worker, the model it runs on, elapsed time, the worker's latest note and command, a red warning after 2 minutes of silence, the done check while it runs, a one-line result, separate `Needs review` and `Needs fixes` sections so only accepted work counts as Done, foldable runs — and the session's own Claude subagents, running first, finished ones folded.
 - **Honest cost accounting.** Billed `$` for metered APIs, with DeepSeek's peak-hour price; API-equivalent `≈$` for Codex on a ChatGPT subscription; long-context pricing per request.
 - **Session-bound.** A session sees only the runs it started; `claude --resume` brings them back.
+- **Stall reports.** `muster.py watch <run-dir>` wakes Claude when a running worker has been silent for 10 minutes (`--stall-min N`), once per silence. It only reports: Claude decides whether to wait, cancel or relaunch.
 - **A clean-up list.** `muster.py clean` lists old runs, task worktrees and `muster/*` branches, merged or not, with the command for each; it deletes nothing.
 - **No dependencies.** The runner is one Python file on the standard library.
 
@@ -188,7 +189,7 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
 | `preamble` | adds the lines to every prompt, then the first matching `routing` entry's `preamble` | only its shape (`doctor`) |
 | `--check` | writes a done check for each task and passes it | runs it after the worker, one at a time per `runsDir`; a failing check fails the task |
 
-When a worker fails, `status` reads `failed: <reason>`: the last error line of its log (secrets such as `sk-…` or `Bearer …` masked, cut to 160 characters), or `exit <code>` when there is none. `meta` keeps it as `last_error`, with the log's path as `log_path`, and the pane shows both. A worker that ran out of disk shows `failed: disk full (ENOSPC), …` and its `result.md` ends with the command to rerun it.
+When a worker fails, `status` reads `failed: <reason>`: the last error line of its log (secrets such as `sk-…` or `Bearer …` masked, cut to 160 characters), or `exit <code>` when there is none. `meta` keeps it as `last_error`, with the log's path as `log_path`, and the pane shows both. A worker that ran out of disk shows `failed: disk full (ENOSPC), …` and its `result.md` ends with the command to rerun it. A worker that exits 0 but opens its report with `Status: BLOCKED` or `Status: NEEDS_CONTEXT` shows `failed: worker reported BLOCKED` (or `NEEDS_CONTEXT`): its done check is skipped and tasks waiting on it with `--after` are canceled.
 
 </details>
 
@@ -207,7 +208,9 @@ Above the runs, **Claude agents** lists the subagents this Claude Code session s
 | `e` · `c` | expand all · collapse all |
 | `esc` | back to the prompt |
 
-Finished runs fold to one line with their totals. A toast tells you when a task ends. Each worker keeps one color everywhere, and each task names the model it ran on (with its reasoning effort for Codex).
+Inside a run, tasks are grouped as Running, Queued, Failed, Needs fixes, Needs review, Canceled and Done. Done holds only reviewed work (and older tasks with no recorded diff); the `status` file still says `done` for the others, because the worker and its check succeeded.
+
+Finished runs fold to one line with their totals; a run with work left to review or fix stays open. A toast tells you when a task ends. Each worker keeps one color everywhere, and each task names the model it ran on (with its reasoning effort for Codex).
 
 ## Tokens and cost
 
@@ -240,7 +243,7 @@ Muster deletes nothing on its own. `python3 <plugin>/skills/muster/muster.py cle
 ## Safety
 
 > [!WARNING]
-> Workers run with approvals and sandboxing off: they can run any command in the folder you give them. Use Muster in repos you trust, keep secrets out of prompts, and read the diffs before merging. Nothing is committed, pushed or merged unless you ask. `muster.py cancel` sends SIGTERM only to the runner pid in that task's `meta`, and only while that task is queued or running. Around each task the runner snapshots the cwd's repo with `git add -A` into a throwaway copy of the index and `git write-tree`, before and after, to write `changes.diff`: that adds objects to the repo's `.git` (unreferenced, so git's automatic gc removes them once they are about two weeks old; with Git LFS, `git add` also copies tracked large files into `.git/lfs/objects`), but never touches the real index, a branch or a working file. `--check` runs the given command in the cwd with `sh -c`, with the same rights as the worker, one check at a time per `runsDir`; stopping a task stops every process its worker or check started. Muster does not merge and does not police merges: the pane marks each done task `needs review` until its `review.md` approves the current `changes.diff`; use your repo's branch protection if merges need a hard gate.
+> Workers run with approvals and sandboxing off: they can run any command in the folder you give them. Use Muster in repos you trust, keep secrets out of prompts, and read the diffs before merging. Nothing is committed, pushed or merged unless you ask. `muster.py cancel` sends SIGTERM only to the runner pid in that task's `meta`, and only while that task is queued or running. Around each task the runner snapshots the cwd's repo with `git add -A` into a throwaway copy of the index and `git write-tree`, before and after, to write `changes.diff`: that adds objects to the repo's `.git` (unreferenced, so git's automatic gc removes them once they are about two weeks old; with Git LFS, `git add` also copies tracked large files into `.git/lfs/objects`), but never touches the real index, a branch or a working file. `--check` runs the given command in the cwd with `sh -c`, with the same rights as the worker, one check at a time per `runsDir`, and is skipped when the worker reports `BLOCKED` or `NEEDS_CONTEXT`; `muster.py watch` only reads a run and records in each task's `meta` which silence it has reported, and never stops a task; stopping a task stops every process its worker or check started. Muster does not merge and does not police merges: the pane keeps each finished task out of Done, under `Needs review` or `Needs fixes`, until its `review.md` approves the current `changes.diff`; use your repo's branch protection if merges need a hard gate.
 
 ## FAQ
 
@@ -275,7 +278,7 @@ The runner stopped it before it started: exit 3 means every worker it was given 
 <details>
 <summary><b>What does "needs review" mean?</b></summary>
 
-The task finished, but nobody has approved its `changes.diff` yet. It clears when `review.md` in the task folder has `Verdict: Approved` and the `changes_sha256` from `meta`, so a review of an older diff does not count. Muster never merges; it only shows what was taken on trust.
+The task finished, but nobody has approved its `changes.diff` yet, so it does not count as Done. It clears when `review.md` in the task folder has `Verdict: Approved` and the `changes_sha256` from `meta`, so a review of an older diff does not count. `needs fixes` means a review of the current diff ended in `Verdict: Needs fixes`. Muster never merges; it only shows what was taken on trust.
 
 </details>
 
