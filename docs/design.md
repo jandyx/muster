@@ -5,7 +5,7 @@ Why Muster is built the way it is. [How it works](how-it-works.md) draws the par
 ## Principles
 
 1. **Claude decides, workers execute.** Claude Code plans, writes each brief, reviews and reports. Codex accounts and Claude-compatible backends do well-scoped work. Judgment stays with the model that has the user's context; volume goes to cheaper or separately billed workers.
-2. **Evidence over claims.** A worker's "tests pass" is a claim. The runner records what changed (`changes.diff`), runs the done check itself (`check.txt`) and flags edited tests (`tests_touched`). A task counts as Done only when `review.md` approves that exact diff (`changes-sha256`).
+2. **Evidence over claims.** A worker's "tests pass" is a claim. The runner records what changed (`changes.diff`), runs the done check itself (`check.txt`) and flags edited tests (`tests_touched`). A task that changed code counts as Done only when `review.md` approves that exact diff (`changes-sha256`), or the user overrides; a read-only task is done once a review covers it, whatever the verdict, since its report is the result.
 3. **Hard limits in code, judgment in the skill.** What must never happen is enforced by `muster.py`. What needs taste is written in `SKILL.md` for Claude to follow.
 4. **Files are the interface.** The runner and the pane share nothing but files in a task folder. Either side can be rewritten, restarted or inspected with `cat`.
 5. **Nothing irreversible by default.** Muster never commits, pushes, merges or deletes on its own. `clean` lists commands; the user runs them.
@@ -42,10 +42,10 @@ The split follows one test: could a mistake here lose data, leak work into the w
 ## Decisions
 
 ### A task folder, not a database or a socket
-Each task is a folder with `prompt.md`, `meta` (key=value), `status`, a log, `result.md`, `usage`, `changes.diff`, `check.txt` and `review.md`. The runner writes everything except `review.md`, which Claude writes; the pane only reads. Plain files survive crashes, need no server and let a person debug a run with a text editor. The cost is a contract: a change to any of these files is a change to both sides, so [AGENTS.md](../AGENTS.md) lists them.
+Each task is a folder with `prompt.md`, `meta` (key=value), `status`, a log, `result.md`, `usage`, `changes.diff`, `check.txt` and `review.md`. Claude writes `prompt.md` and `review.md`; the runner writes the rest (a Codex worker writes `result.md` itself through `codex exec -o`); the pane only reads. Plain files survive crashes, need no server and let a person debug a run with a text editor. The cost is a contract: a change to any of these files is a change to both sides, so [AGENTS.md](../AGENTS.md) lists them.
 
 ### Review is bound to the diff
-`review.md` must carry the `changes_sha256` from `meta`. A review of an older diff stops counting the moment the diff changes, so a fix round cannot inherit an approval. The pane keeps unapproved work out of Done, and the progress bar fills only with accepted work, because a finished worker is not finished work.
+`review.md` must carry the `changes_sha256` from `meta`. A review of an older diff stops counting the moment the diff changes, so a fix round cannot inherit an approval. The pane keeps a changed diff out of Done until a review approves it (tasks from before diffs were recorded show no review state), and the progress bar fills only with accepted work, because a finished worker is not finished work.
 
 ### The change must not grade itself
 Claude reads changed tests and check scripts first: a weakened assertion or a skipped test is Critical unless the brief asked for it. Large diffs go to a fresh reviewer that never saw the author's reasoning. The value of that reviewer comes from not sharing the author's context, not from a stronger model.

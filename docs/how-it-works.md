@@ -106,7 +106,7 @@ flowchart TB
     prefer --> queue["queue: first listed worker<br/>under its cap takes it"]
     queue --> run["run with worker args + tier args"]
     run --> outcome{outcome}
-    outcome -- "check fails / Needs fixes" --> task["failure=task<br/>fix round, same tier;<br/>up one tier if the tier proved too weak (max 2)"]
+    outcome -- "check fails (failure=task)<br/>or review: Needs fixes" --> task["fix round, same tier;<br/>up one tier if the tier proved too weak (max 2)"]
     outcome -- "BLOCKED / NEEDS_CONTEXT" --> blocked["failure=blocked<br/>answer or split, same tier"]
     outcome -- "quota, rate limit, auth" --> provider["failure=provider<br/>another worker, same tier"]
     outcome -- "disk, network, crash" --> infra["failure=infra<br/>rerun, same tier"]
