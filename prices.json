@@ -1,5 +1,5 @@
 {
-  "_note": "USD per 1M tokens, refreshed 2026-11-19 by scripts/update_prices.py from LiteLLM's model_prices_and_context_window.json (OpenAI and DeepSeek entries cite their official pricing pages). Prices change: override any entry in ~/.muster/prices.json.",
+  "_note": "USD per 1M tokens, standard tier, checked 2026-11-19 by scripts/update_prices.py against LiteLLM's model_prices_and_context_window.json, whose entries cite each provider's pricing page. Prices change: override any entry in ~/.muster/prices.json.",
   "gpt-6-astra": {
     "input": 10.0,
     "cached": 1.0,

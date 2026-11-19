@@ -29,6 +29,14 @@ class Convert(unittest.TestCase):
                                         "peak": {"input": 0.3, "cached": 0.006, "output": 1.2},
                                         "peak_utc_weekdays": [[1, 4], [6, 10]]})
 
+    def test_long_context_and_off_peak_together_are_refused(self):
+        e = {"input_cost_per_token": 1 * M, "output_cost_per_token": 2 * M,
+             "input_cost_per_token_above_272k_tokens": 2 * M, "output_cost_per_token_above_272k_tokens": 4 * M,
+             "off_peak_pricing": {"input_cost_per_token": 0.5 * M, "output_cost_per_token": 1 * M,
+                                  "windows": [{"hours_utc": "00:00-00:00", "weekdays": [1, 2, 3, 4, 5, 6, 7]}]}}
+        with self.assertRaises(ValueError):
+            U.convert(e)
+
     def test_a_missing_cache_price_is_the_input_price(self):
         e = {"input_cost_per_token": 2 * M, "output_cost_per_token": 4 * M}
         self.assertEqual(U.convert(e), {"input": 2.0, "cached": 2.0, "output": 4.0})
@@ -37,7 +45,9 @@ class Convert(unittest.TestCase):
         for windows in ([{"hours_utc": "00:00-12:00", "weekdays": [1, 2, 3, 4, 5, 6, 7]}],  # weekend peak
                         [{"hours_utc": "00:00-12:00", "weekdays": [1]},                       # weekdays differ
                          {"hours_utc": "00:00-00:00", "weekdays": [2, 3, 4, 5, 6, 7]}],
-                        [{"hours_utc": "00:30-01:00", "weekdays": [1, 2, 3, 4, 5, 6, 7]}]):   # not whole hours
+                        [{"hours_utc": "00:30-01:00", "weekdays": [1, 2, 3, 4, 5, 6, 7]}],    # not whole hours
+                        [{"hours_utc": "22:00-02:00", "weekdays": [1, 2, 3, 4, 5]},           # crosses midnight
+                         {"hours_utc": "00:00-00:00", "weekdays": [6, 7]}]):
             with self.subTest(windows=windows), self.assertRaises(ValueError):
                 U.peak_ranges(windows)
 
