@@ -191,11 +191,11 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
 | `routing` | picks workers in that order, falls back on quota errors | not checked |
 | `only` | never plans a fenced worker elsewhere | refuses outside its globs (exit 3) |
 | `caps` | passes each task its whole worker list | queues while every listed worker is full, starts on the first to free a slot (priority, then launch order); counts live processes only |
-| `tiers` | picks each task's tier and passes `--tier` | moves `prefer` workers to the front of the task's list (after `only` has filtered it); appends the tier's `args` after the worker's own |
+| `tiers` | picks each task's tier and passes `--tier` | moves `prefer` workers to the front of the task's list (after `only` has filtered it), so they win when several have a free slot; appends the tier's `args` after the worker's own |
 | `preamble` | adds the lines to every prompt, then the first matching `routing` entry's `preamble` | only its shape (`doctor`) |
 | `--check` | writes a done check for each task and passes it | runs it after the worker, one at a time per `runsDir`; a failing check fails the task |
 
-When a worker fails, `status` reads `failed: <reason>`: the last error line of its log (secrets such as `sk-…` or `Bearer …` masked, cut to 160 characters), or `exit <code>` when there is none. `meta` keeps it as `last_error`, with the log's path as `log_path`, and the pane shows both. A worker that ran out of disk shows `failed: disk full (ENOSPC), …` and its `result.md` ends with the command to rerun it. A worker that exits 0 but opens its report with `Status: BLOCKED` or `Status: NEEDS_CONTEXT` shows `failed: worker reported BLOCKED` (or `NEEDS_CONTEXT`): its done check is skipped and tasks waiting on it with `--after` are canceled. A failed task records `failure=provider` when the worker's own error line names a provider problem (usage limit, quota, rate limit, too many requests, HTTP 429/401/403/529, overloaded, billing, credits, access token, unauthorized, authentication, `codex_login`). Retry on another worker at the same tier. A runner stopped by an outside signal records `failure=interrupted`. Retry at the same tier on the same or another worker. Other task failures record `failure=task`. Canceled tasks have no `failure` key.
+When a worker fails, `status` reads `failed: <reason>`: the last error line of its log (secrets such as `sk-…` or `Bearer …` masked, cut to 160 characters), or `exit <code>` when there is none. `meta` keeps it as `last_error`, with the log's path as `log_path`, and the pane shows both. A worker that ran out of disk shows `failed: disk full (ENOSPC), …` and its `result.md` ends with the command to rerun it. A worker that exits 0 but opens its report with `Status: BLOCKED` or `Status: NEEDS_CONTEXT` shows `failed: worker reported BLOCKED` (or `NEEDS_CONTEXT`): its done check is skipped and tasks waiting on it with `--after` are canceled. A failed task records `failure=provider` when the worker's own error line names a provider problem (usage limit, quota, rate limit, too many requests, HTTP 429/401/403/529, overloaded, billing, credits, access token, unauthorized, authentication, `codex_login`). Retry on another worker at the same tier. Any other non-zero worker exit (disk full, a dropped connection, a server error, a crash) records `failure=infra`, and a runner stopped by an outside signal records `failure=interrupted`: retry both at the same tier on the same or another worker. A `BLOCKED` or `NEEDS_CONTEXT` report records `failure=blocked`: answer it or split the task; a stronger tier does not help. A failed done check records `failure=task`. Canceled tasks have no `failure` key.
 
 </details>
 
@@ -238,15 +238,15 @@ The newest counted attempt determines the outcome. If it is `done` and its metad
 | `tier`, `worker`, `model` | where the work started; `-` when the run predates tiers or recorded no model |
 | `settled` | accepted work plus work whose newest counted attempt failed |
 | `accepted` | settled work whose current diff has an `Approved` or `User override` verdict, or a `Needs fixes` verdict on an empty diff, and whose status is `done` |
-| `open` | running or queued work, or completed work awaiting a current review or a requested fix |
+| `open` | running or queued work, completed work awaiting a current review or a requested fix, or work waiting for a rerun after a provider, infra or interruption failure |
 | `first_pass` | share of accepted work that needed no rework and no `Fixed in:` line, or `-` |
-| `attempts_per_work` | mean attempts per settled piece, excluding provider failures and interruptions |
+| `attempts_per_work` | mean attempts per settled piece, excluding provider and infra failures and interruptions |
 | `median_minutes` | median minutes per settled piece, summing recorded attempt durations for each piece |
 | `tokens_per_accepted` | input plus output tokens across settled work, divided by the accepted count |
 | `usd_per_accepted` | recorded cost across settled work divided by the accepted count, with `≥` when only some attempts have a price and `-` when none do |
 | `billing` | `metered`, `subscription` or `mixed` across settled attempts, or `-` when unknown |
 
-A row with only open work shows `-` for all rates, costs, timing and billing. A failed attempt on settled work contributes its cost, including provider failures and interruptions. Subscription dollars express the API-equivalent cost. With fewer than 30 settled pieces, only large differences are meaningful.
+A row with only open work shows `-` for all rates, costs, timing and billing. Work whose newest attempt failed for a provider, infra or interruption reason is open: it waits for its rerun. Work accepted after an escalation stays in its starting row, so `first_pass` shows how often the starting tier was enough. A failed attempt on settled work contributes its cost, including provider and infra failures and interruptions. Subscription dollars express the API-equivalent cost. With fewer than 30 settled pieces, only large differences are meaningful.
 
 ## How it works
 

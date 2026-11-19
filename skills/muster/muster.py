@@ -50,6 +50,8 @@ USER_PRICES = os.path.expanduser("~/.muster/prices.json")
 # follow the usual slug rule (DNS-1123 label, same as k8s resource names and Docker tags).
 TASK_ID = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
 TIERS = ("low", "standard", "high")
+# Failure kinds that say nothing about the task: rerun at the same tier, and do not count the attempt as a round.
+NOT_TASK = ("provider", "infra", "interrupted")
 
 
 def expand(p):
@@ -807,13 +809,14 @@ def stats(cfg, days=None):
             "settled": 0, "accepted": 0, "open": 0, "first_pass": 0, "attempts": 0, "tokens": 0,
             "usd": 0.0, "priced": False, "unpriced": False, "minutes": [], "billing": set()})
         ok = accepted(newest)
-        if not ok and not newest["status"].startswith("failed:"):
+        # Work whose newest attempt failed for a reason outside the task is waiting for its rerun.
+        if not ok and (not newest["status"].startswith("failed:") or newest["meta"].get("failure") in NOT_TASK):
             g["open"] += 1
             continue
         g["settled"] += 1
         if ok:
             g["accepted"] += 1
-        rounds = [a for a in counted if a["meta"].get("failure") not in ("provider", "interrupted")]
+        rounds = [a for a in counted if a["meta"].get("failure") not in NOT_TASK]
         if ok and len(rounds) == 1 and "Fixed in:" not in newest["review"]:
             g["first_pass"] += 1
         g["attempts"] += len(rounds)
@@ -1318,7 +1321,7 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None, 
         if check:
             append_meta(task, check=f"skipped: the worker reported {stopped}")
         append_meta(task, last_error=reason, log_path=os.path.abspath(os.path.join(task, "result.md")),
-                    failure="task")
+                    failure="blocked")
         finish(task, 1, f"failed: {reason}")
         return 1
     if rc == 0 and check:
@@ -1345,8 +1348,10 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None, 
             f.write(f"\n\nDisk full (ENOSPC). To resume: free space, then rerun this task dir; the worker starts over "
                     f"from prompt.md in the same cwd, so add what is already done to prompt.md first:\n\n"
                     "    " + shlex.join(rerun + (["--tier", tier] if tier else [])) + "\n")
+    # A worker that exits non-zero failed itself (disk, network, server error, crash), not the task: a task
+    # failure shows as a failed check, a BLOCKED report or a review.
     append_meta(task, last_error=reason, log_path=os.path.abspath(where or main_log),
-                failure="provider" if line and PROVIDER.search(line) else "task")
+                failure="provider" if line and PROVIDER.search(line) else "infra")
     finish(task, rc, status)
     return rc
 
