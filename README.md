@@ -195,7 +195,7 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
 | `preamble` | adds the lines to every prompt, then the first matching `routing` entry's `preamble` | only its shape (`doctor`) |
 | `--check` | writes a done check for each task and passes it | runs it after the worker, one at a time per `runsDir`; a failing check fails the task |
 
-When a worker fails, `status` reads `failed: <reason>`: the last error line of its log (secrets such as `sk-…` or `Bearer …` masked, cut to 160 characters), or `exit <code>` when there is none. `meta` keeps it as `last_error`, with the log's path as `log_path`, and the pane shows both. A worker that ran out of disk shows `failed: disk full (ENOSPC), …` and its `result.md` ends with the command to rerun it. A worker that exits 0 but opens its report with `Status: BLOCKED` or `Status: NEEDS_CONTEXT` shows `failed: worker reported BLOCKED` (or `NEEDS_CONTEXT`): its done check is skipped and tasks waiting on it with `--after` are canceled. A failed task also records `failure=`: `provider` when the worker's own error line names a provider problem (usage limit, quota, rate limit, too many requests, HTTP 429/401/403/529, overloaded, billing, credits, access token, unauthorized, authentication, `codex_login`), otherwise `task`; canceled tasks get neither. `failure=provider` means retry on another worker at the same tier; `failure=task` means the work itself failed.
+When a worker fails, `status` reads `failed: <reason>`: the last error line of its log (secrets such as `sk-…` or `Bearer …` masked, cut to 160 characters), or `exit <code>` when there is none. `meta` keeps it as `last_error`, with the log's path as `log_path`, and the pane shows both. A worker that ran out of disk shows `failed: disk full (ENOSPC), …` and its `result.md` ends with the command to rerun it. A worker that exits 0 but opens its report with `Status: BLOCKED` or `Status: NEEDS_CONTEXT` shows `failed: worker reported BLOCKED` (or `NEEDS_CONTEXT`): its done check is skipped and tasks waiting on it with `--after` are canceled. A failed task records `failure=provider` when the worker's own error line names a provider problem (usage limit, quota, rate limit, too many requests, HTTP 429/401/403/529, overloaded, billing, credits, access token, unauthorized, authentication, `codex_login`). Retry on another worker at the same tier. A runner stopped by an outside signal records `failure=interrupted`. Retry at the same tier on the same or another worker. Other task failures record `failure=task`. Canceled tasks have no `failure` key.
 
 </details>
 
@@ -240,13 +240,13 @@ The newest counted attempt determines the outcome. If it is `done` and its metad
 | `accepted` | settled work whose current diff has an `Approved` or `User override` verdict, or a `Needs fixes` verdict on an empty diff, and whose status is `done` |
 | `open` | running or queued work, or completed work awaiting a current review or a requested fix |
 | `first_pass` | share of accepted work that needed no rework and no `Fixed in:` line, or `-` |
-| `attempts_per_work` | mean attempts per settled piece, excluding provider failures |
+| `attempts_per_work` | mean attempts per settled piece, excluding provider failures and interruptions |
 | `median_minutes` | median minutes per settled piece, summing recorded attempt durations for each piece |
 | `tokens_per_accepted` | input plus output tokens across settled work, divided by the accepted count |
 | `usd_per_accepted` | recorded cost across settled work divided by the accepted count, with `≥` when only some attempts have a price and `-` when none do |
 | `billing` | `metered`, `subscription` or `mixed` across settled attempts, or `-` when unknown |
 
-A row with only open work shows `-` for all rates, costs, timing and billing. A failed attempt on settled work contributes its cost, including a provider failure. Subscription dollars express the API-equivalent cost. With fewer than 30 settled pieces, only large differences are meaningful.
+A row with only open work shows `-` for all rates, costs, timing and billing. A failed attempt on settled work contributes its cost, including provider failures and interruptions. Subscription dollars express the API-equivalent cost. With fewer than 30 settled pieces, only large differences are meaningful.
 
 ## How it works
 
