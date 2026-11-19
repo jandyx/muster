@@ -726,6 +726,15 @@ echo "all done" > "$out"
             self.assertEqual((u["model"], u["input"], u["output"], u["billing"]), ("gpt-6-astra", 100, 10, "subscription"))
             self.assertIn("session id: abc", (task / "log.txt").read_text())
 
+    def test_an_error_word_in_the_echoed_prompt_is_not_the_failure(self):
+        # codex copies the prompt into its log; a brief that mentions ENOSPC must not read as a full disk
+        with tempfile.TemporaryDirectory() as d:
+            worker = fake_cli(d, "w", "cat >&2\necho 'ERROR: You hit your usage limit.' >&2\nexit 1\n")
+            task = make_task(d)
+            (task / "prompt.md").write_text("# t\n- Check the ENOSPC path and the error handling.\n")
+            M.run({"runsDir": d, "workers": {"w": {"type": "claude", "command": worker}}}, "w", str(task), d)
+            self.assertEqual((task / "status").read_text().strip(), "failed: ERROR: You hit your usage limit.")
+
     def test_worker_failure_is_recorded(self):
         with tempfile.TemporaryDirectory() as d:
             bad = fake_cli(d, "bad", "cat >/dev/null\necho boom >&2\nexit 7\n")
