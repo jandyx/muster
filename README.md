@@ -217,7 +217,7 @@ Finished runs fold to one line with their totals; a run with work left to review
 - **Metered workers** (an API key, DeepSeek) show billed dollars in green, marked `peak` when they started in DeepSeek's peak hours (weekdays 01:00–04:00 and 06:00–10:00 UTC, double price). The skill warns before sending a large, non-urgent batch into peak hours.
 - **Subscription workers** (Codex on a ChatGPT login) show `≈$`: what the same tokens would cost on the API. You are not billed per token.
 - **Codex is priced per request**, so requests past the long-context threshold use the long-context rate.
-- **Prices** live in [`prices.json`](prices.json) with their source and date. Override any model in `~/.muster/prices.json`.
+- **Prices** live in [`prices.json`](prices.json) with their source and date. Override any model in `~/.muster/prices.json`. `python3 scripts/update_prices.py [model …]` refreshes them from LiteLLM's community price list, the one ccusage uses, and adds the models you name.
 
 The full decision chain is drawn in [docs/how-it-works.md](docs/how-it-works.md#how-a-tasks-cost-is-worked-out).
 

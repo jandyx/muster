@@ -1,5 +1,5 @@
 {
-  "_note": "USD per 1M tokens, checked 2026-11-05 against developers.openai.com/api/docs/pricing (Standard tier) and api-docs.deepseek.com/quick_start/pricing. Prices change: override any entry in ~/.muster/prices.json.",
+  "_note": "USD per 1M tokens, refreshed 2026-11-19 by scripts/update_prices.py from LiteLLM's model_prices_and_context_window.json (OpenAI and DeepSeek entries cite their official pricing pages). Prices change: override any entry in ~/.muster/prices.json.",
   "gpt-6-astra": {
     "input": 10.0,
     "cached": 1.0,
@@ -50,5 +50,27 @@
         10
       ]
     ]
+  },
+  "gpt-6.2-astra": {
+    "input": 8.0,
+    "cached": 0.4,
+    "output": 40.0,
+    "long_context_over": 272000,
+    "long": {
+      "input": 16.0,
+      "cached": 0.8,
+      "output": 60.0
+    }
+  },
+  "gpt-6.1-sol": {
+    "input": 2.0,
+    "cached": 0.1,
+    "output": 10.0,
+    "long_context_over": 272000,
+    "long": {
+      "input": 4.0,
+      "cached": 0.2,
+      "output": 15.0
+    }
   }
 }

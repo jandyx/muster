@@ -33,7 +33,7 @@ claude plugin validate .                  # manifest, hooks module, marketplace
 - New behaviour in `muster.py` gets a test in `tests/test_muster.py`; new pane rows get an assertion in `tests/pane.test.tsx`.
 - When a stored value's shape changes in `hooks/register.tsx`, bump that atom's `shape` tag (`runs-6` → `runs-7`) so old stored values are declined.
 - Colors in the pane are theme keys (`success`, `merged`, …), never hex, so both terminal themes work.
-- Prices in `prices.json` carry their source and check date in `_note`; update both together.
+- Prices in `prices.json` carry their source and check date in `_note`; update both together. `scripts/update_prices.py` does both: run it rather than editing prices by hand, and add a model by naming it.
 - Keep user data out of the repo: no real account names, paths, repos or branches in docs, tests or screenshots. `assets/screenshot.html` is the source of `assets/screenshot.png`.
 - Workers run with approvals off. Do not widen what the runner does without saying so in the README's Safety section.
 
