@@ -175,7 +175,7 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
 
 **Tiers** are optional; without them every task runs with its worker's own settings. `low`, `standard` and `high` are the only names, each with up to three keys:
 
-- `args`: extra CLI arguments by worker name or type (`codex`, `claude`), the name winning, added after the worker's own `args`. Change the model with `["--model", "opus"]` for Claude Code, or `["-c", "model=\"<model>\""]` for Codex. Codex refuses `-m` twice, and `doctor` flags a tier that adds `-m` to a worker that already sets it.
+- `args`: extra CLI arguments by worker name or type (`codex`, `claude`), added after the worker's own `args`. When both keys fit a worker, only the name's list is used; the two are not merged. Change the model with `["--model", "opus"]` for Claude Code, or `["-c", "model=\"<model>\""]` for Codex. Codex refuses `-m` twice, and `doctor` flags a tier that adds `-m` to a worker that already sets it.
 - `prefer`: workers that take the task first when several have a free slot.
 - `when`: one sentence that replaces the skill's rule for picking this tier. A `routing` entry's `tiers.<name>.when` replaces it for those repos.
 
@@ -208,6 +208,24 @@ Claude picks each task's tier; the runner applies `prefer` and `args`. `stats` s
 When a worker fails, `status` reads `failed: <reason>`: the last error line of its log (secrets such as `sk-…` or `Bearer …` masked, cut to 160 characters), or `exit <code>` when there is none. `meta` keeps it as `last_error`, with the log's path as `log_path`, and the pane shows both. A worker that ran out of disk shows `failed: disk full (ENOSPC), …` and its `result.md` ends with the command to rerun it. A worker that exits 0 but opens its report with `Status: BLOCKED` or `Status: NEEDS_CONTEXT` shows `failed: worker reported BLOCKED` (or `NEEDS_CONTEXT`): its done check is skipped and tasks waiting on it with `--after` are canceled. A failed task records `failure=provider` when the worker's own error line names a provider problem (usage limit, quota, rate limit, too many requests, HTTP 429/401/403/529, overloaded, billing, credits, access token, unauthorized, authentication, `codex_login`). Retry on another worker at the same tier. Any other non-zero worker exit (disk full, a dropped connection, a server error, a crash) records `failure=infra`, and a runner stopped by an outside signal records `failure=interrupted`: retry both at the same tier on the same or another worker. After two such failures in a row on one piece of work, Claude stops and asks instead of rerunning again; a context or turn limit counts as the task's failure. A `BLOCKED` or `NEEDS_CONTEXT` report records `failure=blocked`: answer it or split the task; a stronger tier does not help. A failed done check records `failure=task`. Canceled tasks have no `failure` key.
 
 </details>
+
+### How settings combine
+
+Your words in the conversation win over the config ("run this on deepseek", "make it high"), except for the limits the runner enforces. For one task, in order:
+
+| Step | Rule | Who |
+|---|---|---|
+| Config file | `MUSTER_CONFIG` if set, else `~/.muster/config.json` | both |
+| Candidate workers | the workers you name; otherwise the **first** `routing` entry whose `match` fits the cwd, so put narrow globs (`~/work/app-ios*`) above broad ones (`~/work/app-*`) and `*` last | Claude |
+| Fences | `only` removes workers fenced away from the cwd, even ones you named; none left is a refusal (exit 3) | runner |
+| Tier | the tier you name; otherwise the matching `routing` entry's `tiers.<name>.when`, then `tiers.<name>.when`, then the skill's default rule | Claude |
+| Order | the tier's `prefer` moves listed workers to the front; it never adds a worker | runner |
+| Start | the first listed worker under its cap takes the task; `caps.<name>` wins over `caps.<type>`, default 3 for `codex` and 5 for `claude`; on a full worker, higher `--priority` starts first, then launch order | runner |
+| Arguments | later wins: the CLI's own settings (a Codex home's `config.toml`, a wrapper's defaults), then the worker's `args`, then the tier's `args`. Codex refuses `-m` twice, so `doctor` flags it | runner |
+| Prompt rules | added, never replaced: global `preamble`, then the matching `routing` entry's `preamble`, then repo rules from your own instructions, which Claude copies into the brief | Claude |
+| Prices | `~/.muster/prices.json` replaces the plugin's `prices.json` model by model | runner |
+
+Example, with the config above: a `low` task in `~/workspace/work-app` matches the first `routing` entry (`codex-work`, `codex`, `deepseek`); `only` keeps all three; `low` moves `deepseek` to the front. It starts on `deepseek` when that has a free slot, otherwise on the first Codex worker with one; on `codex-work` that means `-m gpt-6-astra` from its own `args` plus `low`'s reasoning effort. Its prompt carries the global `preamble` and the entry's pull-request line.
 
 ## The pane
 
