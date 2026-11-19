@@ -377,8 +377,10 @@ def free_gb(path):
 
 ERROR_LINE = re.compile(r"ENOSPC|no space left on device|error|panic|traceback|quota|rate.?limit", re.I)
 # A failure of the provider, not of the task: rerunning on another worker at the same tier is the right response.
-PROVIDER = re.compile(r"usage limit|quota|rate.?limit|too many requests|\b(?:429|401|403|529)\b|overloaded|billing|"
-                      r"credits|access token|unauthorized|authentication|codex_login", re.I)
+PROVIDER = re.compile(r"usage limit|quota|rate.?limit|too many requests|"
+                      r"\b(?:HTTP|status|code)\W{0,3}(?:429|401|403|529)\b|"
+                      r"\b(?:429|401|403|529)\s+(?:too many|unauthori|forbidden|overloaded)|"
+                      r"overloaded|billing|credits|access token|unauthorized|authentication|codex_login", re.I)
 ENOSPC = re.compile(r"ENOSPC|no space left on device", re.I)
 SECRET = re.compile(r"(?i)\b(bearer\s+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*)\S+"
                     r"|\b(sk-|xox[a-z]?-|ghp_|gho_|ghs_|github_pat_)[A-Za-z0-9_\-]+")
@@ -811,7 +813,7 @@ def stats(cfg, days=None):
         g["settled"] += 1
         if ok:
             g["accepted"] += 1
-        rounds = [a for a in counted if a["meta"].get("failure") != "provider"]  # a provider failure is not rework
+        rounds = [a for a in counted if a["meta"].get("failure") not in ("provider", "interrupted")]
         if ok and len(rounds) == 1 and "Fixed in:" not in newest["review"]:
             g["first_pass"] += 1
         g["attempts"] += len(rounds)
@@ -1103,7 +1105,7 @@ def on_stop(task):
                     continue
         reason = read_meta(task).get("canceled")
         if reason is None:
-            append_meta(task, failure="task")
+            append_meta(task, failure="interrupted")
             finish(task, 128 + signum, f"failed: interrupted ({signal.Signals(signum).name})")
         else:
             finish(task, 128 + signum, f"canceled: {reason}" if reason else "canceled")

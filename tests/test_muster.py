@@ -374,6 +374,7 @@ class Run(unittest.TestCase):
             self.assertEqual(p.wait(timeout=20), 128 + signal.SIGTERM)
             self.assertEqual((task / "status").read_text().strip(), "failed: interrupted (SIGTERM)")
             self.assertIn("finished=", (task / "meta").read_text())
+            self.assertEqual(M.read_meta(str(task))["failure"], "interrupted")
 
 
 class Guards(unittest.TestCase):
@@ -1207,9 +1208,11 @@ class FailureKind(unittest.TestCase):
     def test_the_provider_pattern_covers_provider_errors_only(self):
         for text in ("usage limit reached", "Quota exceeded", "rate limit", "too many requests", "HTTP 429",
                      "401 Unauthorized", "status 403", "529 overloaded", "billing problem", "no credits left",
-                     "access token expired", "unauthorized", "authentication failed", "codex_login"):
+                     "access token expired", "unauthorized", "authentication failed", "codex_login",
+                     "error code: 429", "STATUS =403", "HTTP401", "403 Forbidden", "401 Unauthorised", "429 too many"):
             self.assertTrue(M.PROVIDER.search(text), text)
-        for text in ("ValueError: bad input", "2 tests failed", "ENOSPC: no space left on device"):
+        for text in ("ValueError: bad input", "2 tests failed", "ENOSPC: no space left on device",
+                     "AssertionError: expected 401, got 200", "line 403 of file", "took 529 ms", "status....429"):
             self.assertFalse(M.PROVIDER.search(text), text)
 
 
@@ -1280,18 +1283,19 @@ class Stats(unittest.TestCase):
             self.assertIn("API-equivalent", out)
             self.assertIn("small samples", out)
 
-    def test_provider_failure_then_success_is_first_pass_and_cost_counts(self):
-        with tempfile.TemporaryDirectory() as d:
-            run = "20261118-1000-run"
-            self.add(d, run, "A", status="failed: usage limit", failure="provider", sha="", review="",
-                     usage=self.usage(10, 5, 2.0))
-            self.add(d, run, "A-r2", sha="s2", retry_of=f"{run}/A", started="2026-11-18 10:20:00",
-                     finished="2026-11-18 10:30:00", usage=self.usage(20, 5, 1.0),
-                     review="Verdict: Approved\nchanges-sha256: s2\n")
-            row = self.table(M.stats({"runsDir": d}))[0]
-            self.assertEqual((row["settled"], row["accepted"], row["first_pass"], row["attempts_per_work"]),
-                             ("1", "1", "100%", "1.0"))
-            self.assertEqual((row["tokens_per_accepted"], row["usd_per_accepted"]), ("40", "3.00"))
+    def test_provider_failure_or_interruption_then_success_is_first_pass_and_cost_counts(self):
+        for failure, reason in (("provider", "usage limit"), ("interrupted", "interrupted (SIGTERM)")):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as d:
+                run = "20261118-1000-run"
+                self.add(d, run, "A", status=f"failed: {reason}", failure=failure, sha="", review="",
+                         usage=self.usage(10, 5, 2.0))
+                self.add(d, run, "A-r2", sha="s2", retry_of=f"{run}/A", started="2026-11-18 10:20:00",
+                         finished="2026-11-18 10:30:00", usage=self.usage(20, 5, 1.0),
+                         review="Verdict: Approved\nchanges-sha256: s2\n")
+                row = self.table(M.stats({"runsDir": d}))[0]
+                self.assertEqual((row["settled"], row["accepted"], row["first_pass"], row["attempts_per_work"]),
+                                 ("1", "1", "100%", "1.0"))
+                self.assertEqual((row["tokens_per_accepted"], row["usd_per_accepted"]), ("40", "3.00"))
 
     def test_a_canceled_attempt_or_one_that_never_started_does_not_change_the_result(self):
         with tempfile.TemporaryDirectory() as d:
