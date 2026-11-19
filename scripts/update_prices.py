@@ -36,6 +36,8 @@ def hours(span):
     if not hit:
         raise ValueError(f"off-peak window {span!r} is not on whole hours")
     a, b = int(hit[1]), int(hit[2]) or 24
+    if b <= a:
+        raise ValueError(f"off-peak window {span!r} crosses midnight")
     return set(range(a, b))
 
 
@@ -71,6 +73,8 @@ def convert(e):
         entry["long_context_over"] = int(k) * 1000
         entry["long"] = rates(e, f"_above_{k}k_tokens")
     off = e.get("off_peak_pricing")
+    if off and long:
+        raise ValueError("long-context and off-peak prices together")
     if off:
         # LiteLLM's base price is the peak price; prices.json keeps the off-peak price as the base.
         entry = {**rates(off), "peak": entry, "peak_utc_weekdays": peak_ranges(off["windows"])}
@@ -91,7 +95,7 @@ def main(argv):
             if not e or "input_cost_per_token" not in e:
                 raise ValueError("not priced in LiteLLM")
             new = convert(e)
-        except (KeyError, ValueError) as err:
+        except (KeyError, ValueError, TypeError) as err:
             print(f"{name}: kept, {err}")
             failed += 1
             continue
@@ -99,14 +103,17 @@ def main(argv):
             print(f"{name}: {json.dumps(prices.get(name))} -> {json.dumps(new)}")
             prices[name] = new
             changed += 1
-    if changed and not dry:
+    if not dry:
         today = datetime.date.today().isoformat()
-        prices["_note"] = (f"USD per 1M tokens, refreshed {today} by scripts/update_prices.py from LiteLLM's "
-                           f"model_prices_and_context_window.json (OpenAI and DeepSeek entries cite their official "
-                           f"pricing pages). Prices change: override any entry in ~/.muster/prices.json.")
-        with open(PRICES, "w") as f:
+        prices["_note"] = (f"USD per 1M tokens, standard tier, checked {today} by scripts/update_prices.py against "
+                           f"LiteLLM's model_prices_and_context_window.json, whose entries cite each provider's "
+                           f"pricing page. Prices change: override any entry in ~/.muster/prices.json.")
+        # Write beside the file and swap it in, so an interrupted run never leaves a truncated prices.json.
+        tmp = PRICES + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(prices, f, indent=2, ensure_ascii=False)
             f.write("\n")
+        os.replace(tmp, PRICES)
     print(f"{changed} changed, {failed} kept" + (" (dry run)" if dry else ""))
     return 1 if failed else 0
 
