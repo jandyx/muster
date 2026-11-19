@@ -15,6 +15,7 @@ Start with the [README](../README.md) to install and use Muster. These pages go 
 |---|---|
 | Install and first run | [README: Quick start](../README.md#quick-start) |
 | Config keys: workers, routing, `only`, `caps`, tiers, preamble | [README: Configure](../README.md#configure), [example config](../examples/config.example.json) |
+| Which setting wins: routing order, fences, tiers, arguments, prompt rules | [README: How settings combine](../README.md#how-settings-combine) |
 | Set up by asking Claude | the [`muster-setup` skill](../skills/muster-setup/SKILL.md) |
 | The dispatch loop Claude follows | the [`muster` skill](../skills/muster/SKILL.md) |
 | The pane and band | [README: The pane](../README.md#the-pane) |
