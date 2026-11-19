@@ -761,11 +761,12 @@ const waitingTree = (extra: Record<string, string> = {}) => {
 }
 
 test('the Stop hook joins its reminder to a block from a lower hook', async ($, on) => {
-  on('classic.Stop', () => ({ block: 'lower says stop' }))
+  on('classic.Stop', () => ({ block: 'lower says stop', additionalContext: ['lower hook context'] }))
   await mountWith($, on, waitingTree())
   const r: any = await $.classic.Stop({ stop_hook_active: false, session_id: 'S1' } as any)
   expect(r.block).toContain('lower says stop')
   expect(r.block).toContain('Muster: finished tasks')
+  expect(r.additionalContext).toEqual(['lower hook context'])
 })
 
 test('the Stop hook waits while subagents or workflows run, without using the reminder up', async ($, on) => {
