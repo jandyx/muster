@@ -208,7 +208,7 @@ Above the runs, **Claude agents** lists the subagents this Claude Code session s
 | `e` · `c` | expand all · collapse all |
 | `esc` | back to the prompt |
 
-Inside a run, tasks are grouped as Running, Queued, Failed, Needs fixes, Needs review, Canceled and Done; earlier attempts of reworked tasks fold under Retried. A task that changed nothing counts as a finished read-only review once `review.md` covers it, whatever its verdict. Done holds only reviewed work (and older tasks with no recorded diff); the `status` file still says `done` for the others, because the worker and its check succeeded.
+Inside a run, tasks are grouped as Running, Queued, Failed, Needs fixes, Needs review, Canceled and Done; earlier attempts of reworked tasks fold under Retried. A task that changed nothing counts as a finished read-only review once `review.md` covers it, whatever its verdict. Done holds only reviewed work (and older tasks with no recorded diff); the `status` file still says `done` for the others, because the worker and its check succeeded. When a run has stopped working and tasks in it still wait for review or fixes, the session that dispatched it is sent back once per task at the end of its turn; a closed session is not reopened.
 
 Finished runs fold to one line with their totals; a run with work left to review or fix stays open. A toast tells you when a task ends. Each worker keeps one color everywhere, and each task names the model it ran on (with its reasoning effort for Codex).
 

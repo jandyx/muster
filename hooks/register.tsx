@@ -16,6 +16,8 @@ const agentsAtom = atom({ plugin: 'muster', key: 'agents' } as const, [] as Agen
 // folds once nothing in it runs; a section without one stays open.
 const foldsAtom = atom({ plugin: 'muster', key: 'folds' } as const, {}, { shape: 'folds-1' })
 const notifiedAtom = atom({ plugin: 'muster', key: 'notified' } as const, [], { shape: 'notified-1' })
+// Tasks the dispatching session was already sent back for, so each is reminded once.
+const remindedAtom = atom({ plugin: 'muster', key: 'reminded' } as const, [], { shape: 'reminded-1' })
 
 // Cells in the band's overall progress bar.
 const BAND_BAR = 8
@@ -336,6 +338,9 @@ export const register: Register = on => {
   // the agent calls a tool again. Never stored, so a busy fleet costs no state writes.
   const agentActs = new Map<string, string>()
 
+  // runsAtom lags by up to POLL_MS; the Stop hook refreshes it so a review.md written just before the turn ended counts.
+  let refreshRuns = async () => {}
+
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'muster-panel', description: 'Open the Muster pane' })
     const home = (await $.env.get('HOME')) ?? ''
@@ -357,6 +362,7 @@ export const register: Register = on => {
     // Runs are bound to the session that dispatched them (muster.py records it).
     // Unknown session id: show everything, as before.
     let sessionId = ''
+    // shortcut: a run belongs to the session that owns its first task's meta, so a task another session launched into it is not reminded there; upgrade if sessions start sharing runs.
     const isMine = (run: Run) => !sessionId || run.tasks.some(t => t.session === sessionId)
 
     const readText = (path: string) => $.fs.read(path).then(t => (typeof t === 'string' ? t : ''), () => '')
@@ -549,6 +555,7 @@ export const register: Register = on => {
         void $.ui.open({ id: PANE, title: TITLE })
       }
     }
+    refreshRuns = poll
 
     // The band above the prompt replaced the status line; clear what an older version pinned.
     $.ui.status(undefined)
@@ -556,6 +563,30 @@ export const register: Register = on => {
     void poll()
 
     return next(e)
+  })
+
+  // Reviewing is the dispatching session's job, and nothing else wakes it for that. Send it back once per task, only
+  // when its run has stopped working, so a session that chooses to leave a task open is not nagged every turn.
+  on('classic.Stop', async ($, e, next) => {
+    if (e.stop_hook_active) return next(e)
+    // Subagents or workflows still in flight will wake the session again; keep the one reminder for then.
+    if (e.background_tasks?.some(t => t.type === 'subagent' || t.type === 'workflow')) return next(e)
+    await refreshRuns()
+    const runs = await read($, runsAtom)
+    const attempts = lineage(runs)
+    const seen = new Set(await read($, remindedAtom))
+    const waiting = runs
+      .filter(r => !r.tasks.some(t => isActive(t) && t.status !== 'pending'))
+      .flatMap(r => r.tasks.filter(t => t.session === e.session_id && attempts.latest.has(t) && needsAttention(t)).map(t => ({ key: `${r.name}/${t.id}`, review: t.review })))
+      .filter(w => !seen.has(w.key))
+    if (waiting.length === 0) return next(e)
+    const result = await next(e)
+    if (result.preventContinuation) return result
+    await update($, remindedAtom, old => [...old, ...waiting.map(w => w.key)].slice(-500))
+    const list = waiting.map(w => `- ${w.key}: ${w.review}`).join('\n')
+    const text = `Muster: finished tasks from this session still wait for you:\n${list}\nFollow step 6 of the muster skill now: review each one and record review.md, or launch its fix. If one needs the user's decision, say which and why. This reminder comes once per task.`
+    // Our block would replace a lower hook's, so join them.
+    return { ...result, block: result.block ? `${result.block}\n\n${text}` : text }
   })
 
   // Starting a batch ("/muster …", "muster: …") opens the pane too. Opened from the person's own prompt,

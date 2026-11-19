@@ -729,3 +729,72 @@ test('each task shows the model it ran on, from meta when done and from the log 
   expect((await ui.find({ type: 'Text', text: /DONE_WITH_CONCERNS/ }))?.text).toBeTruthy()
   await ui.unmount()
 })
+
+test('the Stop hook sends the session back once per waiting task, and only for its own settled runs', async ($, on) => {
+  const sha = 'd'.repeat(64)
+  const meta = `changes=1 files +1 -0\nchanges_sha256=${sha}\n`
+  const other = { ...task('done', meta), meta: task('done', meta).meta.replace('session=S1', 'session=S2') }
+  const t = tree('/h/.muster/runs', {
+    '20261119-1000-wait': { rev: task('done', meta), fix: task('done', meta), ok: task('done', meta), foreign: other },
+    '20261119-1100-busy': { idle: task('done', meta), live: task('running') },
+    '20261119-1200-redo': { x: task('done', meta), 'x-r2': task('done', meta) },
+  })
+  const dir = '/h/.muster/runs/20261119-1000-wait'
+  t[`${dir}/fix/review.md`] = `Verdict: Needs fixes\nchanges-sha256: ${sha}\n`
+  t[`${dir}/ok/review.md`] = `Verdict: Approved\nchanges-sha256: ${sha}\n`
+  t['/h/.muster/runs/20261119-1200-redo/x-r2/review.md'] = `Verdict: Approved\nchanges-sha256: ${sha}\n`
+  on('classic.Stop', () => ({}))
+  await mountWith($, on, t)
+  const first: any = await $.classic.Stop({ stop_hook_active: true, session_id: 'S1' } as any)
+  expect(first.block).toBeUndefined()
+  const second: any = await $.classic.Stop({ stop_hook_active: false, session_id: 'S1' } as any)
+  expect(second.block).toContain('- 20261119-1000-wait/rev: needs review')
+  expect(second.block).toContain('- 20261119-1000-wait/fix: needs fixes')
+  expect(second.block).not.toMatch(/ok:|foreign|busy|redo/)
+  const third: any = await $.classic.Stop({ stop_hook_active: false, session_id: 'S1' } as any)
+  expect(third.block).toBeUndefined()
+})
+
+const waitingTree = (extra: Record<string, string> = {}) => {
+  const meta = `changes=1 files +1 -0\nchanges_sha256=${'d'.repeat(64)}\n`
+  return { ...tree('/h/.muster/runs', { '20261119-1000-wait': { rev: task('done', meta) } }), ...extra }
+}
+
+test('the Stop hook joins its reminder to a block from a lower hook', async ($, on) => {
+  on('classic.Stop', () => ({ block: 'lower says stop' }))
+  await mountWith($, on, waitingTree())
+  const r: any = await $.classic.Stop({ stop_hook_active: false, session_id: 'S1' } as any)
+  expect(r.block).toContain('lower says stop')
+  expect(r.block).toContain('Muster: finished tasks')
+})
+
+test('the Stop hook waits while subagents or workflows run, without using the reminder up', async ($, on) => {
+  on('classic.Stop', () => ({}))
+  await mountWith($, on, waitingTree())
+  const busy: any = await $.classic.Stop({
+    stop_hook_active: false,
+    session_id: 'S1',
+    background_tasks: [{ id: 'x', type: 'subagent', status: 'running', description: 'r' }],
+  } as any)
+  expect(busy.block).toBeUndefined()
+  const later: any = await $.classic.Stop({ stop_hook_active: false, session_id: 'S1', background_tasks: [] } as any)
+  expect(later.block).toContain('20261119-1000-wait/rev')
+})
+
+test('the Stop hook does not remind when a lower hook prevents continuing, and keeps the reminder', async ($, on) => {
+  let prevent = true
+  on('classic.Stop', () => (prevent ? { preventContinuation: true } : {}))
+  await mountWith($, on, waitingTree())
+  const first: any = await $.classic.Stop({ stop_hook_active: false, session_id: 'S1' } as any)
+  expect(first.block).toBeUndefined()
+  prevent = false
+  const second: any = await $.classic.Stop({ stop_hook_active: false, session_id: 'S1' } as any)
+  expect(second.block).toContain('20261119-1000-wait/rev')
+})
+
+test('the Stop hook still reminds when the run holds a pending task', async ($, on) => {
+  on('classic.Stop', () => ({}))
+  await mountWith($, on, waitingTree({ '/h/.muster/runs/20261119-1000-wait/queued/prompt.md': '# queued\n' }))
+  const r: any = await $.classic.Stop({ stop_hook_active: false, session_id: 'S1' } as any)
+  expect(r.block).toContain('20261119-1000-wait/rev')
+})
