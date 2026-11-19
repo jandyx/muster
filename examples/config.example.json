@@ -25,6 +25,11 @@
     "codex-work": ["~/workspace/work-*"]
   },
   "caps": { "codex": 3, "claude": 5 },
+  "tiers": {
+    "low":      { "prefer": ["deepseek"], "args": { "codex": ["-c", "model_reasoning_effort=\"medium\""] } },
+    "standard": { "args": { "codex": ["-c", "model_reasoning_effort=\"high\""] } },
+    "high":     { "args": { "codex": ["-c", "model_reasoning_effort=\"xhigh\""] } }
+  },
   "preamble": [
     "Never print secrets or tokens in your output."
   ]

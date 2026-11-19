@@ -2,6 +2,7 @@
 """Muster worker runner: run one task on one configured worker and record what happened.
 
     muster.py run <worker[,worker…]> <task-dir> <cwd> [--after A,B] [--priority N] [--check CMD] [--retry-of TASK-DIR]
+                                              [--tier low|standard|high]
                                               queue until deps are done and one of the workers has a free slot
                                               (first in the list wins a tie), then run prompt.md on it; then run
                                               CMD (sh -c, in cwd) and fail the task if it fails;
@@ -14,6 +15,9 @@
     muster.py clean [--days N]                list what could be removed (runs untouched for N days, default 14;
                                               task worktrees; muster/* branches) with the command for each; deletes
                                               nothing
+    muster.py stats [--days N]                show settled, accepted and open work by tier, worker and model;
+                                              compute rates and costs over settled work only. --days N limits
+                                              the run folders by age. Reads only.
     muster.py workers                         list configured workers
     muster.py detect                          JSON: Codex homes and claude-like CLIs found on this machine
     muster.py doctor                          check the config; exit 1 when something is wrong
@@ -32,6 +36,7 @@ import re
 import shutil
 import shlex
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -44,6 +49,7 @@ USER_PRICES = os.path.expanduser("~/.muster/prices.json")
 # Task ids are directory names and triple as the pane label, `--after` name and worktree branch suffix, so they
 # follow the usual slug rule (DNS-1123 label, same as k8s resource names and Docker tags).
 TASK_ID = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+TIERS = ("low", "standard", "high")
 
 
 def expand(p):
@@ -78,6 +84,22 @@ def load_config():
     if not isinstance(cfg, dict):
         sys.exit(f"muster: {CONFIG} must hold a JSON object")
     return cfg
+
+
+def tier_config(cfg, name):
+    """The settings for `--tier name`; exits when the name is unknown or the config has no such tier."""
+    if name not in TIERS:
+        sys.exit(f"muster: --tier {name}: expected one of {', '.join(TIERS)}")
+    tiers = cfg.get("tiers") or {}
+    if name not in tiers:
+        sys.exit(f"muster: --tier {name}: no tiers.{name} in {CONFIG}")
+    return tiers[name]
+
+
+def tier_args(tier, name, kind):
+    """A tier's extra arguments for this worker: the worker's own key wins over its type's, as caps do."""
+    args = (tier or {}).get("args") or {}
+    return args.get(name, args.get(kind, []))
 
 
 def load_prices():
@@ -354,6 +376,9 @@ def free_gb(path):
 
 
 ERROR_LINE = re.compile(r"ENOSPC|no space left on device|error|panic|traceback|quota|rate.?limit", re.I)
+# A failure of the provider, not of the task: rerunning on another worker at the same tier is the right response.
+PROVIDER = re.compile(r"usage limit|quota|rate.?limit|too many requests|\b(?:429|401|403|529)\b|overloaded|billing|"
+                      r"credits|access token|unauthorized|authentication|codex_login", re.I)
 ENOSPC = re.compile(r"ENOSPC|no space left on device", re.I)
 SECRET = re.compile(r"(?i)\b(bearer\s+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*)\S+"
                     r"|\b(sk-|xox[a-z]?-|ghp_|gho_|ghs_|github_pat_)[A-Za-z0-9_\-]+")
@@ -449,7 +474,7 @@ def detect():
             "config_exists": os.path.isfile(CONFIG)}
 
 
-KEYS = {"": {"runsDir", "workers", "routing", "only", "caps", "preamble"},
+KEYS = {"": {"runsDir", "workers", "routing", "only", "caps", "tiers", "preamble"},
         "worker": {"type", "command", "args", "codexHome", "billing"},
         "route": {"match", "workers", "preamble"}}
 
@@ -538,6 +563,35 @@ def doctor(cfg):
             probs.append(f"caps.{k}: not a worker name or type")
         elif not isinstance(v, int) or isinstance(v, bool) or v < 1:
             probs.append(f"caps.{k}: {v!r}, expected a whole number of at least 1")
+    tiers = cfg.get("tiers") or {}
+    if not isinstance(tiers, dict):
+        probs.append("tiers: expected an object of tier -> settings")
+        tiers = {}
+    for name, t in tiers.items():
+        if name.startswith("_"):
+            continue
+        if name not in TIERS:
+            probs.append(f"tiers.{name}: unknown tier (expected one of {', '.join(TIERS)})")
+            continue
+        if not isinstance(t, dict):
+            probs.append(f"tiers.{name}: expected an object")
+            continue
+        for k in t:
+            if k not in ("prefer", "args") and not k.startswith("_"):
+                probs.append(f"tiers.{name}.{k}: unknown key (expected args, prefer)")
+        prefer = t.get("prefer")
+        if prefer is not None and not (isinstance(prefer, list)
+                                       and all(isinstance(w, str) and w in workers for w in prefer)):
+            probs.append(f"tiers.{name}.prefer: expected a list of known worker names")
+        args = t.get("args")
+        if args is not None and not isinstance(args, dict):
+            probs.append(f"tiers.{name}.args: expected an object of worker or type -> arguments")
+        elif args:
+            for k, v in args.items():
+                if k not in workers and k not in ("codex", "claude"):
+                    probs.append(f"tiers.{name}.args.{k}: not a worker name or type")
+                if not (isinstance(v, list) and strings(v)):
+                    probs.append(f"tiers.{name}.args.{k}: expected a list of strings")
     return probs
 
 
@@ -646,6 +700,160 @@ def clean(cfg, days=14):
     lines.append("\nNothing was deleted. Lines starting with a command are safe to run; '# keep or check first' ones "
                  "hold work that is not in the trunk or not committed. Snapshot objects from changes.diff need no "
                  "cleanup: git's gc drops them.")
+    return "\n".join(lines)
+
+
+# ---------- stats ----------
+
+VERDICT = re.compile(r"^\W*Verdict\W*:\W*(.*?)\W*$", re.I | re.M)
+
+
+def stats(cfg, days=None):
+    """What each tier, worker and model delivered, read from the run folders. Reads only; writes nothing.
+    Attempts of one piece of work are joined as the pane joins them (`retry_of`, then `x`/`x-r2` naming)."""
+    runs = expand(cfg.get("runsDir", "~/.muster/runs"))
+    today = datetime.date.today()
+
+    def text(path):
+        try:
+            return read_text(path)
+        except OSError:
+            return ""
+
+    def when(value):
+        try:
+            return datetime.datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            return None
+
+    def number(value):
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    attempts = {}
+    for run in sorted(os.listdir(runs)) if os.path.isdir(runs) else []:
+        d = os.path.join(runs, run)
+        if not os.path.isdir(d):
+            continue
+        if days is not None:
+            hit = re.match(r"(\d{8})", run)
+            try:
+                date = datetime.datetime.strptime(hit[1], "%Y%m%d").date() if hit else None
+            except ValueError:
+                date = None
+            if date is None or (today - date).days >= days:
+                continue
+        for tid in sorted(os.listdir(d)):
+            t = os.path.join(d, tid)
+            if not os.path.isdir(t):
+                continue
+            meta = read_meta(t)
+            status = text(os.path.join(t, "status")).strip()
+            usage = load_json(os.path.join(t, "usage"), None)
+            key = f"{run}/{tid}"
+            attempts[key] = {
+                "key": key, "id": tid, "run": run, "meta": meta, "status": status,
+                "usage": usage if isinstance(usage, dict) else None,
+                "review": text(os.path.join(t, "review.md")),
+                "started": when(meta.get("started")), "finished": when(meta.get("finished")),
+                # A canceled attempt or one that never started is not part of the record.
+                "counted": not status.startswith("canceled") and bool(meta.get("started")),
+            }
+
+    def trace(a, seen):
+        parent = attempts.get(a["meta"].get("retry_of", ""))
+        if parent and parent["key"] not in seen:  # `seen` stops a hand-edited retry_of loop
+            work, rnd = trace(parent, seen | {parent["key"]})
+            return work, rnd + 1
+        hit = re.match(r"^(.*)-r(\d+)$", a["id"])
+        return f"{a['run']}/{hit[1] if hit else a['id']}", int(hit[2]) if hit else 1
+
+    works = {}
+    for a in attempts.values():
+        work, a["round"] = trace(a, {a["key"]})
+        works.setdefault(work, []).append(a)
+
+    def accepted(a):
+        # The pane's rules: the last Verdict line counts, and only when review.md names the current diff.
+        if a["status"] != "done" or "changes" not in a["meta"]:
+            return False
+        verdicts = VERDICT.findall(a["review"])
+        verdict = (verdicts[-1] if verdicts else "").lower()
+        m = a["meta"]
+        covers = not m.get("changes_sha256") or m["changes_sha256"] in a["review"]
+        fixes = verdict == "needs fixes" and covers
+        return (verdict in ("approved", "user override") and covers) or \
+            (fixes and (m.get("changes") or "").startswith("0 files"))
+
+    groups = {}
+    legacy = 0
+    for items in works.values():
+        counted = [a for a in items if a["counted"]]
+        if not counted:
+            continue
+        newest = max(counted, key=lambda a: (a["round"], a["started"] or datetime.datetime.min))
+        if newest["status"] == "done" and "changes" not in newest["meta"]:
+            legacy += 1
+            continue
+        first = min(counted, key=lambda a: (a["started"] or datetime.datetime.min, a["round"]))
+        tier, worker = first["meta"].get("tier") or "-", first["meta"].get("worker") or "-"
+        model = first["meta"].get("model") or (first["usage"] or {}).get("model")
+        model = model if isinstance(model, str) and model else "-"  # malformed usage may hold anything
+        g = groups.setdefault((tier, worker, model), {
+            "settled": 0, "accepted": 0, "open": 0, "first_pass": 0, "attempts": 0, "tokens": 0,
+            "usd": 0.0, "priced": False, "unpriced": False, "minutes": [], "billing": set()})
+        ok = accepted(newest)
+        if not ok and not newest["status"].startswith("failed:"):
+            g["open"] += 1
+            continue
+        g["settled"] += 1
+        if ok:
+            g["accepted"] += 1
+        rounds = [a for a in counted if a["meta"].get("failure") != "provider"]  # a provider failure is not rework
+        if ok and len(rounds) == 1 and "Fixed in:" not in newest["review"]:
+            g["first_pass"] += 1
+        g["attempts"] += len(rounds)
+        for a in counted:
+            u = a["usage"] or {}
+            g["tokens"] += number(u.get("input")) + number(u.get("output"))
+            if isinstance(u.get("usd"), (int, float)) and not isinstance(u.get("usd"), bool):
+                g["usd"] += u["usd"]
+                g["priced"] = True
+            else:
+                g["unpriced"] = True
+            if u.get("billing") in ("metered", "subscription"):
+                g["billing"].add(u["billing"])
+        spent = [(a["finished"] - a["started"]).total_seconds() / 60 for a in counted
+                 if a["started"] and a["finished"]]
+        if spent:
+            g["minutes"].append(sum(spent))
+
+    header = ("tier", "worker", "model", "settled", "accepted", "open", "first_pass", "attempts_per_work",
+              "median_minutes", "tokens_per_accepted", "usd_per_accepted", "billing")
+    order = {"low": 0, "standard": 1, "high": 2, "-": 3}
+    lines = ["\t".join(header)]
+    for key in sorted(groups, key=lambda k: (order.get(k[0], 4), k[1], k[2])):
+        g = groups[key]
+        ok = g["accepted"]
+        usd = "-"
+        if ok and g["priced"]:
+            usd = ("≥" if g["unpriced"] else "") + f"{g['usd'] / ok:.2f}"
+        lines.append("\t".join([
+            key[0], key[1], key[2], str(g["settled"]), str(ok), str(g["open"]),
+            f"{100 * g['first_pass'] / ok:.0f}%" if ok else "-",
+            f"{g['attempts'] / g['settled']:.1f}" if g["settled"] else "-",
+            f"{statistics.median(g['minutes']):.1f}" if g["minutes"] else "-",
+            str(round(g["tokens"] / ok)) if ok else "-",
+            usd,
+            next(iter(g["billing"])) if len(g["billing"]) == 1 else "mixed" if g["billing"] else "-",
+        ]))
+    lines.append("Subscription dollars are API-equivalent, not money paid.")
+    if legacy:
+        lines.append(f"{legacy} pieces of work from before reviews were recorded are left out.")
+    if any(g["settled"] < 30 for g in groups.values()):
+        lines.append("Rows with fewer than 30 settled pieces of work are small samples: only large differences are meaningful.")
     return "\n".join(lines)
 
 
@@ -895,6 +1103,7 @@ def on_stop(task):
                     continue
         reason = read_meta(task).get("canceled")
         if reason is None:
+            append_meta(task, failure="task")
             finish(task, 128 + signum, f"failed: interrupted ({signal.Signals(signum).name})")
         else:
             finish(task, 128 + signum, f"canceled: {reason}" if reason else "canceled")
@@ -997,12 +1206,13 @@ def retry_ref(task, target):
     return f"{os.path.basename(os.path.dirname(old))}/{os.path.basename(old)}"
 
 
-def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None):
+def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None, tier=None):
     # `names`: one worker or several ("a,b"); the task waits for whichever frees a slot first.
     names = [n for n in (names.split(",") if isinstance(names, str) else names) if n]
     for name in names:
         if name not in cfg["workers"]:
             sys.exit(f"muster: unknown worker {name!r} (known: {', '.join(cfg['workers'])})")
+    t = tier_config(cfg, tier) if tier else None  # before anything is written
     prompt = os.path.join(task, "prompt.md")
     if not os.path.isfile(prompt) or not os.path.isdir(cwd):
         sys.exit(f"muster: need {prompt} and an existing cwd {cwd}")
@@ -1020,6 +1230,10 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None):
     if not names:
         limits = "; ".join(f"{n} to {cfg['only'][n]}" for n in fenced)
         return refuse(task, f"`only` limits {limits}; {cwd} is outside", 3)
+    if t:
+        # `prefer` moves listed workers to the front, after the fence; a stable sort adds nothing and keeps order.
+        prefer = t.get("prefer") or []
+        names = sorted(names, key=lambda n: n not in prefer)
     try:
         if read_text(os.path.join(task, "status")).startswith("canceled"):
             return 0  # canceled before its runner started
@@ -1030,7 +1244,8 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None):
     # `worker` and `type` are written when the task starts; until then `workers` lists where it may go.
     with open(os.path.join(task, "meta"), "w") as f:
         f.write(f"workers={','.join(names)}\ncwd={cwd}\nsession={os.environ.get('CLAUDE_CODE_SESSION_ID', '')}\n"
-                f"pid={os.getpid()}\nqueued={now()}\nafter={','.join(after)}\npriority={priority}\nretry_of={retried}\n")
+                f"pid={os.getpid()}\nqueued={now()}\nafter={','.join(after)}\npriority={priority}\nretry_of={retried}\n"
+                f"tier={tier or ''}\n")
     write_status(task, "queued")
     on_stop(task)
     shown, name = "queued", None
@@ -1069,7 +1284,7 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None):
     worker = cfg["workers"][name]
     kind = worker["type"]
     env = dict(os.environ)
-    extra = [expand(a) for a in worker.get("args", [])]
+    extra = [expand(a) for a in worker.get("args", [])] + [expand(a) for a in tier_args(t, name, kind)]
     with open(prompt) as stdin, open(os.path.join(task, "log.txt"), "w") as log:
         if kind == "codex":
             env["CODEX_HOME"] = expand(worker.get("codexHome", "~/.codex"))
@@ -1100,7 +1315,8 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None):
         reason = f"worker reported {stopped}"
         if check:
             append_meta(task, check=f"skipped: the worker reported {stopped}")
-        append_meta(task, last_error=reason, log_path=os.path.abspath(os.path.join(task, "result.md")))
+        append_meta(task, last_error=reason, log_path=os.path.abspath(os.path.join(task, "result.md")),
+                    failure="task")
         finish(task, 1, f"failed: {reason}")
         return 1
     if rc == 0 and check:
@@ -1108,7 +1324,8 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None):
         if crc != 0:
             line, _ = last_error([os.path.join(task, "check.txt")])
             reason = f"done check failed (exit {crc})" + (f": {short(line, 100)}" if line else "")
-            append_meta(task, last_error=reason, log_path=os.path.abspath(os.path.join(task, "check.txt")))
+            append_meta(task, last_error=reason, log_path=os.path.abspath(os.path.join(task, "check.txt")),
+                        failure="task")
             finish(task, crc, f"failed: {reason}")
             return crc
     if rc == 0:
@@ -1121,11 +1338,13 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None):
     status = f"failed: {reason}"
     if line and ENOSPC.search(line):
         status = f"failed: disk full (ENOSPC), {free_gb(cwd):.1f}G free on {mount_of(cwd)}"
+        rerun = ["python3", os.path.abspath(__file__), "run", ",".join(names), os.path.abspath(task), cwd]
         with open(os.path.join(task, "result.md"), "a") as f:
             f.write(f"\n\nDisk full (ENOSPC). To resume: free space, then rerun this task dir; the worker starts over "
                     f"from prompt.md in the same cwd, so add what is already done to prompt.md first:\n\n"
-                    "    " + shlex.join(["python3", os.path.abspath(__file__), "run", ",".join(names), os.path.abspath(task), cwd]) + "\n")
-    append_meta(task, last_error=reason, log_path=os.path.abspath(where or main_log))
+                    "    " + shlex.join(rerun + (["--tier", tier] if tier else [])) + "\n")
+    append_meta(task, last_error=reason, log_path=os.path.abspath(where or main_log),
+                failure="provider" if line and PROVIDER.search(line) else "task")
     finish(task, rc, status)
     return rc
 
@@ -1146,11 +1365,12 @@ def main():
         sys.exit(1 if probs else 0)
     if cmd == "run" and len(args) >= 3:
         opts = dict(zip(args[3::2], args[4::2]))
-        if len(args) % 2 == 0 or set(opts) - {"--after", "--priority", "--check", "--retry-of"}:
+        if len(args) % 2 == 0 or set(opts) - {"--after", "--priority", "--check", "--retry-of", "--tier"}:
             sys.exit(__doc__)
         after = [a for a in opts.get("--after", "").split(",") if a]
         sys.exit(run(cfg, *args[:3], after=after, priority=int(opts.get("--priority", "0")),
-                     check=opts.get("--check") or None, retry_of=opts.get("--retry-of") or None))
+                     check=opts.get("--check") or None, retry_of=opts.get("--retry-of") or None,
+                     tier=opts.get("--tier") or None))
     if cmd == "cancel" and len(args) in (1, 2):
         sys.exit(cancel(args[0], args[1] if len(args) == 2 else ""))
     if cmd == "usage" and len(args) == 1:
@@ -1158,6 +1378,9 @@ def main():
         return
     if cmd == "clean" and len(args) in (0, 2) and (not args or args[0] == "--days"):
         print(clean(cfg, int(args[1]) if args else 14))
+        return
+    if cmd == "stats" and len(args) in (0, 2) and (not args or args[0] == "--days"):
+        print(stats(cfg, int(args[1]) if args else None))
         return
     if cmd == "workers":
         for name, w in cfg["workers"].items():
