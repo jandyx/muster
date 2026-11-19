@@ -114,7 +114,7 @@ flowchart TB
     outcome -- "approved" --> done([Done])
 ```
 
-Provider, infra and interrupted failures do not count toward the three-round limit (the first run and two fixes); after three failed rounds, Claude switches to a stronger worker, does it itself or asks.
+Provider, infra and interrupted failures do not count toward the three-round limit (the first run and two fixes); after three failed rounds, Claude switches to a stronger worker, does it itself or asks. Two failures outside the task in a row on one piece of work also stop the reruns and go to the user, and a context or turn limit counts as a task failure.
 
 ## How a task's cost is worked out
 
