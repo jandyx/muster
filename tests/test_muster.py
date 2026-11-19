@@ -1175,22 +1175,26 @@ class FailureKind(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertEqual(M.read_meta(str(task))["failure"], "provider")
 
-    def test_an_ordinary_worker_error_is_a_task_failure(self):
-        with tempfile.TemporaryDirectory() as d:
-            rc, task = self.run_fake(d, "cat >/dev/null\necho 'ValueError: bad input' >&2\nexit 2\n")
-            self.assertEqual(rc, 2)
-            self.assertEqual(M.read_meta(str(task))["failure"], "task")
+    def test_any_other_worker_exit_is_an_infra_failure_not_a_task_failure(self):
+        for body in ("echo 'ValueError: bad input' >&2\nexit 2", "echo 'ENOSPC: no space left on device' >&2\nexit 1",
+                     "echo 'error: stream disconnected before completion' >&2\nexit 1",
+                     "echo 'Error: 502 Bad Gateway' >&2\nexit 1", "exit 137"):
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as d:
+                rc, task = self.run_fake(d, "cat >/dev/null\n" + body + "\n")
+                self.assertNotEqual(rc, 0)
+                self.assertEqual(M.read_meta(str(task))["failure"], "infra")
 
-    def test_a_failed_check_and_a_blocked_report_are_task_failures(self):
+    def test_a_failed_check_is_a_task_failure_and_a_blocked_report_is_blocked(self):
         with tempfile.TemporaryDirectory() as d:
             rc, task = self.run_fake(d, "cat >/dev/null\n", check="exit 3")
             self.assertEqual(rc, 3)
             self.assertEqual(M.read_meta(str(task))["failure"], "task")
-        with tempfile.TemporaryDirectory() as d:
-            rc, task = self.run_fake(d, "cat >/dev/null\n"
-                                        "echo '{\"type\":\"result\",\"result\":\"Status: BLOCKED\"}'\n")
-            self.assertEqual(rc, 1)
-            self.assertEqual(M.read_meta(str(task))["failure"], "task")
+        for status in ("BLOCKED", "NEEDS_CONTEXT"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as d:
+                rc, task = self.run_fake(d, "cat >/dev/null\n"
+                                            f"echo '{{\"type\":\"result\",\"result\":\"Status: {status}\"}}'\n")
+                self.assertEqual(rc, 1)
+                self.assertEqual(M.read_meta(str(task))["failure"], "blocked")
 
     def test_canceled_tasks_have_no_failure_key(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1284,7 +1288,8 @@ class Stats(unittest.TestCase):
             self.assertIn("small samples", out)
 
     def test_provider_failure_or_interruption_then_success_is_first_pass_and_cost_counts(self):
-        for failure, reason in (("provider", "usage limit"), ("interrupted", "interrupted (SIGTERM)")):
+        for failure, reason in (("provider", "usage limit"), ("interrupted", "interrupted (SIGTERM)"),
+                                ("infra", "stream disconnected")):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as d:
                 run = "20261118-1000-run"
                 self.add(d, run, "A", status=f"failed: {reason}", failure=failure, sha="", review="",
@@ -1366,6 +1371,17 @@ class Stats(unittest.TestCase):
             for column in ("first_pass", "attempts_per_work", "median_minutes", "tokens_per_accepted",
                            "usd_per_accepted", "billing"):
                 self.assertEqual(row[column], "-", column)
+
+    def test_work_waiting_for_a_rerun_after_a_failure_outside_the_task_is_open(self):
+        for failure in M.NOT_TASK:
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as d:
+                self.add(d, "run", "task", status="failed: x", failure=failure, sha="", review="")
+                row = self.table(M.stats({"runsDir": d}))[0]
+                self.assertEqual((row["settled"], row["open"]), ("0", "1"))
+        with tempfile.TemporaryDirectory() as d:
+            self.add(d, "run", "task", status="failed: done check failed", failure="task", sha="", review="")
+            row = self.table(M.stats({"runsDir": d}))[0]
+            self.assertEqual((row["settled"], row["accepted"], row["open"]), ("1", "0", "0"))
 
     def test_partially_priced_settled_attempts_show_a_lower_bound(self):
         with tempfile.TemporaryDirectory() as d:
