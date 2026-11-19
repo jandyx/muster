@@ -157,7 +157,8 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
   },
   "routing": [                                  // first match on the task's cwd wins
     { "match": "~/workspace/work-*", "workers": ["codex-work", "codex", "deepseek"],
-      "preamble": ["Open pull requests with the repo's pr.sh."] },   // added to prompts for these repos only
+      "preamble": ["Open pull requests with the repo's pr.sh."],     // added to prompts for these repos only
+      "tiers": { "high": { "when": "Anything that touches billing/." } } },   // these repos' rule for a tier
     { "match": "*",                  "workers": ["codex", "deepseek"] }
   ],
   "only":  { "codex-work": ["~/workspace/work-*"] },   // this worker refuses any other repo
@@ -165,7 +166,8 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
   "tiers": {                                         // optional: one setting per task, cheapest that suffices
     "low":      { "prefer": ["deepseek"], "args": { "codex": ["-c", "model_reasoning_effort=\"medium\""] } },
     "standard": { "args": { "codex": ["-c", "model_reasoning_effort=\"high\""] } },
-    "high":     { "args": { "codex": ["-c", "model_reasoning_effort=\"xhigh\""] } }
+    "high":     { "args": { "codex": ["-c", "model_reasoning_effort=\"xhigh\""] },
+                  "when": "Cross-module work, concurrency, security or data migrations." }   // optional: replaces the skill's rule
   },
   "preamble": ["Never print secrets or tokens in your output."]
 }
@@ -191,7 +193,7 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
 | `routing` | picks workers in that order, falls back on quota errors | not checked |
 | `only` | never plans a fenced worker elsewhere | refuses outside its globs (exit 3) |
 | `caps` | passes each task its whole worker list | queues while every listed worker is full, starts on the first to free a slot (priority, then launch order); counts live processes only |
-| `tiers` | picks each task's tier and passes `--tier` | moves `prefer` workers to the front of the task's list (after `only` has filtered it), so they win when several have a free slot; appends the tier's `args` after the worker's own |
+| `tiers` | picks each task's tier by its `when` (the matching `routing` entry's first) or the skill's default rule, and passes `--tier` | moves `prefer` workers to the front of the task's list (after `only` has filtered it), so they win when several have a free slot; appends the tier's `args` after the worker's own |
 | `preamble` | adds the lines to every prompt, then the first matching `routing` entry's `preamble` | only its shape (`doctor`) |
 | `--check` | writes a done check for each task and passes it | runs it after the worker, one at a time per `runsDir`; a failing check fails the task |
 
