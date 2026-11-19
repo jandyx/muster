@@ -1151,13 +1151,23 @@ class TierDoctor(unittest.TestCase):
         for cfg, needle in (({"tiers": [1]}, "tiers: expected an object"),
                             ({"tiers": {"low": "x"}}, "tiers.low: expected an object"),
                             ({"tiers": {"low": {"args": ["x"]}}}, "tiers.low.args: expected an object"),
-                            ({"tiers": {"low": {"prefer": "w"}}}, "tiers.low.prefer: expected")):
+                            ({"tiers": {"low": {"prefer": "w"}}}, "tiers.low.prefer: expected"),
+                            ({"tiers": {"low": {"when": ["x"]}}}, "tiers.low.when: expected a string"),
+                            ({"routing": [{"match": "*", "workers": ["w"], "tiers": []}]}, "*).tiers: expected an object"),
+                            ({"routing": [{"match": "*", "workers": ["w"], "tiers": {"huge": {}}}]},
+                             "*).tiers.huge: unknown tier"),
+                            ({"routing": [{"match": "*", "workers": ["w"], "tiers": {"low": {"args": {}}}}]},
+                             "*).tiers.low: expected { when }"),
+                            ({"routing": [{"match": "*", "workers": ["w"], "tiers": {"low": {"when": 1}}}]},
+                             "*).tiers.low.when: expected a string")):
             self.assertIn(needle, "\n".join(M.doctor({"workers": {"w": worker}, **cfg})))
 
     def test_doctor_accepts_tiers_and_note_keys(self):
         cfg = {"workers": {"w": {"type": "claude", "command": sys.executable}},
-               "tiers": {"_note": "tiers are optional", "low": {"_why": "small",
-                                                                "prefer": ["w"], "args": {"w": ["-x"]}}}}
+               "tiers": {"_note": "tiers are optional", "low": {"_why": "small", "when": "docs and typos only",
+                                                                "prefer": ["w"], "args": {"w": ["-x"]}}},
+               "routing": [{"match": "*", "workers": ["w"],
+                            "tiers": {"_note": "x", "high": {"when": "any change", "_why": "payments"}}}]}
         self.assertEqual(M.doctor(cfg), [])
 
 

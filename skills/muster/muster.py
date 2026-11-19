@@ -480,7 +480,7 @@ def detect():
 
 KEYS = {"": {"runsDir", "workers", "routing", "only", "caps", "tiers", "preamble"},
         "worker": {"type", "command", "args", "codexHome", "billing"},
-        "route": {"match", "workers", "preamble"}}
+        "route": {"match", "workers", "preamble", "tiers"}}
 
 
 def doctor(cfg):
@@ -548,6 +548,20 @@ def doctor(cfg):
                 probs.append(f"routing[{i}] ({r.get('match')}): unknown worker {w!r}")
         if not strings(r.get("preamble")):
             probs.append(f"routing[{i}] ({r.get('match')}).preamble: expected a list of strings")
+        # A route may only restate when each tier fits these repos; workers and arguments stay global.
+        rt = r.get("tiers")
+        if rt is not None and not isinstance(rt, dict):
+            probs.append(f"routing[{i}] ({r.get('match')}).tiers: expected an object of tier -> {{ when }}")
+        for name, t in (rt if isinstance(rt, dict) else {}).items():
+            where = f"routing[{i}] ({r.get('match')}).tiers.{name}"
+            if name.startswith("_"):
+                continue
+            if name not in TIERS:
+                probs.append(f"{where}: unknown tier (expected one of {', '.join(TIERS)})")
+            elif not isinstance(t, dict) or set(k for k in t if not k.startswith("_")) - {"when"}:
+                probs.append(f"{where}: expected {{ when }}")
+            elif not isinstance(t.get("when", ""), str):
+                probs.append(f"{where}.when: expected a string")
     if routing and not any(r.get("match") == "*" for r in routing):
         probs.append("routing: no '*' fallback entry; tasks outside every match have no default worker")
     only, caps = cfg.get("only") or {}, cfg.get("caps") or {}
@@ -581,8 +595,10 @@ def doctor(cfg):
             probs.append(f"tiers.{name}: expected an object")
             continue
         for k in t:
-            if k not in ("prefer", "args") and not k.startswith("_"):
-                probs.append(f"tiers.{name}.{k}: unknown key (expected args, prefer)")
+            if k not in ("prefer", "args", "when") and not k.startswith("_"):
+                probs.append(f"tiers.{name}.{k}: unknown key (expected args, prefer, when)")
+        if not isinstance(t.get("when", ""), str):
+            probs.append(f"tiers.{name}.when: expected a string")
         prefer = t.get("prefer")
         if prefer is not None and not (isinstance(prefer, list)
                                        and all(isinstance(w, str) and w in workers for w in prefer)):

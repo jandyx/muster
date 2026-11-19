@@ -15,7 +15,7 @@ Read `~/.muster/config.json` (or `MUSTER_CONFIG`) at the start of every run; `py
 - `routing`: `{ match, workers, preamble? }` list. The first `match` glob (`~` allowed) that fits the cwd gives its workers, first choice first; `*` is the fallback.
 - `only.<worker>`: the only globs that worker may work in; never route elsewhere, not even as a quota fallback. The runner refuses outside them (exit 3).
 - `caps.<worker>` or `caps.<type>`: tasks at once per worker (default codex 3, claude 5). The runner queues over the cap.
-- `tiers.<low|standard|high>`: optional. `prefer` lists workers moved to the front of a task's worker list (after `only` has filtered it), so they win when several have a free slot; a busy preferred worker does not hold the task back; `args` maps a worker name or type to extra CLI arguments, passed after the worker's own `args`, with a worker name winning over its type. Give a task one with `--tier`.
+- `tiers.<low|standard|high>`: optional. `prefer` lists workers moved to the front of a task's worker list (after `only` has filtered it), so they win when several have a free slot; a busy preferred worker does not hold the task back; `args` maps a worker name or type to extra CLI arguments, passed after the worker's own `args`, with a worker name winning over its type; `when` describes which tasks get the tier. A `routing` entry may set `tiers.<name>.when` for its repos. Give a task one with `--tier`.
 - `preamble` and the matching `routing` entry's `preamble`: lines added to every prompt's rules block.
 - The user's explicit choice always wins over the config.
 
@@ -26,7 +26,7 @@ Metered workers on a peak-priced model (`prices.json`; DeepSeek costs double wee
 ## Loop
 
 1. **Plan.** Split the request into independent tasks, each with a goal, scope and done check. Show a table (id, worker, cwd, tier, goal) and start without waiting unless the request is ambiguous; the `tier` column appears when the config has `tiers`. Size each task so one run can finish it; work that needs design judgment gets the design written into the brief, or stays with Claude.
-   With `tiers` in the config, give each task a tier:
+   With `tiers` in the config, give each task a tier. A tier's `when` replaces its default below: the matching `routing` entry's first, else the one in `tiers`.
    - `low`: at most about 2 files and 100 changed lines, an unambiguous brief, a runnable `--check`, and nothing touching secrets, authentication, payments or private data.
    - `standard`: the default, and the choice when unsure. A task without a runnable check starts here or higher.
    - `high`: cross-module work, 3 or more files with non-trivial logic, concurrency, security, data migrations, or independent review of risky code.
