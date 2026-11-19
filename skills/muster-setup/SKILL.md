@@ -1,6 +1,6 @@
 ---
 name: muster-setup
-description: Set up or change Muster's workers and routing (~/.muster/config.json). Use for set up muster, add a worker, muster doctor.
+description: Set up or change Muster's workers, routing and tiers (~/.muster/config.json). Use for set up muster, add a worker, pick a model per tier, muster doctor.
 ---
 
 # Muster setup
@@ -31,12 +31,20 @@ From what you found, draft workers:
 
 Then draft `routing` with a `*` fallback, `caps` (`codex` 3, `claude` 5) and `runsDir` (`~/.muster/runs`, or keep the existing one).
 
+Tiers are optional; add them only when the user wants cheaper or stronger runs for some tasks. Only `low`, `standard` and `high` exist, each with:
+- `args`: extra CLI arguments keyed by worker name or type (`codex`, `claude`), the name winning; they follow the worker's own `args`. Model: `["--model", "<model>"]` for Claude Code; `["-c", "model=\"<model>\""]` for Codex, which refuses `-m` twice, so leave `-m` out of a Codex worker's own `args` when tiers should pick its model. Codex effort: `["-c", "model_reasoning_effort=\"medium\""]` (`low`, `medium`, `high`, `xhigh`).
+- `prefer`: workers that take the task first when several have a free slot, such as a cheap metered worker for `low`.
+- `when`: one sentence replacing the skill's default rule for picking that tier. A `routing` entry may set `"tiers": { "<name>": { "when": "…" } }` for its repos; nothing else goes there.
+
+Map plain requests onto these: "high uses opus" → `tiers.high.args.claude: ["--model", "opus"]`; "low goes to deepseek" → `tiers.low.prefer: ["deepseek"]`; "anything touching billing/ in the work repos is high" → that `routing` entry's `tiers.high.when`.
+
 ## 3. Ask only what detection cannot answer
 
 Use AskUserQuestion, at most one round of up to four questions, each with a recommended default first. Typical:
 - Which repos or folders should each worker prefer? (Offer the folders under the user's usual workspace, such as `~/workspace/*`, grouped by prefix.)
 - Should any worker be limited to certain repos only (`only`)? Mention that the runner enforces it.
 - Parallel caps per account: keep 3 / 5, or change?
+- Tiers: one setting for every task (recommended unless the user mentioned cost or model choice), or a cheaper `low` and a stronger `high`? If tiers, which model or effort for each?
 - Any rule worker prompts should carry? Global ones go in `preamble`; rules for one group of repos (for example, how pull requests are opened there) go in that `routing` entry's `preamble`.
 
 If the user already said these things in this conversation, do not ask again.
@@ -52,7 +60,8 @@ If the user already said these things in this conversation, do not ask again.
 
 Tell the user, in their language:
 - the workers and which repos each one takes;
-- which limits the runner enforces (`only`, `caps`) and which Claude follows when planning (`routing`, `preamble`);
+- which limits the runner enforces (`only`, `caps`, a tier's `prefer` and `args`) and which Claude follows when planning (`routing`, `preamble`, a tier's `when`);
+- with tiers, that `python3 $MUSTER stats` later shows how each tier performs;
 - how to start: "muster: …" (the pane opens by itself), and `/muster-panel` to reopen it.
 
 ## Rules

@@ -612,6 +612,15 @@ def doctor(cfg):
                     probs.append(f"tiers.{name}.args.{k}: not a worker name or type")
                 if not (isinstance(v, list) and strings(v)):
                     probs.append(f"tiers.{name}.args.{k}: expected a list of strings")
+            # Codex refuses `-m` twice, so a tier's model flag breaks a Codex worker that already pins one.
+            for wname, w in workers.items():
+                if not isinstance(w, dict) or w.get("type") != "codex":
+                    continue
+                extra = args.get(wname, args.get(w.get("type"), []))
+                if isinstance(extra, list) and isinstance(w.get("args"), list) and \
+                        {"-m", "--model"} & set(extra) and {"-m", "--model"} & set(w["args"]):
+                    probs.append(f"tiers.{name}.args: adds -m to worker {wname}, which already sets it; "
+                                 f"Codex refuses it twice (use -c model=\"...\" or drop one)")
     return probs
 
 

@@ -1162,6 +1162,18 @@ class TierDoctor(unittest.TestCase):
                              "*).tiers.low.when: expected a string")):
             self.assertIn(needle, "\n".join(M.doctor({"workers": {"w": worker}, **cfg})))
 
+    def test_doctor_flags_a_tier_model_flag_on_a_codex_worker_that_pins_one(self):
+        workers = {"pinned": {"type": "codex", "args": ["-m", "a"]}, "free": {"type": "codex"},
+                   "c": {"type": "claude", "command": sys.executable, "args": ["--model", "a"]}}
+        probs = M.doctor({"workers": workers, "tiers": {"high": {"args": {"codex": ["-m", "b"],
+                                                                          "claude": ["--model", "b"]}}}})
+        self.assertEqual([p for p in probs if "-m" in p],
+                         ["tiers.high.args: adds -m to worker pinned, which already sets it; "
+                          "Codex refuses it twice (use -c model=\"...\" or drop one)"])
+        probs = M.doctor({"workers": workers, "tiers": {"high": {"args": {"codex": ["-c", "model=\"b\""],
+                                                                          "pinned": []}}}})
+        self.assertFalse([p for p in probs if "-m" in p])
+
     def test_doctor_accepts_tiers_and_note_keys(self):
         cfg = {"workers": {"w": {"type": "claude", "command": sys.executable}},
                "tiers": {"_note": "tiers are optional", "low": {"_why": "small", "when": "docs and typos only",
