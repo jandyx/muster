@@ -372,9 +372,11 @@ def tail_lines(path, size=65536):
         return []
 
 
-def last_error(paths):
+def last_error(paths, echoed=()):
     """(line, path): the last line that looks like an error in the tails of `paths`, first path first;
-    an ENOSPC line anywhere wins. stream-json lines count through their error text only."""
+    an ENOSPC line anywhere wins. stream-json lines count through their error text only. Lines in `echoed`
+    (the prompt, which codex copies into its log) are skipped: a brief that mentions an error is not one."""
+    echoed = {e.strip() for e in echoed if e.strip()}
     hits = []
     for path in paths:
         for line in tail_lines(path):
@@ -385,7 +387,7 @@ def last_error(paths):
                 except ValueError:
                     o = {}
                 line = str(o.get("result") or o.get("error") or "") if isinstance(o, dict) and (o.get("is_error") or o.get("error")) else ""
-            if ERROR_LINE.search(line):
+            if ERROR_LINE.search(line) and line not in echoed:
                 hits.append((re.sub(r"^\d{4}-\d\d-\d\dT[\d:.]+Z\s+", "", line), path))  # drop codex log timestamps
     disk = [h for h in hits if ENOSPC.search(h[0])]
     if disk:
@@ -1114,7 +1116,7 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None):
         return 0
     main_log = os.path.join(task, "stream.jsonl" if kind == "claude" else "log.txt")
     logs = [main_log] + ([os.path.join(task, "log.txt")] if kind == "claude" else [])
-    line, where = last_error(logs)
+    line, where = last_error(logs, read_text(prompt).splitlines())
     reason = short(line) if line else f"exit {rc}"
     status = f"failed: {reason}"
     if line and ENOSPC.search(line):
