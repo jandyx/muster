@@ -262,7 +262,7 @@ A row with only open work shows `-` for all rates, costs, timing and billing. Wo
 
 Claude runs the `muster` skill, which calls `muster.py` once per task in the background. `muster.py` checks the fences and caps, starts the worker, writes everything under `runsDir`, and prices the usage when the worker exits. The pane reads those files every 5 seconds, and asks the engine for the session's own subagents on the same poll.
 
-Architecture, a run's sequence, a task's states and what each pane row reads are drawn in **[docs/how-it-works.md](docs/how-it-works.md)**.
+Architecture, a run's sequence, a task's states and what each pane row reads are drawn in **[docs/how-it-works.md](docs/how-it-works.md)**. Why it is built this way is in **[docs/design.md](docs/design.md)**; **[docs/](docs/README.md)** indexes all of it.
 
 <details>
 <summary>Where things are kept</summary>

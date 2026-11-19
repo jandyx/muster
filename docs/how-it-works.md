@@ -1,6 +1,6 @@
 # How Muster works
 
-Diagrams of the moving parts. The [README](../README.md) covers install, config and use.
+Diagrams of the moving parts. The [README](../README.md) covers install, config and use; [Design](design.md) explains why it is built this way.
 
 ## Architecture
 
@@ -8,7 +8,7 @@ Diagrams of the moving parts. The [README](../README.md) covers install, config 
 flowchart LR
     you([You]) <--> claude["Claude Code<br/>plans · verifies · reports"]
     claude -- "muster skill:<br/>python3 muster.py run" --> runner[muster.py]
-    cfg[(~/.muster/config.json<br/>workers · routing · caps)] -.-> claude
+    cfg[(~/.muster/config.json<br/>workers · routing · caps · tiers)] -.-> claude
     cfg -.-> runner
     runner -- "codex exec<br/>CODEX_HOME=…" --> cx1[Codex worker]
     runner -- "codex exec" --> cx2[Codex worker 2]
@@ -92,6 +92,29 @@ flowchart TB
     result --> row5["↳ one-line result"]
     meta -- "session = this session?" --> filter{shown}
 ```
+
+## How a task gets its worker, and what happens when it fails
+
+```mermaid
+flowchart TB
+    plan["Claude plans a task"] --> tier{"tiers in config?"}
+    tier -- no --> list
+    tier -- yes --> pick["pick low / standard / high<br/>(routing when, tiers when, or the skill's rubric)"]
+    pick --> list["workers from routing<br/>(user's choice wins)"]
+    list --> fence["only: drop fenced workers<br/>none left → refused, exit 3"]
+    fence --> prefer["tier prefer: move to front"]
+    prefer --> queue["queue: first listed worker<br/>under its cap takes it"]
+    queue --> run["run with worker args + tier args"]
+    run --> outcome{outcome}
+    outcome -- "check fails / Needs fixes" --> task["failure=task<br/>fix round, same tier;<br/>up one tier if the tier proved too weak (max 2)"]
+    outcome -- "BLOCKED / NEEDS_CONTEXT" --> blocked["failure=blocked<br/>answer or split, same tier"]
+    outcome -- "quota, rate limit, auth" --> provider["failure=provider<br/>another worker, same tier"]
+    outcome -- "disk, network, crash" --> infra["failure=infra<br/>rerun, same tier"]
+    outcome -- "signal" --> interrupted["failure=interrupted<br/>rerun, same tier"]
+    outcome -- "approved" --> done([Done])
+```
+
+Provider, infra and interrupted failures do not count toward the three-round limit (the first run and two fixes); after three failed rounds, Claude switches to a stronger worker, does it itself or asks.
 
 ## How a task's cost is worked out
 
