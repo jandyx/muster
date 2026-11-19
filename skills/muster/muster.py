@@ -95,6 +95,8 @@ def tier_config(cfg, name):
     tiers = cfg.get("tiers") or {}
     if name not in tiers:
         sys.exit(f"muster: --tier {name}: no tiers.{name} in {CONFIG}")
+    if not isinstance(tiers[name], dict):
+        sys.exit(f"muster: --tier {name}: tiers.{name} is not an object; run doctor")
     return tiers[name]
 
 
@@ -410,13 +412,15 @@ def last_error(paths, echoed=()):
     for path in paths:
         for line in tail_lines(path):
             line = line.strip()
+            flagged = False  # a stream-json error result is an error whatever its words ("usage limit reached")
             if line.startswith("{"):
                 try:
                     o = json.loads(line)
                 except ValueError:
                     o = {}
-                line = str(o.get("result") or o.get("error") or "") if isinstance(o, dict) and (o.get("is_error") or o.get("error")) else ""
-            if ERROR_LINE.search(line) and line not in echoed:
+                flagged = isinstance(o, dict) and bool(o.get("is_error") or o.get("error"))
+                line = str(o.get("result") or o.get("error") or "") if flagged else ""
+            if line and (flagged or ERROR_LINE.search(line)) and line not in echoed:
                 hits.append((re.sub(r"^\d{4}-\d\d-\d\dT[\d:.]+Z\s+", "", line), path))  # drop codex log timestamps
     disk = [h for h in hits if ENOSPC.search(h[0])]
     if disk:

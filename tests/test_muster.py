@@ -1191,6 +1191,24 @@ class FailureKind(unittest.TestCase):
                    "w", str(task), d, check=check)
         return rc, task
 
+    def test_a_claude_usage_limit_result_without_the_word_error_is_a_provider_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, task = self.run_fake(d, "cat >/dev/null\n"
+                                        "echo '{\"type\":\"result\",\"is_error\":true,"
+                                        "\"result\":\"Claude AI usage limit reached|1731699999\"}'\nexit 1\n")
+            self.assertEqual(rc, 1)
+            meta = M.read_meta(str(task))
+            self.assertEqual((meta["failure"], meta["last_error"]), ("provider", "Claude AI usage limit reached|1731699999"))
+
+    def test_a_tier_that_is_not_an_object_fails_cleanly(self):
+        with tempfile.TemporaryDirectory() as d:
+            task = make_task(d)
+            with self.assertRaises(SystemExit) as e:
+                M.run({"runsDir": d, "workers": {"w": {"type": "claude", "command": "x"}}, "tiers": {"low": "x"}},
+                      "w", str(task), d, tier="low")
+            self.assertIn("not an object", str(e.exception))
+            self.assertFalse((task / "meta").exists())
+
     def test_a_usage_limit_error_is_a_provider_failure(self):
         with tempfile.TemporaryDirectory() as d:
             rc, task = self.run_fake(d, "cat >/dev/null\necho 'Error: usage limit reached' >&2\nexit 1\n")

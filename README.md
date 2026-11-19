@@ -181,7 +181,7 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
 
 Claude picks each task's tier; the runner applies `prefer` and `args`. `stats` shows how each tier did (see [How the tiers perform](#how-the-tiers-perform)). Asking `muster-setup` in plain words ("high uses opus", "low goes to deepseek") writes these keys for you.
 
-`//` comments are allowed, and `doctor` ignores keys starting with `_` at the top level, in a worker and in a `routing` entry, so they can hold notes. Check it with `python3 <plugin>/skills/muster/muster.py doctor` (one line per problem, `ok` when usable: broken JSON with its line, unknown keys such as a misspelled `preambel`, wrong types, unknown workers), list workers with `workers`, and see what the machine offers with `detect`.
+`//` comments are allowed, and `doctor` ignores keys starting with `_` at the top level, in a worker, in a `routing` entry and in a tier, so they can hold notes. Check it with `python3 <plugin>/skills/muster/muster.py doctor` (one line per problem, `ok` when usable: broken JSON with its line, unknown keys such as a misspelled `preambel`, wrong types, unknown workers), list workers with `workers`, and see what the machine offers with `detect`.
 
 <details>
 <summary>Worker types</summary>
@@ -248,7 +248,7 @@ The newest counted attempt determines the outcome. If it is `done` and its metad
 | `tier`, `worker`, `model` | where the work started; `-` when the run predates tiers or recorded no model |
 | `settled` | accepted work plus work whose newest counted attempt failed |
 | `accepted` | settled work whose current diff has an `Approved` or `User override` verdict, or a `Needs fixes` verdict on an empty diff, and whose status is `done` |
-| `open` | running or queued work, completed work awaiting a current review or a requested fix, or work waiting for a rerun after a provider, infra or interruption failure |
+| `open` | running work, completed work awaiting a current review or a requested fix, or work waiting for a rerun after a provider, infra or interruption failure |
 | `first_pass` | share of accepted work that needed no rework and no `Fixed in:` line, or `-` |
 | `attempts_per_work` | mean attempts per settled piece, excluding provider and infra failures and interruptions |
 | `median_minutes` | median minutes per settled piece, summing recorded attempt durations for each piece |
