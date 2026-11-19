@@ -173,6 +173,14 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
 }
 ```
 
+**Tiers** are optional; without them every task runs with its worker's own settings. `low`, `standard` and `high` are the only names, each with up to three keys:
+
+- `args`: extra CLI arguments by worker name or type (`codex`, `claude`), the name winning, added after the worker's own `args`. Change the model with `["--model", "opus"]` for Claude Code, or `["-c", "model=\"<model>\""]` for Codex. Codex refuses `-m` twice, and `doctor` flags a tier that adds `-m` to a worker that already sets it.
+- `prefer`: workers that take the task first when several have a free slot.
+- `when`: one sentence that replaces the skill's rule for picking this tier. A `routing` entry's `tiers.<name>.when` replaces it for those repos.
+
+Claude picks each task's tier; the runner applies `prefer` and `args`. `stats` shows how each tier did (see [How the tiers perform](#how-the-tiers-perform)). Asking `muster-setup` in plain words ("high uses opus", "low goes to deepseek") writes these keys for you.
+
 `//` comments are allowed, and `doctor` ignores keys starting with `_` at the top level, in a worker and in a `routing` entry, so they can hold notes. Check it with `python3 <plugin>/skills/muster/muster.py doctor` (one line per problem, `ok` when usable: broken JSON with its line, unknown keys such as a misspelled `preambel`, wrong types, unknown workers), list workers with `workers`, and see what the machine offers with `detect`.
 
 <details>

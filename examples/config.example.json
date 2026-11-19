@@ -28,7 +28,8 @@
   "tiers": {
     "low":      { "prefer": ["deepseek"], "args": { "codex": ["-c", "model_reasoning_effort=\"medium\""] } },
     "standard": { "args": { "codex": ["-c", "model_reasoning_effort=\"high\""] } },
-    "high":     { "args": { "codex": ["-c", "model_reasoning_effort=\"xhigh\""] } }
+    "high":     { "args": { "codex": ["-c", "model_reasoning_effort=\"xhigh\""] },
+                  "when": "Cross-module work, concurrency, security or data migrations." }
   },
   "preamble": [
     "Never print secrets or tokens in your output."
