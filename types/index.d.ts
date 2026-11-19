@@ -60,6 +60,7 @@ declare module 'claude-code' {
       runs: Shaped<Run[]>
       agents: Shaped<Agent[]>
       notified: Shaped<string[]>
+      reminded: Shaped<string[]>
       folds: Shaped<Record<string, boolean>>
     }
   }
