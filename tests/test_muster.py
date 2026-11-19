@@ -630,8 +630,8 @@ def fake_cli(dirpath, name, body):
     return str(f)
 
 
-def make_task(root, title="t"):
-    task = pathlib.Path(root, "run", "A")
+def make_task(root, title="t", run="run"):
+    task = pathlib.Path(root, run, "A")
     task.mkdir(parents=True)
     (task / "prompt.md").write_text(f"# {title}\n")
     return task
@@ -1064,3 +1064,346 @@ class Cli(unittest.TestCase):
                            env=dict(os.environ, MUSTER_CONFIG="/nonexistent/config.json"), capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertFalse(json.loads(r.stdout)["config_exists"])
+
+
+class TaskTier(unittest.TestCase):
+    def test_tier_args_follow_the_workers_own_and_a_name_key_beats_the_type(self):
+        with tempfile.TemporaryDirectory() as d:
+            spy = fake_cli(d, "spy", f'cat >/dev/null\necho "$@" > "{d}/args"\n')
+            cfg = {"runsDir": d, "workers": {"w": {"type": "claude", "command": spy, "args": ["--model", "x"]}},
+                   "tiers": {"standard": {"args": {"claude": ["--effort", "low"], "w": ["--effort", "high"]}}}}
+            task = make_task(d)
+            self.assertEqual(M.run(cfg, "w", str(task), d, tier="standard"), 0)
+            self.assertEqual(pathlib.Path(d, "args").read_text().split(),
+                             ["-p", "--output-format", "stream-json", "--verbose", "--model", "x",
+                              "--effort", "high"])
+
+            cx = fake_cli(d, "cx", f'cat >/dev/null\necho "$@" > "{d}/cx-args"\n')
+            home = pathlib.Path(d, "codex-home")
+            home.mkdir()
+            (home / "auth.json").write_text("{}")
+            cfg = {"runsDir": d, "workers": {"c": {"type": "codex", "codexHome": str(home), "command": cx,
+                                                   "args": ["-m", "gpt-6-astra"]}},
+                   "tiers": {"high": {"args": {"codex": ["-c", 'model_reasoning_effort="xhigh"']}}}}
+            task = make_task(d, run="second")
+            self.assertEqual(M.run(cfg, "c", str(task), d, tier="high"), 0)
+            self.assertEqual(pathlib.Path(d, "cx-args").read_text().split()[-5:],
+                             ["-m", "gpt-6-astra", "-c", 'model_reasoning_effort="xhigh"', "-"])
+
+    def test_prefer_reorders_without_adding_workers_or_bypassing_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            ok = fake_cli(d, "ok", "cat >/dev/null\n")
+            cfg = {"runsDir": d, "tiers": {"low": {"prefer": ["b", "c"]}},
+                   "workers": {n: {"type": "claude", "command": ok} for n in ("a", "b", "c")}}
+            task = make_task(d)
+            self.assertEqual(M.run(cfg, "a,b", str(task), d, tier="low"), 0)
+            self.assertEqual(M.read_meta(str(task))["workers"], "b,a")  # c is not added
+
+            ordered = make_task(d, run="second")
+            self.assertEqual(M.run(cfg, "a,c,b", str(ordered), d, tier="low"), 0)
+            self.assertEqual(M.read_meta(str(ordered))["workers"], "c,b,a")  # preferred keep their order
+
+            cfg["only"] = {"b": ["/nowhere/*"]}
+            fenced = make_task(d, run="third")
+            self.assertEqual(M.run(cfg, "a,b", str(fenced), d, tier="low"), 0)
+            self.assertEqual(M.read_meta(str(fenced))["workers"], "a")  # prefer cannot un-fence b
+
+    def test_a_bad_or_unconfigured_tier_exits_before_writing_meta(self):
+        with tempfile.TemporaryDirectory() as d:
+            ok = fake_cli(d, "ok", "cat >/dev/null\n")
+            cfg = {"runsDir": d, "workers": {"w": {"type": "claude", "command": ok}},
+                   "tiers": {"low": {}}}
+            task = make_task(d)
+            for name, want in (("huge", "--tier huge: expected one of low, standard, high"),
+                               ("high", "--tier high: no tiers.high")):
+                with self.assertRaises(SystemExit) as raised:
+                    M.run(cfg, "w", str(task), d, tier=name)
+                self.assertIn(want, str(raised.exception))
+            self.assertFalse((task / "meta").exists())
+
+    def test_meta_records_the_tier_or_an_empty_one_and_no_tier_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            spy = fake_cli(d, "spy", f'cat >/dev/null\necho "$@" > "{d}/args"\n')
+            cfg = {"runsDir": d, "workers": {"w": {"type": "claude", "command": spy, "args": ["--model", "x"]}},
+                   "tiers": {"low": {"args": {"claude": ["--effort", "low"]}}}}
+            task = make_task(d)
+            self.assertEqual(M.run(cfg, "w", str(task), d), 0)
+            self.assertEqual(M.read_meta(str(task))["tier"], "")
+            self.assertEqual(pathlib.Path(d, "args").read_text().split(),
+                             ["-p", "--output-format", "stream-json", "--verbose", "--model", "x"])
+            task = make_task(d, run="second")
+            self.assertEqual(M.run(cfg, "w", str(task), d, tier="low"), 0)
+            self.assertEqual(M.read_meta(str(task))["tier"], "low")
+
+
+class TierDoctor(unittest.TestCase):
+    def test_doctor_reports_each_bad_tier_shape(self):
+        worker = {"type": "claude", "command": sys.executable}
+        probs = "\n".join(M.doctor({"workers": {"w": worker},
+                                    "tiers": {"huge": {}, "low": {"preferred": [], "prefer": ["ghost"],
+                                                                  "args": {"nope": [], "w": "x"}}}}))
+        for needle in ("tiers.huge: unknown tier", "tiers.low.preferred: unknown key",
+                       "tiers.low.prefer: expected a list of known worker names",
+                       "tiers.low.args.nope: not a worker name or type",
+                       "tiers.low.args.w: expected a list of strings"):
+            self.assertIn(needle, probs)
+        for cfg, needle in (({"tiers": [1]}, "tiers: expected an object"),
+                            ({"tiers": {"low": "x"}}, "tiers.low: expected an object"),
+                            ({"tiers": {"low": {"args": ["x"]}}}, "tiers.low.args: expected an object"),
+                            ({"tiers": {"low": {"prefer": "w"}}}, "tiers.low.prefer: expected")):
+            self.assertIn(needle, "\n".join(M.doctor({"workers": {"w": worker}, **cfg})))
+
+    def test_doctor_accepts_tiers_and_note_keys(self):
+        cfg = {"workers": {"w": {"type": "claude", "command": sys.executable}},
+               "tiers": {"_note": "tiers are optional", "low": {"_why": "small",
+                                                                "prefer": ["w"], "args": {"w": ["-x"]}}}}
+        self.assertEqual(M.doctor(cfg), [])
+
+
+class FailureKind(unittest.TestCase):
+    def run_fake(self, d, body, check=None):
+        worker = fake_cli(d, "w", body)
+        task = make_task(d)
+        rc = M.run({"runsDir": d, "workers": {"w": {"type": "claude", "command": worker}}},
+                   "w", str(task), d, check=check)
+        return rc, task
+
+    def test_a_usage_limit_error_is_a_provider_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, task = self.run_fake(d, "cat >/dev/null\necho 'Error: usage limit reached' >&2\nexit 1\n")
+            self.assertEqual(rc, 1)
+            self.assertEqual(M.read_meta(str(task))["failure"], "provider")
+
+    def test_an_ordinary_worker_error_is_a_task_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, task = self.run_fake(d, "cat >/dev/null\necho 'ValueError: bad input' >&2\nexit 2\n")
+            self.assertEqual(rc, 2)
+            self.assertEqual(M.read_meta(str(task))["failure"], "task")
+
+    def test_a_failed_check_and_a_blocked_report_are_task_failures(self):
+        with tempfile.TemporaryDirectory() as d:
+            rc, task = self.run_fake(d, "cat >/dev/null\n", check="exit 3")
+            self.assertEqual(rc, 3)
+            self.assertEqual(M.read_meta(str(task))["failure"], "task")
+        with tempfile.TemporaryDirectory() as d:
+            rc, task = self.run_fake(d, "cat >/dev/null\n"
+                                        "echo '{\"type\":\"result\",\"result\":\"Status: BLOCKED\"}'\n")
+            self.assertEqual(rc, 1)
+            self.assertEqual(M.read_meta(str(task))["failure"], "task")
+
+    def test_canceled_tasks_have_no_failure_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            ok = fake_cli(d, "ok", "cat >/dev/null\n")
+            dep = pathlib.Path(d, "run", "A")
+            dep.mkdir(parents=True)
+            (dep / "status").write_text("failed: exit 1\n")
+            task = pathlib.Path(d, "run", "B")
+            task.mkdir()
+            (task / "prompt.md").write_text("# t\n")
+            self.assertEqual(M.run({"runsDir": d, "workers": {"w": {"type": "claude", "command": ok}}},
+                                   "w", str(task), d, after=["A"]), 5)
+            self.assertNotIn("failure", M.read_meta(str(task)))
+
+    def test_the_provider_pattern_covers_provider_errors_only(self):
+        for text in ("usage limit reached", "Quota exceeded", "rate limit", "too many requests", "HTTP 429",
+                     "401 Unauthorized", "status 403", "529 overloaded", "billing problem", "no credits left",
+                     "access token expired", "unauthorized", "authentication failed", "codex_login"):
+            self.assertTrue(M.PROVIDER.search(text), text)
+        for text in ("ValueError: bad input", "2 tests failed", "ENOSPC: no space left on device"):
+            self.assertFalse(M.PROVIDER.search(text), text)
+
+
+class Stats(unittest.TestCase):
+    def add(self, root, run, tid, *, tier="low", worker="w", model="m", status="done",
+            started="2026-11-18 10:00:00", finished="2026-11-18 10:10:00", changes="1 files +1 -0",
+            sha="sha", review=None, usage=None, retry_of="", failure=""):
+        t = pathlib.Path(root, run, tid)
+        t.mkdir(parents=True)
+        lines = [f"workers={worker or 'w'}", f"tier={tier}", f"model={model}",
+                 f"retry_of={retry_of}"]
+        if changes is not None:
+            lines.append(f"changes={changes}")
+        if worker:
+            lines += [f"worker={worker}", "type=claude"]
+        if sha:
+            lines.append(f"changes_sha256={sha}")
+        if started:
+            lines += [f"started={started}", f"finished={finished}"]
+        if failure:
+            lines.append(f"failure={failure}")
+        (t / "meta").write_text("\n".join(lines) + "\n")
+        (t / "status").write_text(status + "\n")
+        review = f"Verdict: Approved\nchanges-sha256: {sha}\n" if review is None and sha else review
+        if review is not None:
+            (t / "review.md").write_text(review)
+        if usage is not None:
+            (t / "usage").write_text(json.dumps(usage))
+        return t
+
+    @staticmethod
+    def usage(inp, out, usd, billing="metered", model="m"):
+        return {"model": model, "input": inp, "output": out, "usd": usd, "billing": billing}
+
+    @staticmethod
+    def table(out):
+        lines = out.splitlines()
+        head = lines[0].split("\t")
+        return [dict(zip(head, line.split("\t"))) for line in lines[1:] if "\t" in line]
+
+    def rows(self, out):
+        return {row["worker"]: row for row in self.table(out)}
+
+    def test_first_pass_fix_round_and_cross_run_retry(self):
+        with tempfile.TemporaryDirectory() as d:
+            r1, r2 = "20261117-1200-one", "20261118-0900-two"
+            self.add(d, r1, "first", worker="w1", usage=self.usage(100, 20, 1.0))
+            self.add(d, r1, "fixed", worker="w2", sha="fx1",
+                     review="Verdict: Needs fixes\nchanges-sha256: fx1\n")
+            self.add(d, r1, "fixed-r2", worker="w2", sha="fx2", retry_of=f"{r1}/fixed",
+                     started="2026-11-18 10:20:00", finished="2026-11-18 10:30:00",
+                     review="Verdict: Approved\nchanges-sha256: fx2\n")
+            self.add(d, r1, "cross", worker="w3", tier="standard", sha="cx1",
+                     review="Verdict: Needs fixes\nchanges-sha256: cx1\n")
+            self.add(d, r2, "cross", worker="w4", tier="standard", sha="cx2", retry_of=f"{r1}/cross",
+                     started="2026-11-18 11:20:00", finished="2026-11-18 11:30:00",
+                     review="Verdict: Approved\nchanges-sha256: cx2\n")
+            out = M.stats({"runsDir": d})
+            rows = self.rows(out)
+            self.assertEqual(sorted(rows), ["w1", "w2", "w3"])  # the run-2 attempt joins w3's work
+            self.assertEqual((rows["w1"]["settled"], rows["w1"]["accepted"], rows["w1"]["first_pass"],
+                              rows["w1"]["attempts_per_work"]), ("1", "1", "100%", "1.0"))
+            self.assertEqual((rows["w2"]["settled"], rows["w2"]["accepted"], rows["w2"]["first_pass"],
+                              rows["w2"]["attempts_per_work"], rows["w2"]["median_minutes"]),
+                             ("1", "1", "0%", "2.0", "20.0"))
+            self.assertEqual((rows["w3"]["settled"], rows["w3"]["accepted"], rows["w3"]["attempts_per_work"]),
+                             ("1", "1", "2.0"))
+            self.assertIn("API-equivalent", out)
+            self.assertIn("small samples", out)
+
+    def test_provider_failure_then_success_is_first_pass_and_cost_counts(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = "20261118-1000-run"
+            self.add(d, run, "A", status="failed: usage limit", failure="provider", sha="", review="",
+                     usage=self.usage(10, 5, 2.0))
+            self.add(d, run, "A-r2", sha="s2", retry_of=f"{run}/A", started="2026-11-18 10:20:00",
+                     finished="2026-11-18 10:30:00", usage=self.usage(20, 5, 1.0),
+                     review="Verdict: Approved\nchanges-sha256: s2\n")
+            row = self.table(M.stats({"runsDir": d}))[0]
+            self.assertEqual((row["settled"], row["accepted"], row["first_pass"], row["attempts_per_work"]),
+                             ("1", "1", "100%", "1.0"))
+            self.assertEqual((row["tokens_per_accepted"], row["usd_per_accepted"]), ("40", "3.00"))
+
+    def test_a_canceled_attempt_or_one_that_never_started_does_not_change_the_result(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = "20261118-1100-run"
+            self.add(d, run, "A", sha="a1", usage=self.usage(10, 0, 1.0))
+            self.add(d, run, "A-r2", status="canceled: not needed", sha="", review="", retry_of=f"{run}/A",
+                     started="2026-11-18 11:20:00", usage=self.usage(50, 0, 9.0))
+            self.add(d, run, "A-r3", status="queued", worker="", sha="", review="", retry_of=f"{run}/A",
+                     started="")
+            row = self.table(M.stats({"runsDir": d}))[0]
+            self.assertEqual((row["settled"], row["accepted"], row["first_pass"], row["attempts_per_work"]),
+                             ("1", "1", "100%", "1.0"))
+            self.assertEqual((row["tokens_per_accepted"], row["usd_per_accepted"]), ("10", "1.00"))
+
+    def test_a_stale_review_is_not_accepted_and_a_read_only_needs_fixes_is(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = "20261118-1200-run"
+            self.add(d, run, "stale", worker="stale", sha="current",
+                     review="Verdict: Approved\nchanges-sha256: earlier\n")
+            self.add(d, run, "read-only", worker="read-only", tier="standard", changes="0 files +0 -0",
+                     sha="ro", review="Verdict: Needs fixes\nchanges-sha256: ro\n")
+            rows = self.rows(M.stats({"runsDir": d}))
+            self.assertEqual((rows["stale"]["accepted"], rows["stale"]["first_pass"],
+                              rows["stale"]["tokens_per_accepted"], rows["stale"]["usd_per_accepted"]),
+                             ("0", "-", "-", "-"))
+            self.assertEqual((rows["stale"]["settled"], rows["stale"]["open"]), ("0", "1"))
+            self.assertEqual((rows["read-only"]["accepted"], rows["read-only"]["first_pass"]), ("1", "100%"))
+
+    def test_usd_per_accepted_divides_all_attempts_cost_by_accepted_work(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = "20261118-1300-run"
+            self.add(d, run, "good", sha="g", usage=self.usage(10, 5, 3.0))
+            self.add(d, run, "bad", status="failed: ValueError", failure="task", changes=None, sha="", review="",
+                     usage=self.usage(20, 5, 1.0))
+            row = self.table(M.stats({"runsDir": d}))[0]
+            self.assertEqual((row["settled"], row["accepted"], row["attempts_per_work"],
+                              row["tokens_per_accepted"], row["usd_per_accepted"]),
+                             ("2", "1", "1.0", "40", "4.00"))
+
+    def test_legacy_work_is_excluded_from_rows_and_counted_once_in_footer(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.add(d, "run", "accepted", usage=self.usage(10, 5, 1.0))
+            before = M.stats({"runsDir": d})
+            self.assertNotIn("before reviews were recorded", before)
+            self.add(d, "run", "old", changes=None, sha="", usage=self.usage(90, 10, 8.0))
+            self.add(d, "run", "retry", worker="other")
+            self.add(d, "run", "retry-r2", worker="other", changes=None, sha="")
+            after = M.stats({"runsDir": d})
+            self.assertEqual(self.table(after), self.table(before))
+            self.assertIn("2 pieces of work from before reviews were recorded are left out.", after.splitlines())
+
+    def test_unreviewed_retry_changes_only_the_open_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.add(d, "run", "accepted", usage=self.usage(10, 5, 1.0))
+            before = self.table(M.stats({"runsDir": d}))
+            self.add(d, "run", "pending", usage=self.usage(90, 10, 8.0, "subscription"))
+            self.add(d, "run", "pending-r2", sha="", finished="2026-11-18 12:00:00")
+            self.assertEqual(self.table(M.stats({"runsDir": d})), [dict(before[0], open="1")])
+
+    def test_only_open_work_has_no_rates_or_billing(self):
+        with tempfile.TemporaryDirectory() as d:
+            for status in ("queued", "running"):
+                self.add(d, "run", status, status=status, changes=None, sha="")
+            self.add(d, "run", "needs-fixes", review="Verdict: Needs fixes\nchanges-sha256: sha\n",
+                     usage=self.usage(10, 5, 1.0))
+            row = self.table(M.stats({"runsDir": d}))[0]
+            self.assertEqual((row["settled"], row["accepted"], row["open"]), ("0", "0", "3"))
+            for column in ("first_pass", "attempts_per_work", "median_minutes", "tokens_per_accepted",
+                           "usd_per_accepted", "billing"):
+                self.assertEqual(row[column], "-", column)
+
+    def test_partially_priced_settled_attempts_show_a_lower_bound(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.add(d, "run", "task", status="failed: usage limit", failure="provider")
+            self.add(d, "run", "task-r2", usage=self.usage(10, 5, 3.0))
+            self.assertEqual(self.table(M.stats({"runsDir": d}))[0]["usd_per_accepted"], "≥3.00")
+
+    def test_days_filters_runs_by_folder_date(self):
+        with tempfile.TemporaryDirectory() as d:
+            today = datetime.date.today()
+            old = (today - datetime.timedelta(days=10)).strftime("%Y%m%d") + "-0000-old"
+            new = today.strftime("%Y%m%d") + "-0000-new"
+            self.add(d, old, "A", worker="old")
+            self.add(d, new, "B", worker="new")
+            self.assertEqual(sorted(self.rows(M.stats({"runsDir": d}, days=5))), ["new"])
+            self.assertEqual(sorted(self.rows(M.stats({"runsDir": d}, days=1))), ["new"])
+            self.assertEqual(sorted(self.rows(M.stats({"runsDir": d}))), ["new", "old"])
+
+    def test_a_retry_of_loop_and_malformed_files_do_not_crash(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = "20261118-1400-run"
+            self.add(d, run, "a", sha="a", retry_of=f"{run}/b")
+            self.add(d, run, "b", sha="b", retry_of=f"{run}/a")
+            junk = pathlib.Path(d, run, "junk")
+            junk.mkdir()
+            (junk / "meta").write_text("not meta\nretry_of=missing/task\nstarted=not a time\n")
+            (junk / "status").write_text("done\n")
+            (junk / "usage").write_text("{not json")
+            (junk / "review.md").write_text("Verdict: Approved\n")
+            odd = pathlib.Path(d, run, "odd")
+            odd.mkdir()
+            (odd / "meta").write_text("worker=w\ntier=low\nstarted=2026-11-18 10:00:00\nchanges=1 files +1 -0\n")
+            (odd / "status").write_text("done\n")
+            (odd / "review.md").write_text("Verdict: Approved\n")
+            (odd / "usage").write_text(json.dumps({"model": [], "input": [], "output": {}, "usd": "x",
+                                                   "billing": []}))
+            pathlib.Path(d, run, "empty").mkdir()
+            out = M.stats({"runsDir": d})
+            self.assertEqual(out.splitlines()[0], "tier\tworker\tmodel\tsettled\taccepted\topen\tfirst_pass\t"
+                                                  "attempts_per_work\tmedian_minutes\ttokens_per_accepted\t"
+                                                  "usd_per_accepted\tbilling")
+            # a and b share a row, odd has malformed usage, and junk predates recorded changes.
+            self.assertEqual(len(self.table(out)), 2)
+            self.assertEqual(self.table(out)[0]["usd_per_accepted"], "-")
+            self.assertEqual(self.table(out)[1]["settled"], "2")

@@ -15,6 +15,7 @@ Read `~/.muster/config.json` (or `MUSTER_CONFIG`) at the start of every run; `py
 - `routing`: `{ match, workers, preamble? }` list. The first `match` glob (`~` allowed) that fits the cwd gives its workers, first choice first; `*` is the fallback.
 - `only.<worker>`: the only globs that worker may work in; never route elsewhere, not even as a quota fallback. The runner refuses outside them (exit 3).
 - `caps.<worker>` or `caps.<type>`: tasks at once per worker (default codex 3, claude 5). The runner queues over the cap.
+- `tiers.<low|standard|high>`: optional. `prefer` lists workers moved to the front of a task's worker list (after `only` has filtered it); `args` maps a worker name or type to extra CLI arguments, passed after the worker's own `args`, with a worker name winning over its type. Give a task one with `--tier`.
 - `preamble` and the matching `routing` entry's `preamble`: lines added to every prompt's rules block.
 - The user's explicit choice always wins over the config.
 
@@ -24,7 +25,12 @@ Metered workers on a peak-priced model (`prices.json`; DeepSeek costs double wee
 
 ## Loop
 
-1. **Plan.** Split the request into independent tasks, each with a goal, scope and done check. Show a table (id, worker, cwd, goal) and start without waiting unless the request is ambiguous. Size each task so one run can finish it; work that needs design judgment gets the design written into the brief, or stays with Claude.
+1. **Plan.** Split the request into independent tasks, each with a goal, scope and done check. Show a table (id, worker, cwd, tier, goal) and start without waiting unless the request is ambiguous; the `tier` column appears when the config has `tiers`. Size each task so one run can finish it; work that needs design judgment gets the design written into the brief, or stays with Claude.
+   With `tiers` in the config, give each task a tier:
+   - `low`: at most about 2 files and 100 changed lines, an unambiguous brief, a runnable `--check`, and nothing touching secrets, authentication, payments or private data.
+   - `standard`: the default, and the choice when unsure. A task without a runnable check starts here or higher.
+   - `high`: cross-module work, 3 or more files with non-trivial logic, concurrency, security, data migrations, or independent review of risky code.
+   The file and line numbers are starting points, not measured limits.
 2. **Isolate.** Parallel writers to one repo each get a worktree: `git -C <repo> worktree add ../<repo>-<task-id> -b muster/<task-id>`. One writer, or read-only tasks, may share the repo.
 3. **Prepare.** Task dir: `<runsDir>/<YYYYMMDD-HHMM>-<slug>/<task-id>/` (`runsDir` default `~/.muster/runs`). `<task-id>` is a kebab-case slug (`^[a-z][a-z0-9]*(-[a-z0-9]+)*$`, max 63 chars) from the title's English core, e.g. `fix-pr-association-wait`; a retry appends `-r2`, `-r3`. It labels the task in the pane, names it in `--after` and ends its `muster/<task-id>` branch, so keep it stable.
    Write `prompt.md`. Workers start cold and run once, so it is a full brief:
@@ -53,7 +59,8 @@ Metered workers on a peak-priced model (`prices.json`; DeepSeek costs double wee
 
    Then the config's `preamble` lines, the matching `routing` entry's, and any repo rule from the user's own instructions for this cwd (workers do not see Claude's CLAUDE.md or memory).
 4. **Launch.** Each task in its own Bash call with `run_in_background: true`, all in one message, dependent ones too:
-   `python3 $MUSTER run <worker[,worker…]> <task-dir> <cwd> [--after A,B] [--priority N] [--check "<done check>"] [--retry-of <task-dir>]`
+   `python3 $MUSTER run <worker[,worker…]> <task-dir> <cwd> [--after A,B] [--priority N] [--check "<done check>"] [--retry-of <task-dir>] [--tier <name>]`
+   - `--tier <name>`: the task's tier from step 1. Omit it when the config has no `tiers`; without it the worker command is unchanged.
    - `--retry-of <task-dir>`: give it on every rerun of earlier work, whatever its id or run: the task dir of the attempt it replaces. Progress counts both as one piece of work and the newest attempt decides.
    - `--after A,B`: wait until sibling tasks A and B are `done`; if one fails or is canceled, this one is canceled (exit 5).
    - `--priority N` (default 0): on a full worker, higher starts first.
@@ -70,6 +77,7 @@ Metered workers on a peak-priced model (`prices.json`; DeepSeek costs double wee
      Rate each finding Critical, Important (task cannot be trusted until fixed) or Minor. A problem in code the task did not change is Pre-existing: report it, do not send it back.
    - **The change must not grade itself.** Read the hunks in `tests_touched` (changed tests and files the `--check` runs) first: a weakened assertion, a skipped or deleted test or a loosened check script is Critical unless the brief asked for it. Never rerun a failed check hoping for green; a flaky check is a finding.
    - **A fresh reviewer** for a diff over about 300 lines or 8 files, or when your context is long: an Agent subagent (`general-purpose`) given the paths of `prompt.md`, `result.md`, `check.txt` and `changes.diff`, told to read the whole diff, treat `result.md` and the worker's reasons as unverified claims, review against the brief rather than taste, cite `file:line`, rate each finding, list what it cannot verify, and end with `Verdict: Approved` or `Verdict: Needs fixes`. Do not tell it what you expect to find. Confirm its Critical and Important findings in the code yourself.
+   - **Claude's own subagents** suit short read-only work that needs this session's context, such as lookups and fresh review. They do not replace workers for code changes, because they get no runner evidence. Use a small model for lookups. A fresh reviewer helps because it did not see the author's reasoning, not because it is a stronger model.
    - **Record** `review.md` in the task dir:
      ```
      Reviewer: <Claude, or reviewer subagent>
@@ -80,12 +88,12 @@ Metered workers on a peak-priced model (`prices.json`; DeepSeek costs double wee
      ```
      `Approved` needs no open Critical or Important finding and every Cannot verify item settled (run it, check it, or ask the user). `Verdict: User override` only when the user explicitly said to merge without review.
    - Tasks in one repo: compare the files in their `changes.diff`; an overlap is a merge conflict to plan.
-   **Fix loop.** Critical or Important findings, or `failed: done check failed`: write `<task-id>-r2` (launched with `--retry-of` the task it fixes) repeating the original brief plus each finding at `file:line` (or the end of `check.txt`) and what is wanted, and run it in the same worktree. Its diff holds only the fix; review it against the brief and the findings. Once approved, set the original's `review.md` to `Verdict: Approved` with `Fixed in: <task-id>-r2`, keeping its own `changes-sha256`. Tasks canceled because they ran `--after` the failed one do not restart by themselves: launch them again with `--after <task-id>-r2`. `failed: worker reported BLOCKED` or `NEEDS_CONTEXT`: `result.md` says why; answer in the follow-up, or split the task. After three failed rounds (the first run and two fixes), stop: use a stronger worker, do it yourself, or ask the user.
+   **Fix loop.** Critical or Important findings, or `failed: done check failed`: write `<task-id>-r2` (launched with `--retry-of` the task it fixes) repeating the original brief plus each finding at `file:line` (or the end of `check.txt`) and what is wanted, and run it in the same worktree. Its diff holds only the fix; review it against the brief and the findings. Once approved, set the original's `review.md` to `Verdict: Approved` with `Fixed in: <task-id>-r2`, keeping its own `changes-sha256`. Tasks canceled because they ran `--after` the failed one do not restart by themselves: launch them again with `--after <task-id>-r2`. `failed: worker reported BLOCKED` or `NEEDS_CONTEXT`: `result.md` says why; answer in the follow-up, or split the task. After three failed rounds (the first run and two fixes), stop: use a stronger worker, do it yourself, or ask the user. After a task failure (`failure=task` in `meta`, or a `Needs fixes` review), the next attempt goes up one tier, at most two escalations. After `failure=provider`, rerun on another worker at the same tier; it does not count as a failed round.
    **Empty diff.** The pane treats a reviewed task whose meta has `changes=0 files …` as a finished read-only review; outside a git repo (`changes=unavailable`) only `Verdict: Approved` finishes it. If the task was meant to change code, run `<task-id>-r2` instead of recording it as reviewed. For a read-only task the report is the result: confirm its Critical and Important findings in the code, then write `review.md` with meta's `changes_sha256`, the confirmed findings under `Findings`, and `Verdict: Needs fixes` if any stay open or `Verdict: Approved` if none do. Either verdict finishes the task; open findings become follow-up work.
 
    **Record before moving on.** Confirming findings in the conversation does not finish a task: until `review.md` exists the pane shows it as waiting. Write it before you report the run or start other work. When a turn ends with a finished run still waiting, the pane sends this session back once per task.
    **Learn from misses.** The same kind of miss caught twice in one project: propose one line for that project's `routing[].preamble` and add it once the user agrees. Drop preamble lines that no longer fire.
-7. **Report** as below. Merge, commit and push only when asked; after a `muster/*` branch is merged, offer to remove its worktree. Asked what can be cleaned up: show `python3 $MUSTER clean` (it deletes nothing) and remove only what the user picks.
+7. **Report** as below. Merge, commit and push only when asked; after a `muster/*` branch is merged, offer to remove its worktree. Asked what can be cleaned up: show `python3 $MUSTER clean` (it deletes nothing) and remove only what the user picks. Asked how tiers perform: run `python3 $MUSTER stats` (add `--days N` to bound it) and report rates and costs with the row's `settled` count. Report `open` separately and keep any `≥` on partially priced costs.
 
 ## Report format
 
