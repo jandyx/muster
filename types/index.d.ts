@@ -31,7 +31,13 @@ export type Task = {
   // What a running task does once its worker has exited (the done check, saving results), and since when; else ''.
   phase: string
   phaseMs: number
+  // decision.md while it waits for the user (no `Decided:` line yet); else null.
+  decision: Decision | null
+  // Approved, changed files on a branch, review.md has a `Summary:` and no `Merged:` yet.
+  mergeable: boolean
 }
+// A question Claude hands the user, from decision.md, in the user's language.
+export type Decision = { question: string; context: string; options: string[]; recommend: string }
 export type Usage = {
   model: string
   input: number
@@ -61,6 +67,7 @@ declare module 'claude-code' {
       agents: Shaped<Agent[]>
       notified: Shaped<string[]>
       reminded: Shaped<string[]>
+      sent: Shaped<Record<string, string>>
       folds: Shaped<Record<string, boolean>>
     }
   }

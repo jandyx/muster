@@ -244,6 +244,8 @@ Above the runs, **Claude agents** lists the subagents this Claude Code session s
 
 Inside a run, tasks are grouped as Running, Queued, Failed, Needs fixes, Needs review, Canceled and Done; earlier attempts of reworked tasks fold under Retried. A task that changed nothing counts as a finished read-only review once `review.md` covers it, whatever its verdict. Done holds only reviewed work (and older tasks with no recorded diff); the `status` file still says `done` for the others, because the worker and its check succeeded. When a run has stopped working and tasks in it still wait for review or fixes, the session that dispatched it is sent back once per task at the end of its turn; a closed session is not reopened.
 
+At the top, **Waiting for you** lists what only you can settle, in your language: a question Claude wrote into the task's `decision.md` (with what each option leads to and which it recommends), and reviewed work ready to merge (from `review.md`'s `Summary:`). Picking an option sends it to Claude as your answer. **Merge…** and **Send back…** only fill the prompt box, so nothing hard to undo happens until you press Enter. A merge item clears when Claude records `Merged:` in `review.md`, or on its own once git sees the work landed (the branch deleted, or its committed work in trunk, checked once a minute); after a squash merge that keeps the branch, use **Hide**. The band shows `✉ you ×N` while anything waits there, even after its run has finished.
+
 Finished runs fold to one line with their totals; a run with work left to review or fix stays open. A toast tells you when a task ends. Each worker keeps one color everywhere, and each task names the model it ran on (with its reasoning effort for Codex).
 
 ## Tokens and cost

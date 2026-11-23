@@ -1,14 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Agent, Run, Task, Usage } from '../types'
+import type { Agent, Decision, Run, Task, Usage } from '../types'
 
 const PANE = 'muster'
 const TITLE = 'Muster'
 const POLL_MS = 5000
 
 // Change a tag when its value's fields change, so a reload declines old values.
-const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-13' })
+const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-14' })
 // The session's own subagents (`$.agent.list()`), refreshed every poll. They are not Muster runs: no worker,
 // no cost; the list is already bound to this session, so it needs no session filter.
 const agentsAtom = atom({ plugin: 'muster', key: 'agents' } as const, [] as Agent[], { shape: 'agents-1' })
@@ -18,6 +18,8 @@ const foldsAtom = atom({ plugin: 'muster', key: 'folds' } as const, {}, { shape:
 const notifiedAtom = atom({ plugin: 'muster', key: 'notified' } as const, [], { shape: 'notified-1' })
 // Tasks the dispatching session was already sent back for, so each is reminded once.
 const remindedAtom = atom({ plugin: 'muster', key: 'reminded' } as const, [], { shape: 'reminded-1' })
+// Inbox choices already sent to Claude, by item key, with what was sent; the row shows that instead of its buttons.
+const sentAtom = atom({ plugin: 'muster', key: 'sent' } as const, {}, { shape: 'sent-1' })
 
 // Cells in the band's overall progress bar.
 const BAND_BAR = 8
@@ -86,6 +88,38 @@ type Lineage = ReturnType<typeof lineage>
 const retriedAttempts = (tasks: Task[], attempts: Lineage) => tasks.filter(t => !attempts.latest.has(t) && isFinished(t))
 // Something in the run still runs, or its newest work waits for a review or fixes.
 const isOpen = (run: Run, attempts: Lineage) => run.tasks.some(t => isActive(t) || (attempts.latest.has(t) && needsAttention(t)))
+// decision.md, written by Claude when only the user can decide: `Question:`, `Context:` (may run on several
+// lines), `Options:` with one `- ` or `1. ` line each, `Recommend:`. A `Decided:` line closes it.
+const parseDecision = (text: string): Decision | null => {
+  if (text.trim() === '' || /^\W*Decided\W*:/im.test(text)) return null
+  const d: Decision = { question: '', context: '', options: [], recommend: '' }
+  let field = ''
+  for (const raw of text.split('\n')) {
+    const line = raw.trim()
+    const head = /^\W*(Question|Context|Options|Recommend)\W*:\s*(.*)$/i.exec(line)
+    if (head) {
+      field = head[1]!.toLowerCase()
+      if (field !== 'options') d[field as 'question' | 'context' | 'recommend'] = head[2]!
+      continue
+    }
+    if (line === '') continue
+    if (field === 'options') d.options.push(line.replace(/^(?:[-*•]|\d+[.)])\s*/, ''))
+    // Lines of CJK text join without a space, as they read in the file.
+    else if (field === 'question' || field === 'context' || field === 'recommend')
+      d[field] = d[field] === '' ? line : cells(d[field].at(-1)!) === 2 || cells(line[0]!) === 2 ? d[field] + line : `${d[field]} ${line}`
+  }
+  return d.question === '' ? null : d
+}
+type InboxItem = { key: string; task: Task; decision: Decision | null }
+// What only the user can settle, newest attempt only: a question Claude handed over, then work approved and waiting
+// to be merged. A rerun of the task replaces it, so an answered question leaves once Claude acts on it.
+// Items the user hid (Hide) stay out, by the same id the sent record uses.
+const itemId = (i: InboxItem) => (i.decision ? `${i.key}|${i.decision.question}` : `${i.key}|merge`)
+const HIDDEN = 'hidden'
+const inboxOf = (runs: Run[], attempts: Lineage, sent: Record<string, string>): InboxItem[] => {
+  const items = runs.flatMap(r => r.tasks.filter(t => attempts.latest.has(t)).map(t => ({ key: `${r.name}/${t.id}`, task: t, decision: t.decision })))
+  return [...items.filter(i => i.decision !== null), ...items.filter(i => i.decision === null && i.task.mergeable)].filter(i => sent[itemId(i)] !== HIDDEN)
+}
 // Pane sections inside a run, in display order; a task falls into the first whose test it passes.
 const SECTIONS: [string, string | undefined, (t: Task) => boolean][] = [
   ['Running', 'yellow', isRunning],
@@ -259,6 +293,7 @@ const cells = (ch: string) => {
     ? 2
     : 1
 }
+const NO_LINE_START = '\u3002\uff0c\u3001\uff1b\uff1a\uff01\uff1f\uff09\u300d\u300f\u300b\u3011,.;:!?)'
 const width = (text: string) => [...text].reduce((a, c) => a + cells(c), 0)
 // Splits text into lines of `width` cells, breaking at the last space when there is one; past `max` lines it
 // keeps `max` and ends the last with "…".
@@ -273,6 +308,10 @@ const wrapCells = (text: string, cols: number, max: number) => {
       if (space > 0 && ch !== ' ' && width(line.slice(0, space)) >= w * 0.6) {
         lines.push(line.slice(0, space))
         line = line.slice(space + 1)
+      } else if (NO_LINE_START.includes(ch) && [...line].length > 1) {
+        // Closing punctuation never starts a line: the character before it moves down with it.
+        lines.push([...line].slice(0, -1).join(''))
+        line = [...line].at(-1)!
       } else {
         lines.push(line)
         line = ''
@@ -391,18 +430,51 @@ export const register: Register = on => {
       return (100 - pct) / ((pct - prev.pct) / dt)
     }
 
+    // A merge made outside Claude (a PR merged on GitHub, a local git merge) leaves no `Merged:` line, so git is asked:
+    // the branch is gone, or trunk holds its commits (by patch, as muster.py's `unmerged` counts rebased work). Workers
+    // do not commit unless told to, so work still uncommitted, or a branch that has not moved past `base_head` (HEAD
+    // when the task started), is never merged, though trunk trivially contains such a branch. Asked
+    // at most once a minute per task, and a merged answer is kept. A squash merge is invisible here until the branch is
+    // deleted; the row's Hide covers that.
+    const landed = new Map<string, { at: number; isMerged: boolean }>()
+    const isLanded = async (key: string, cwd: string, branch: string, baseHead: string) => {
+      const seen = landed.get(key)
+      if (seen && (seen.isMerged || Date.now() - seen.at < 60000)) return seen.isMerged
+      const git = (...args: string[]) => $.process.run(['git', '-C', cwd, ...args], { timeoutMs: 5000 }).catch(() => ({ exitCode: -1, stdout: '' }))
+      const check = async () => {
+        // `rev-parse --verify -q` exits 1 for a missing ref; anything else unexpected means git cannot tell.
+        const ref = await git('rev-parse', '--verify', '-q', `refs/heads/${branch}`)
+        if (ref.exitCode === 1) return true
+        if (ref.exitCode !== 0) return false
+        const dirty = await git('status', '--porcelain')
+        if (dirty.exitCode !== 0 || dirty.stdout.trim() !== '') return false
+        if (baseHead === '' || (await git('rev-parse', branch)).stdout.trim() === baseHead) return false
+        const origin = await git('symbolic-ref', '-q', '--short', 'refs/remotes/origin/HEAD')
+        let trunk = origin.exitCode === 0 ? origin.stdout.trim() : ''
+        for (const b of ['main', 'master']) if (trunk === '' && (await git('rev-parse', '--verify', '-q', `refs/heads/${b}`)).exitCode === 0) trunk = b
+        if (trunk === '' || trunk.endsWith(`/${branch}`) || trunk === branch) return false
+        if ((await git('merge-base', '--is-ancestor', branch, trunk)).exitCode === 0) return true
+        const cherry = await git('cherry', trunk, branch)
+        return cherry.exitCode === 0 && !cherry.stdout.split('\n').some(l => l.startsWith('+'))
+      }
+      const isMerged = await check()
+      landed.set(key, { at: Date.now(), isMerged })
+      return isMerged
+    }
+
     const loadTasks = async (name: string): Promise<Task[]> => {
       const dirs = (await $.fs.list(`${root}/${name}`)).filter(d => d.kind === 'dir').map(d => d.name).sort()
       return Promise.all(
         dirs.map(async (id): Promise<Task> => {
           const dir = `${root}/${name}/${id}`
-          const [status, meta, result, prompt, usageText, reviewText] = await Promise.all([
+          const [status, meta, result, prompt, usageText, reviewText, decisionText] = await Promise.all([
             readText(`${dir}/status`),
             readText(`${dir}/meta`),
             readText(`${dir}/result.md`),
             readText(`${dir}/prompt.md`),
             readText(`${dir}/usage`),
             readText(`${dir}/review.md`),
+            readText(`${dir}/decision.md`),
           ])
           let usage: Usage | null = null
           try {
@@ -413,7 +485,8 @@ export const register: Register = on => {
           const kv = Object.fromEntries(
             meta.split('\n').filter(l => l.includes('=')).map(l => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]),
           )
-          const first = result.split('\n').filter(l => !/^\s*#/.test(l)).map(l => l.replace(/^[>*\-\s]+/, '').trim()).find(Boolean) ?? ''
+          // The report opens with `Status: DONE` by rule, which says nothing; other statuses (concerns, blocked) stay.
+          const first = result.split('\n').filter(l => !/^\s*#/.test(l) && !/^\W*Status\W*:\W*DONE\W*$/i.test(l)).map(l => l.replace(/^[>*\-\s]+/, '').trim()).find(Boolean) ?? ''
           const tidy = first
             .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1') // [report.md](/long/path) -> report.md
             .replace(/`?(\/[^\s`]+\/)([^\s`/]+)`?/g, '$2') // /abs/path/report.md -> report.md
@@ -456,6 +529,10 @@ export const register: Register = on => {
           // A task that changed nothing was a read-only review: its verdict is about what it read, and the review is done.
           const readOnly = kv.changes?.startsWith('0 files') ?? false
           const review = status.trim() !== 'done' || kv.changes === undefined ? '' : approved || (fixes && readOnly) ? 'reviewed' : fixes ? 'needs fixes' : 'needs review'
+          // Claude's one-line account of the change in review.md (`Summary:`), in the user's language; `Merged:` or `Not merging:` once settled.
+          const reviewSummary = /^\W*Summary\W*:\s*(.+)$/im.exec(reviewText)?.[1]?.trim() ?? ''
+          const mergeable = status.trim() === 'done' && approved && !readOnly && kv.changes !== undefined && branch !== '' && reviewSummary !== '' &&
+            !/^\W*(Merged|Not merging)\W*:/im.test(reviewText) && !(await isLanded(`${name}/${id}`, kv.cwd ?? '', branch, kv.base_head ?? ''))
           // After the worker exits its log goes quiet on purpose; meta says what the runner is doing instead.
           const phase = !isLive ? '' : kv.check_started ? 'running done check' : kv.check_waiting ? 'waiting for done check' : kv.worker_exited ? 'saving results' : ''
           return {
@@ -475,7 +552,9 @@ export const register: Register = on => {
             priority: Number(kv.priority ?? 0) || 0,
             retryOf: kv.retry_of ?? '',
             finishedMs: parseTime(kv.finished),
-            summary: tidy.slice(0, 400),
+            summary: (reviewSummary || tidy).slice(0, 400),
+            decision: parseDecision(decisionText),
+            mergeable,
             reason,
             logPath: failed ? (kv.log_path ?? '') : '',
             usage,
@@ -584,7 +663,7 @@ export const register: Register = on => {
     if (result.preventContinuation) return result
     await update($, remindedAtom, old => [...old, ...waiting.map(w => w.key)].slice(-500))
     const list = waiting.map(w => `- ${w.key}: ${w.review}`).join('\n')
-    const text = `Muster: finished tasks from this session still wait for you:\n${list}\nFollow step 6 of the muster skill now: review each one and record review.md, or launch its fix. If one needs the user's decision, say which and why. Answer in the language the user writes in, not the language of this reminder. This reminder comes once per task.`
+    const text = `Muster: finished tasks from this session still wait for you:\n${list}\nFollow step 6 of the muster skill now: review each one and record review.md, or launch its fix. If one needs the user's decision, write its decision.md as step 6 says. Answer in the language the user writes in, not the language of this reminder. This reminder comes once per task.`
     // Our block would replace a lower hook's, so join them.
     return { ...result, block: result.block ? `${result.block}\n\n${text}` : text }
   })
@@ -616,7 +695,9 @@ export const register: Register = on => {
     // Same rows as text, so a session that cannot show the pane still gets the state in its own context.
     const runs = await read($, runsAtom)
     const agents = (await read($, agentsAtom)).filter(isAgentActive)
+    const waiting = inboxOf(runs, lineage(runs), await read($, sentAtom))
     const rows = [
+      ...waiting.map(i => `waiting for you · ${i.decision ? i.decision.question : `${i.task.title}: ready to merge`} · ${i.key}`),
       ...runs.flatMap(r =>
         r.tasks.filter(isActive).map(t => `${t.id} · ${t.worker} · ${t.status}${t.pctText ? ` · ${t.pctText}` : ''} · ${t.title}`),
       ),
@@ -674,6 +755,58 @@ export const register: Register = on => {
       const extra = [[n(needsFixes), 'needs fixes'], [n(needsReview), 'needs review'], [n(isQueued), 'queued'], [n(isCanceled), 'canceled'], [retriedAttempts(run.tasks, attempts).length, 'retried']].filter(([k]) => k).map(([k, l]) => ` · ${k} ${l}`).join('')
       return `${run.tasks.filter(isRunning).length} running · ${n(isDone)} done · ${n(isFailed)} failed${extra}`
     }
+    // The inbox: what only the user can settle, at the top. A choice goes to Claude as the user's own message; merging
+    // and sending back only fill the prompt box, so nothing that is hard to undo leaves without the user's Enter.
+    const sent = await read($, sentAtom)
+    const inbox = inboxOf(runs, attempts, sent)
+    const record = (id: string, label: string | undefined) =>
+      update($, sentAtom, old => Object.fromEntries([...Object.entries(old).filter(([k]) => k !== id), ...(label === undefined ? [] : [[id, label]])].slice(-50)))
+    // Marked before sending: submit resolves only once the prompt has gone through every UserPromptSubmit hook, which
+    // can outlast a press's time budget. A prompt that does not enter takes the mark back.
+    const choose = (id: string, label: string, text: string) => async () => {
+      await record(id, label)
+      void $.prompt.submit({ text, asUser: true }).then(
+        async r => {
+          if (r.drop !== undefined) await record(id, undefined)
+        },
+        () => record(id, undefined),
+      )
+    }
+    const fill = (text: string) => async () => {
+      if (!(await $.prompt.fill({ text })).isFilled) $.ui.toast('muster: the prompt box is busy; close the dialog and try again')
+    }
+    const InboxRow = (item: InboxItem) => {
+      const { key, task: t, decision: d } = item
+      const id = itemId(item)
+      const said = sent[id]
+      const lines = (text: string, max: number, lead = '     ') => wrapCells(text, detailWidth - 1, max).map(line => <Text>{lead}{line}</Text>)
+      // Self-contained, so a session that has not loaded the muster skill still knows where the answer goes.
+      const ask = `Muster decision for ${key}, "${d?.question ?? ''}"`
+      const after = (n: string) => ` (Append "Decided: ${n}" to that task's decision.md in the muster runsDir, then carry it out as step 6 of the muster skill says.)`
+      return (
+        <Box flexDirection="column" marginTop={1}>
+          <Text bold color={d ? 'warning' : 'success'}>{'  '}{d ? `❓ ${d.question}` : `⇢ ${t.title}: ready to merge`}</Text>
+          {lines(d ? d.context : t.summary, 4)}
+          {d?.options.map((o, i) => wrapCells(`${i + 1}. ${o}`, detailWidth - 1, 2).map((line, j) => <Text>{'     '}{j === 0 ? '' : '   '}{line}</Text>))}
+          {d && d.recommend !== '' && lines(`→ ${d.recommend}`, 2)}
+          {said !== undefined ? (
+            <Text color="success">{'     '}✓ sent: {said} · waiting for Claude</Text>
+          ) : (
+            <Box flexDirection="row" gap={2}>
+              <Text>{'    '}</Text>
+              {d?.options.map((o, i) => (
+                <Button key={`decide:${key}:${i + 1}`} onPress={choose(id, `option ${i + 1}`, `${ask}: option ${i + 1}, ${o}.${after(`option ${i + 1}`)}`)}>Option {i + 1}</Button>
+              ))}
+              {d && <Button key={`other:${key}`} onPress={fill(`${ask}: `)}>Other…</Button>}
+              {!d && <Button key={`merge:${key}`} onPress={fill(`Muster: merge ${key} (${t.title}).`)}>Merge…</Button>}
+              {!d && <Button key={`back:${key}`} onPress={fill(`Muster: do not merge ${key} (${t.title}) yet: `)}>Send back…</Button>}
+              <Button key={`hide:${key}`} onPress={() => void record(id, HIDDEN)}>Hide</Button>
+            </Box>
+          )}
+          <Text dimColor>{'     '}{key}{t.branch ? ` · ⎇ ${t.branch}` : ''}</Text>
+        </Box>
+      )
+    }
     // Subagent rows: running first, then waiting; finished ones sit under their own fold.
     const agentRows = (list: Agent[]) =>
       [...list]
@@ -707,6 +840,12 @@ export const register: Register = on => {
         </Box>
         <Text dimColor>{e.props.isFocused ? '↑↓ scroll · Enter folds a run, section or agent' : 'Click or ctrl+x tab here to scroll and fold'}</Text>
         <Text> </Text>
+        {inbox.length > 0 && (
+          <Box flexDirection="column" marginBottom={1}>
+            <Text bold>✉ Waiting for you · {inbox.length}</Text>
+            {inbox.map(InboxRow)}
+          </Box>
+        )}
         {agents.length > 0 && (
           <Box flexDirection="column" marginBottom={1}>
             <Button key="agents" plain onPress={() => void update($, foldsAtom, old => ({ ...old, agents: !isAgentsFolded }))}>
@@ -854,7 +993,9 @@ export const register: Register = on => {
     const active = runs.filter(r => isOpen(r, attempts))
     // Claude's own subagents count while one is still going; a finished one leaves the band quiet.
     const activeAgents = (await read($, agentsAtom)).filter(isAgentActive)
-    if (e.props.hasSurvey || (active.length === 0 && activeAgents.length === 0)) return next(e)
+    // Work waiting for the user keeps the band up even after its run has finished.
+    const asks = inboxOf(runs, attempts, await read($, sentAtom)).length
+    if (e.props.hasSurvey || (active.length === 0 && activeAgents.length === 0 && asks === 0)) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     const now = await $.clock.now()
     // One line across all runs, short enough for a docked pane: what needs you, most urgent first. The bar's number
@@ -874,6 +1015,7 @@ export const register: Register = on => {
     ] as const).map(([test, sign, label, color]) => ({ n: tasks.filter(test).length, sign, label, color })).filter(c => c.n > 0)
     const only = running.length === 1 ? running[0]! : undefined
     const parts = [
+      asks > 0 && <Text color="warning" bold>✉ you ×{asks}</Text>,
       planned > 0 && (
         <Text>
           <Text color="green">{'█'.repeat(filled)}</Text>
