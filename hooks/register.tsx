@@ -584,7 +584,7 @@ export const register: Register = on => {
     if (result.preventContinuation) return result
     await update($, remindedAtom, old => [...old, ...waiting.map(w => w.key)].slice(-500))
     const list = waiting.map(w => `- ${w.key}: ${w.review}`).join('\n')
-    const text = `Muster: finished tasks from this session still wait for you:\n${list}\nFollow step 6 of the muster skill now: review each one and record review.md, or launch its fix. If one needs the user's decision, say which and why. This reminder comes once per task.`
+    const text = `Muster: finished tasks from this session still wait for you:\n${list}\nFollow step 6 of the muster skill now: review each one and record review.md, or launch its fix. If one needs the user's decision, say which and why. Answer in the language the user writes in, not the language of this reminder. This reminder comes once per task.`
     // Our block would replace a lower hook's, so join them.
     return { ...result, block: result.block ? `${result.block}\n\n${text}` : text }
   })
