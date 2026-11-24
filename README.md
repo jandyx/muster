@@ -265,9 +265,7 @@ The full decision chain is drawn in [docs/how-it-works.md](docs/how-it-works.md#
 
 `python3 <plugin>/skills/muster/muster.py stats [--days N] [--since D] [--until D] [--by FIELDS]` reports on run history in read-only mode. Retries linked with `--retry-of` or named `x`, `x-r2` belong to one piece of work. Canceled attempts and attempts that never started are ignored.
 
-Run `python3 <plugin>/skills/muster/muster.py stats --tui` in a terminal for an activity heatmap and breakdowns by repository and worker. Use ←/→ or `h`/`l` to switch tabs, Tab to cycle through all time, the last 7 days and the last 30 days, ↑/↓ or `k`/`j` to scroll the tables, and Esc or `q` to close. The range changes the figures and tables. The heatmap always shows the loaded history, which you can limit with `--days`, `--since` and `--until`.
-
-`stats --json` writes the same heatmap levels, formatted metrics and table rows to standard output without a TTY. It accepts the same date filters.
+`stats --json` writes the data for `/muster-stats` to standard output. The heatmap covers the history loaded with `--days`, `--since` and `--until`. The pane's date range selects which metrics and table rows to show.
 
 Use `--by repo,type` to compare worker types within each repository. Choose a comma-separated list from `repo`, `type`, `tier`, `worker` and `model`. These fields appear first, in the order given, and come from the first counted attempt. The default is `tier,worker,model`.
 

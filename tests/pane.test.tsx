@@ -917,13 +917,12 @@ const statsPane = {
 } as const
 const statsTable = (group: string[], groups: string[][]) => ({
   columns: [...group, 'Settled', 'First pass', 'Sent back', 'Claude fixed', 'Blocked', 'Check failed', 'Cost/accepted'],
-  medium: [...group, 'Settled', 'First pass', 'Back', 'Fixed', 'Block', 'Check', '$/ok'],
   short: [...group, 'Set', 'First pass', 'Back', 'Fix', 'Blk', 'Chk', '$/ok'],
   keys: group.length, has_small: true,
   rows: groups.map(values => ({ cells: [...values, '4', ' 75%*', '1', '0', '0', '0', '≥$0.26'], bar: 8, small: true })),
 })
 const statsView = {
-  version: 1, today: '2026-11-27', legacy_note: '2 pieces from before reviews were recorded are left out.',
+  version: 2, today: '2026-11-27', legacy_note: '2 pieces from before reviews were recorded are left out.',
   labels: {
     tabs: ['Overview', 'Repos', 'Workers'], weekdays: ['Mon', '', 'Wed', '', 'Fri', '', ''],
     less: 'Less', more: 'More', shades: '·░▒▓█', pane_hint: 'Navigation hint from Python',
@@ -937,7 +936,6 @@ const statsView = {
     name, metrics: [['Pieces of work', i === 1 ? '2 (2 settled/0 open)' : '4 (4 settled/0 open)']],
     usage: 'Input 1.7b · Output 4.6m · Cost ≥$1 · Lines +8 -2',
     types: 'codex 75% first pass (n=4)', fun: 'Workers added 8 of the ~9k lines in the original UNIX v6 kernel.',
-    fun_short: '8 / ~9k lines of the original UNIX v6 kernel',
     tables: {
       Repos: statsTable(['Repo', 'Type'], ['project-a', 'project-b', 'project-c', 'project-d', 'project-e', 'project-f'].map(repo => [repo, 'codex'])),
       Workers: statsTable(['Tier', 'Worker', 'Model'], [['low', 'worker-a', 'model-a']]),

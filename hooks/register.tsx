@@ -9,7 +9,7 @@ const POLL_MS = 5000
 
 // Change a tag when its value's fields change, so a reload declines old values.
 const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-15' })
-const statsAtom = atom({ plugin: 'muster', key: 'stats' } as const, null, { shape: 'stats-2' })
+const statsAtom = atom({ plugin: 'muster', key: 'stats' } as const, null, { shape: 'stats-3' })
 // The session's own subagents (`$.agent.list()`), refreshed every poll. They are not Muster runs: no worker,
 // no cost; the list is already bound to this session, so it needs no session filter.
 const agentsAtom = atom({ plugin: 'muster', key: 'agents' } as const, [] as Agent[], { shape: 'agents-1' })
@@ -30,7 +30,7 @@ function parseStats(json: string): StatsView {
   const text = (v: unknown) => typeof v === 'string'
   const strings = (v: unknown) => Array.isArray(v) && v.every(text)
   const note = (v: unknown) => v === null || text(v)
-  if (view?.version !== 1 || !text(view.today) || !note(view.legacy_note)) throw new Error('Invalid stats view (expected version 1)')
+  if (view?.version !== 2 || !text(view.today) || !note(view.legacy_note)) throw new Error('Invalid stats view (expected version 2)')
   const { labels, days, weeks, ranges } = view
   if (!labels || !strings(labels.tabs) || labels.tabs.length !== 3 ||
       !strings(labels.weekdays) || labels.weekdays.length !== 7 || !text(labels.shades) || labels.shades.length !== 5 ||
