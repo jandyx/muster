@@ -542,6 +542,64 @@ class Queue(unittest.TestCase):
         self.assertEqual(p.wait(timeout=20), 0)
         self.assertEqual(M.read_meta(str(t2))["worker"], "v")
 
+    def test_a_queued_task_fails_when_the_busy_worker_also_runs_out(self):
+        worker = self.cfg["workers"]["w"]
+        worker.update(type="codex", codexHome=str(self.d / "w-home"))
+        self.cfg["workers"]["v"] = dict(worker, codexHome=str(self.d / "v-home"))
+        self.cfg["caps"]["v"] = 1
+        self.cfg_path.write_text(json.dumps(self.cfg))
+        until = int(time.time()) + 7200
+        records = {"w": {"until": until, "reason": "usage limit"}}
+        quota = self.d / ".quota.json"
+        quota.write_text(json.dumps(records))
+        self.task("busy", "running", f"worker=v\npid={os.getpid()}\n")
+        task = self.task("waiting")
+        runner = self.launch(task, worker="w,v")
+        try:
+            reset = time.strftime("%H:%M", time.localtime(until))
+            self.wait_status(task, f"queued, w out of quota until {reset}, v runs 1 of 1")
+            records["v"] = records["w"]
+            updated = quota.with_suffix(".tmp")
+            updated.write_text(json.dumps(records))
+            updated.replace(quota)
+            self.assertEqual(runner.wait(timeout=20), 1)
+            self.assertEqual(M.read_meta(str(task))["failure"], "provider")
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+                runner.wait()
+
+    def test_dependency_waits_then_rechecks_worker_quota(self):
+        worker = self.cfg["workers"]["w"]
+        worker.update(type="codex", codexHome=str(self.d / "home"),
+                      command=fake_cli(self.d, "worker", "touch invoked"))
+        self.cfg_path.write_text(json.dumps(self.cfg))
+        quota = self.d / ".quota.json"
+        invoked = self.d / "invoked"
+        for outcome in ("still-out", "recovered"):
+            with self.subTest(outcome=outcome):
+                quota.write_text(json.dumps({"w": {"until": time.time() + 3600, "reason": "usage limit"}}))
+                dependency = self.task("dep-" + outcome)
+                task = self.task(outcome)
+                runner = self.launch(task, "--after", dependency.name)
+                try:
+                    self.wait_status(task, f"queued, waiting for {dependency.name}")
+                    self.assertFalse(invoked.exists())
+                    if outcome == "recovered":
+                        quota.unlink()
+                    (dependency / "status").write_text("done\n")
+                    if outcome == "still-out":
+                        self.assertEqual(runner.wait(timeout=20), 1)
+                        self.assertEqual(M.read_meta(str(task))["failure"], "provider")
+                        self.assertFalse(invoked.exists())
+                    else:
+                        self.assertEqual(runner.wait(timeout=20), 0)
+                        self.assertTrue(invoked.exists())
+                finally:
+                    if runner.poll() is None:
+                        runner.kill()
+                        runner.wait()
+
     def test_fenced_workers_drop_out_of_the_list(self):
         self.cfg["workers"]["v"] = dict(self.cfg["workers"]["w"])
         self.cfg["only"] = {"w": ["/nowhere/*"]}
@@ -641,6 +699,160 @@ def make_task(root, title="t", run="run"):
     task.mkdir(parents=True)
     (task / "prompt.md").write_text(f"# {title}\n")
     return task
+
+
+class CodexQuota(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = pathlib.Path(tmp.name)
+        self.home = self.root / "home"
+        self.sessions = self.home / "sessions/2026/11"
+        self.sessions.mkdir(parents=True)
+        self.rollout = self.sessions / "rollout-a.jsonl"
+        self.until = int(time.time()) + 7200
+        self.quota = self.root / ".quota.json"
+        self.task = make_task(self.root)
+        worker = {"type": "codex", "codexHome": str(self.home),
+                  "command": fake_cli(self.root, "fake", 'echo "$CODEX_HOME" > invoked\n')}
+        self.cfg = {"runsDir": str(self.root), "workers": {
+            "a": worker, "b": dict(worker, codexHome=str(self.root / "other-home"))}}
+
+    def event(self, percent, until, secondary=None, reached=None):
+        return json.dumps({"payload": {"type": "token_count", "rate_limits": {
+            "primary": {"used_percent": percent, "resets_at": until}, "secondary": secondary,
+            "rate_limit_reached_type": reached, "plan_type": "prolite"}}})
+
+    def run_workers(self, names):
+        return M.run(self.cfg, names, str(self.task), str(self.root))
+
+    def test_newest_rollout_supplies_last_valid_snapshot_and_max_window(self):
+        older = self.sessions / "rollout-z.jsonl"
+        older.write_text(self.event(100, self.until))
+        os.utime(older, (1, 1))
+        secondary = {"used_percent": 87.5, "resets_at": self.until + 3600}
+        self.rollout.write_text("\n".join([self.event(90, self.until), "bad json",
+                                          self.event(34, self.until, secondary), "{}", "{broken"]))
+        self.assertEqual(M.codex_quota(str(self.home)), {
+            "used_percent": 87.5, "resets_at": self.until + 3600, "reached": False,
+            "plan": "prolite", "observed": self.rollout.stat().st_mtime})
+
+    def test_appended_snapshot_is_visible_even_if_mtime_is_unchanged(self):
+        self.rollout.write_text(self.event(34, self.until))
+        stamp = self.rollout.stat().st_mtime_ns
+        self.assertFalse(M.codex_quota(str(self.home))["reached"])
+        with self.rollout.open("a") as f:
+            f.write("\n" + self.event(100, self.until))
+        os.utime(self.rollout, ns=(stamp, stamp))
+        self.assertTrue(M.codex_quota(str(self.home))["reached"])
+
+    def test_latest_snapshot_with_elapsed_reset_is_ignored(self):
+        self.rollout.write_text(self.event(100, self.until) + "\n" + self.event(100, 1))
+        self.assertIsNone(M.codex_quota(str(self.home)))
+
+    def test_quota_reads_only_the_tail_and_handles_missing_sessions(self):
+        self.assertIsNone(M.codex_quota(str(self.root / "missing")))
+        self.rollout.write_text(self.event(100, self.until) + "\n" + "x" * (512 * 1024))
+        self.assertIsNone(M.codex_quota(str(self.home)))
+
+    def test_retry_time_uses_local_today_tomorrow_or_explicit_date(self):
+        now = datetime.datetime(2026, 11, 18, 16)
+        for text, expected in [("5:19 PM", now.replace(hour=17, minute=19)),
+                               ("2:03 PM", now.replace(day=19, hour=14, minute=3)),
+                               ("November 20th, 2026 11:31 AM", now.replace(day=20, hour=11, minute=31)),
+                               ("Nov 20th, 2026 11:31 AM", now.replace(day=20, hour=11, minute=31))]:
+            with self.subTest(text=text):
+                self.assertEqual(M.quota_retry_at(f"Try again at {text}.", now), expected.timestamp())
+
+    def test_usage_limit_failure_records_snapshot_reset_and_drops_old_entries(self):
+        self.rollout.write_text(self.event(95, self.until))
+        self.quota.write_text(json.dumps({"expired": {"until": 1, "reason": "usage limit"}}))
+        self.cfg["workers"]["a"]["command"] = fake_cli(self.root, "fail", "echo 'Error: usage limit' >&2\nexit 1")
+        self.assertEqual(self.run_workers("a"), 1)
+        self.assertEqual(M.read_meta(str(self.task))["failure"], "provider")
+        self.assertEqual(json.loads(self.quota.read_text()), {"a": {"until": self.until, "reason": "Error: usage limit"}})
+
+    def test_retry_time_in_usage_limit_line_takes_precedence_over_snapshot(self):
+        self.rollout.write_text(self.event(93, self.until))
+        reset = datetime.datetime.now().replace(hour=11, minute=31, second=0, microsecond=0) + datetime.timedelta(days=2)
+        month = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()[reset.month - 1]
+        retry = f"{month} {reset.day}, {reset.year} 11:31 AM"
+        self.cfg["workers"]["a"]["command"] = fake_cli(
+            self.root, "fail", f'echo "You hit your usage limit. Try again at {retry}." >&2\nexit 1')
+        self.assertEqual(self.run_workers("a"), 1)
+        self.assertEqual(json.loads(self.quota.read_text())["a"]["until"], reset.timestamp())
+
+    def test_usage_limit_without_reset_records_half_an_hour(self):
+        self.cfg["workers"]["a"]["command"] = fake_cli(self.root, "fail", "echo 'Error: usage limit' >&2\nexit 1")
+        before = int(time.time())
+        self.assertEqual(self.run_workers("a"), 1)
+        until = json.loads(self.quota.read_text())["a"]["until"]
+        self.assertGreaterEqual(until, before + 1800)
+        self.assertLessEqual(until, time.time() + 1800)
+
+    def test_elapsed_retry_date_uses_snapshot_or_half_an_hour(self):
+        worker = self.cfg["workers"]["a"]
+        line = "Usage limit. Try again at Nov 20th, 2000 11:31 AM."
+        before = time.time()
+        M.record_quota(str(self.root), "a", worker, line)
+        until = json.loads(self.quota.read_text())["a"]["until"]
+        self.assertGreaterEqual(until, int(before) + 1800)
+        self.assertLessEqual(until, time.time() + 1800)
+
+        self.rollout.write_text(self.event(95, self.until))
+        M.record_quota(str(self.root), "a", worker, line)
+        self.assertEqual(json.loads(self.quota.read_text())["a"]["until"], self.until)
+
+    def test_claude_usage_limit_is_a_provider_failure_without_a_quota_record(self):
+        self.cfg["workers"]["a"].update(type="claude", command=fake_cli(
+            self.root, "fail", "echo 'You hit your usage limit.' >&2\nexit 1"))
+        self.assertEqual(self.run_workers("a"), 1)
+        self.assertEqual(M.read_meta(str(self.task))["failure"], "provider")
+        self.assertFalse(self.quota.exists())
+
+    def test_auth_failure_does_not_record_exhaustion(self):
+        self.cfg["workers"]["a"]["command"] = fake_cli(self.root, "fail", "echo 'Error: 401 Unauthorized' >&2\nexit 1")
+        self.assertEqual(self.run_workers("a"), 1)
+        self.assertEqual(M.read_meta(str(self.task))["failure"], "provider")
+        self.assertFalse(self.quota.exists())
+
+    def test_recorded_worker_is_skipped_and_expired_record_is_available(self):
+        self.quota.write_text(json.dumps({"a": {"until": self.until, "reason": "usage limit"},
+                                          "b": {"until": 1, "reason": "usage limit"}}))
+        self.assertEqual(self.run_workers("a,b"), 0)
+        self.assertEqual((self.root / "invoked").read_text().strip(), self.cfg["workers"]["b"]["codexHome"])
+
+    def test_claude_worker_can_start_with_an_active_quota_record(self):
+        self.cfg["workers"]["a"]["type"] = "claude"
+        self.quota.write_text(json.dumps({"a": {"until": self.until, "reason": "usage limit"}}))
+        self.assertEqual(self.run_workers("a"), 0)
+        self.assertTrue((self.root / "invoked").exists())
+
+    def test_all_out_fails_with_earliest_return_without_launching(self):
+        self.rollout.write_text(self.event(99, self.until, reached="usage_limit"))
+        self.quota.write_text(json.dumps({"b": {"until": self.until + 3600, "reason": "usage limit"}}))
+        self.assertEqual(self.run_workers("b,a"), 1)
+        back = time.strftime("%Y-%m-%d %H:%M", time.localtime(self.until))
+        reason = f"failed: every worker is out of quota (earliest back {back})"
+        self.assertEqual((self.task / "status").read_text().strip(), reason)
+        meta = M.read_meta(str(self.task))
+        self.assertEqual((meta["failure"], meta["last_error"]), ("provider", reason))
+        self.assertFalse((self.root / "invoked").exists())
+
+    def test_workers_appends_quota_to_the_original_columns(self):
+        self.rollout.write_text(self.event(34, self.until))
+        result = Cli.run_cli(self.cfg, "workers")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reset = time.strftime("%m-%d %H:%M", time.localtime(self.until))
+        self.assertEqual(result.stdout.splitlines(), [
+            f"a\tcodex\t{self.home}\t34% · resets {reset} · prolite",
+            f"b\tcodex\t{self.root / 'other-home'}\t-"])
+
+    def test_workers_marks_a_fully_used_window_out(self):
+        self.rollout.write_text(self.event(100, self.until))
+        result = Cli.run_cli(self.cfg, "workers")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.splitlines()[0].split("\t")[-1].startswith("OUT until "))
 
 
 class Pricing(unittest.TestCase):

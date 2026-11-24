@@ -11,7 +11,7 @@ Talk to the user in the language of the user's own messages for the whole run. B
 
 ## Config
 
-Read `~/.muster/config.json` (or `MUSTER_CONFIG`) at the start of every run; `python3 $MUSTER workers` lists workers. No config, or `python3 $MUSTER doctor` reports problems: run the `muster-setup` skill first; never guess workers.
+Read `~/.muster/config.json` (or `MUSTER_CONFIG`) at the start of every run. Before launching, run `python3 $MUSTER workers`. If a large batch would land on a worker at 80% quota usage or higher, mention its usage in the plan. No config, or `python3 $MUSTER doctor` reports problems: run the `muster-setup` skill first; never guess workers.
 
 - `workers.<name>.type`: `codex` (`codex exec` with its `codexHome`) or `claude` (a Claude Code compatible command run with `-p`).
 - `routing`: `{ match, workers, preamble? }` list. The first `match` glob (`~` allowed) that fits the cwd gives its workers, first choice first; `*` is the fallback.
@@ -21,7 +21,7 @@ Read `~/.muster/config.json` (or `MUSTER_CONFIG`) at the start of every run; `py
 - `preamble` and the matching `routing` entry's `preamble`: lines added to every prompt's rules block.
 - The user's explicit choice always wins over the config.
 
-Pass each task the whole worker list for its cwd (`run codex-a,codex-b …`), minus workers the user ruled out, and launch every task at once: the runner starts each on the first listed worker with a free slot. A task failed on quota or rate limit (`last_error` says so): rerun it without that worker.
+Pass each task the whole worker list for its cwd (`run codex-a,codex-b …`), minus workers marked `OUT` or ruled out by the user, and launch every task at once: the runner starts each on the first listed worker with quota and a free slot. A task failed on quota or rate limit (`last_error` says so): rerun it without that worker.
 
 Metered workers on a peak-priced model (`prices.json`; DeepSeek costs double weekdays 01:00–04:00 and 06:00–10:00 UTC): if a large, non-urgent batch would run at peak, say so in the plan and offer to run it later.
 

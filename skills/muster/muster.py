@@ -19,7 +19,7 @@
                                               group work by repo, type, tier, worker or model; filter by run
                                               folder age and first attempt's start date or time. Use --json
                                               for the stats screen's view model. Reads only.
-    muster.py workers                         list configured workers
+    muster.py workers                         list configured workers and their Codex quota
     muster.py detect                          JSON: Codex homes and claude-like CLIs found on this machine
     muster.py doctor                          check the config; exit 1 when something is wrong
 
@@ -29,6 +29,7 @@ root, overridden key by key by ~/.muster/prices.json. Standard library only.
 import datetime
 import fcntl
 import fnmatch
+import functools
 import glob
 import hashlib
 import json
@@ -159,15 +160,75 @@ def codex_billing(home):
     return "subscription" if auth.get("auth_mode") == "chatgpt" else "metered"
 
 
+def codex_rollouts(home, session_id=""):
+    return glob.iglob(os.path.join(home, "sessions", "**", f"rollout-*{session_id}.jsonl"), recursive=True)
+
+
+@functools.lru_cache(maxsize=64)
+def rollout_quota(path, mtime_ns, size):
+    limit = 512 * 1024
+    with open(path, "rb") as f:
+        f.seek(max(0, size - limit))
+        lines = f.read(limit).splitlines()
+    for line in reversed(lines):
+        if b'"rate_limits"' not in line:
+            continue
+        try:
+            pending = [json.loads(line)]
+        except (ValueError, RecursionError):
+            continue
+        while pending:
+            node = pending.pop()
+            if isinstance(node, list):
+                pending.extend(node)
+            if not isinstance(node, dict):
+                continue
+            limits = node.get("rate_limits")
+            if not isinstance(limits, dict):
+                pending.extend(node.values())
+                continue
+            windows = [w for w in (limits.get("primary"), limits.get("secondary"))
+                       if isinstance(w, dict) and type(w.get("used_percent")) in (int, float)
+                       and 0 <= w["used_percent"] <= sys.float_info.max
+                       and type(w.get("resets_at")) in (float, int)]
+            if windows:
+                window = max(windows, key=lambda w: (w["used_percent"], w["resets_at"]))
+                try:
+                    datetime.datetime.fromtimestamp(window["resets_at"])
+                except (ValueError, OverflowError, OSError):
+                    continue
+                used = window["used_percent"]
+                return dict(used_percent=used, resets_at=window["resets_at"],
+                            reached=limits.get("rate_limit_reached_type") is not None or used >= 100,
+                            plan=limits.get("plan_type"), observed=mtime_ns / 1_000_000_000)
+    return None
+
+
+def codex_quota(home):
+    newest = None
+    for path in codex_rollouts(home):
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        if newest is None or stat.st_mtime_ns > newest[1]:
+            newest = (path, stat.st_mtime_ns, stat.st_size)
+    try:
+        snapshot = rollout_quota(*newest) if newest else None
+    except OSError:
+        return None
+    return snapshot if snapshot and snapshot["resets_at"] > time.time() else None
+
+
 def usage_codex(task, home, prices, billing):
     log = read_text(os.path.join(task, "log.txt"))
     m = re.search(r"^session id: (\S+)", log, re.M)
-    files = glob.glob(os.path.join(home, "sessions", "**", f"rollout-*{m.group(1)}.jsonl"), recursive=True) if m else []
-    if not files:
+    path = next(codex_rollouts(home, m.group(1)), None) if m else None
+    if not path:
         return None
     model, prev, p, usd = "?", None, None, 0.0
     tot = dict(input=0, cached=0, output=0, reasoning=0)
-    for line in read_text(files[0]).splitlines():
+    for line in read_text(path).splitlines():
         try:
             d = json.loads(line)
         except ValueError:
@@ -369,6 +430,71 @@ def cap_of(cfg, name):
     return int(caps.get(name, caps.get(kind, DEFAULT_CAPS.get(kind, 3))))
 
 
+ENGLISH_MONTHS = {name: number for number, month in enumerate(
+    "january february march april may june july august september october november december".split(), 1)
+    for name in (month, month[:3])}
+
+
+def quota_retry_at(line, now):
+    match = re.search(r"\btry again at\s+(?:([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,\s+(\d{4})\s+)?"
+                      r"(\d{1,2}):(\d{2})\s+([AP]M)\b", line, re.I)
+    if not match:
+        return None
+    month, day, year, hour, minute, period = match.groups()
+    if not 1 <= int(hour) <= 12:
+        return None
+    try:
+        local_time = datetime.time(int(hour) % 12 + (12 if period.upper() == "PM" else 0), int(minute))
+        if month:
+            number = ENGLISH_MONTHS.get(month.lower())
+            if number is None:
+                return None
+            date = datetime.date(int(year), number, int(day))
+            return datetime.datetime.combine(date, local_time).timestamp()
+        retry = datetime.datetime.combine(now.date(), local_time)
+        if retry <= now:
+            retry += datetime.timedelta(days=1)
+        return retry.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def quota_records(runs):
+    records = load_json(os.path.join(runs, ".quota.json"), {})
+    if not isinstance(records, dict):
+        return {}
+    current = time.time()
+    return {name: row for name, row in records.items() if isinstance(row, dict)
+            and isinstance(row.get("until"), (int, float)) and row["until"] > current}
+
+
+def record_quota(runs, name, worker, line):
+    current = datetime.datetime.now()
+    until = quota_retry_at(line, current)
+    if until is None or until <= current.timestamp():
+        snapshot, _ = worker_quota(worker, {})
+        until = snapshot["resets_at"] if snapshot else current.timestamp() + 30 * 60
+    with open(os.path.join(runs, ".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        records = quota_records(runs)
+        if until > time.time():
+            records[name] = {"until": until, "reason": short(line)}
+        path = os.path.join(runs, ".quota.json")
+        with open(path + ".tmp", "w") as f:
+            json.dump(records, f)
+        os.replace(path + ".tmp", path)
+
+
+def worker_quota(worker, record):
+    if worker["type"] != "codex":
+        return None, 0
+    snapshot = codex_quota(expand(worker.get("codexHome", "~/.codex")))
+    until = record.get("until", 0)
+    if snapshot and snapshot["reached"]:
+        until = max(until, snapshot["resets_at"])
+    return snapshot, until if until > time.time() else 0
+
+
 def mount_of(path):
     path = os.path.realpath(path)
     while not os.path.ismount(path):
@@ -380,7 +506,7 @@ def free_gb(path):
     return shutil.disk_usage(path).free / 1e9
 
 
-ERROR_LINE = re.compile(r"ENOSPC|no space left on device|error|panic|traceback|quota|rate.?limit", re.I)
+ERROR_LINE = re.compile(r"ENOSPC|no space left on device|error|panic|traceback|quota|usage limit|rate.?limit", re.I)
 # A failure of the provider, not of the task: rerunning on another worker at the same tier is the right response.
 PROVIDER = re.compile(r"usage limit|quota|rate.?limit|too many requests|"
                       r"\b(?:HTTP|status|code)\W{0,3}(?:429|401|403|529)\b|"
@@ -1426,21 +1552,32 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None, 
             if deps.startswith("broken"):
                 finish(task, 5, f"canceled: {deps[8:]}")
                 return 5
-            if deps == "ready":
-                full = []
-                for n in names:
-                    busy, cap = running_on(cfg, n), cap_of(cfg, n)
-                    if busy < cap and os.path.realpath(task) in queue_head(cfg, n)[:cap - busy]:
-                        name = n
-                        break
-                    full.append(f"{n} runs {busy} of {cap}")
-                if name is not None:
-                    append_meta(task, worker=name, type=cfg["workers"][name]["type"], started=now())
-                    write_status(task, "running")
+            waiting, resets = [], []
+            records = quota_records(runs)
+            for n in names:
+                _, until = worker_quota(cfg["workers"][n], records.get(n, {}))
+                if until:
+                    resets.append(until)
+                    waiting.append(f"{n} out of quota until {datetime.datetime.fromtimestamp(until):%H:%M}")
+                    continue
+                if deps != "ready":
                     break
-                status = f"queued, {', '.join(full)}"
-            else:
-                status = f"queued, waiting for {deps[6:]}"
+                busy, cap = running_on(cfg, n), cap_of(cfg, n)
+                if busy < cap and os.path.realpath(task) in queue_head(cfg, n)[:cap - busy]:
+                    name = n
+                    break
+                waiting.append(f"{n} runs {busy} of {cap}")
+            if name is not None:
+                append_meta(task, worker=name, type=cfg["workers"][name]["type"], started=now())
+                write_status(task, "running")
+                break
+            if deps == "ready" and len(resets) == len(names):
+                earliest = datetime.datetime.fromtimestamp(min(resets))
+                status = f"failed: every worker is out of quota (earliest back {earliest:%Y-%m-%d %H:%M})"
+                append_meta(task, failure="provider", last_error=status)
+                finish(task, 1, status)
+                return 1
+            status = f"queued, {', '.join(waiting)}" if deps == "ready" else f"queued, waiting for {deps[6:]}"
             if status != shown:
                 write_status(task, status)
                 shown = status
@@ -1514,8 +1651,13 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None, 
                     "    " + shlex.join(rerun + (["--tier", tier] if tier else [])) + "\n")
     # A worker that exits non-zero failed itself (disk, network, server error, crash), not the task: a task
     # failure shows as a failed check, a BLOCKED report or a review.
-    append_meta(task, last_error=reason, log_path=os.path.abspath(where or main_log),
-                failure="provider" if line and PROVIDER.search(line) else "infra")
+    failure = "provider" if line and PROVIDER.search(line) else "infra"
+    if kind == "codex" and failure == "provider" and "usage limit" in line.lower():
+        try:
+            record_quota(runs, name, worker, line)
+        except OSError as e:
+            print(f"muster: could not record quota for {name}: {e}", file=sys.stderr)
+    append_meta(task, last_error=reason, log_path=os.path.abspath(where or main_log), failure=failure)
     finish(task, rc, status)
     return rc
 
@@ -1582,8 +1724,18 @@ def main():
         print(clean(cfg, int(args[1]) if args else 14))
         return
     if cmd == "workers":
+        records = quota_records(expand(cfg.get("runsDir", "~/.muster/runs")))
         for name, w in cfg["workers"].items():
-            print(f"{name}\t{w['type']}\t{w.get('codexHome') or w.get('command', '')}")
+            snapshot, until = worker_quota(w, records.get(name, {}))
+            quota = "-"
+            if until:
+                quota = f"OUT until {datetime.datetime.fromtimestamp(until):%m-%d %H:%M}"
+            elif snapshot:
+                reset = datetime.datetime.fromtimestamp(snapshot["resets_at"])
+                quota = f"{snapshot['used_percent']:g}% · resets {reset:%m-%d %H:%M}"
+                if snapshot["plan"]:
+                    quota += f" · {snapshot['plan']}"
+            print(f"{name}\t{w['type']}\t{w.get('codexHome') or w.get('command', '')}\t{quota}")
         return
     sys.exit(__doc__)
 
