@@ -259,24 +259,34 @@ The full decision chain is drawn in [docs/how-it-works.md](docs/how-it-works.md#
 
 ## How the tiers perform
 
-`python3 <plugin>/skills/muster/muster.py stats [--days N]` groups work by its first counted attempt's `(tier, worker, model)`. Retries linked with `--retry-of` or named `x`, `x-r2` belong to one piece of work. Canceled attempts and attempts that never started are ignored. The command reads only, and `--days N` limits the run folders by age.
+`python3 <plugin>/skills/muster/muster.py stats [--days N] [--since D] [--until D] [--by FIELDS]` reports on run history in read-only mode. Retries linked with `--retry-of` or named `x`, `x-r2` belong to one piece of work. Canceled attempts and attempts that never started are ignored.
+
+Use `--by repo,type` to compare worker types within each repository. Choose a comma-separated list from `repo`, `type`, `tier`, `worker` and `model`. These fields appear first, in the order given, and come from the first counted attempt. The default is `tier,worker,model`.
+
+`--since` and `--until` filter by the first counted attempt's start time. Both take `YYYY-MM-DD` or a quoted `"YYYY-MM-DD HH:MM"`. `--since` includes its boundary. A date-only `--until` includes the whole day. An `--until` with a time keeps only work started before that time. Work without a recorded start time is excluded from a date window. Combine either bound with `--days N` to limit run folders by the date in their names.
+
+`repo` uses the main checkout's directory name. New runs record its path in `main_repo` when Git can resolve it. For older runs, Muster finds the main checkout from Git's common directory at the recorded `repo` (or `cwd`). For a deleted worktree named `<repo>-<suffix>`, it uses the longest matching repo name resolved in the same report. With no match it keeps the directory name, and with no recorded path it shows `-`.
 
 The newest counted attempt determines the outcome. If it is `done` and its metadata has no `changes` key, the work predates recorded reviews. The footer counts these exclusions. Every group with settled or open work gets a tab-separated row.
 
 | Column | Means |
 |---|---|
-| `tier`, `worker`, `model` | where the work started; `-` when the run predates tiers or recorded no model |
+| Selected `--by` fields | where the work started, with `-` for missing values. `type` uses the recorded worker type or the worker's configured type |
 | `settled` | accepted work plus work whose newest counted attempt failed |
 | `accepted` | settled work whose current diff has an `Approved` or `User override` verdict, or a `Needs fixes` verdict on an empty diff, and whose status is `done` |
 | `open` | running work, completed work awaiting a current review or a requested fix, or work waiting for a rerun after a provider, infra or interruption failure |
 | `first_pass` | share of accepted work that needed no rework and no `Fixed in:` line, or `-` |
 | `attempts_per_work` | mean attempts per settled piece, excluding provider and infra failures and interruptions |
+| `blocked` | settled pieces with at least one attempt marked blocked after the worker reported `BLOCKED` or `NEEDS_CONTEXT` |
+| `check_failed` | settled pieces with at least one failed done check |
+| `needs_fixes` | settled pieces where an attempt's last verdict was `Needs fixes` on a non-empty diff, or the newest attempt's review has a `Fixed in:` line |
+| `outside_failures` | number of provider failures, infra failures and interruptions, counting each attempt across both settled and open work |
 | `median_minutes` | median minutes per settled piece, summing recorded attempt durations for each piece |
 | `tokens_per_accepted` | input plus output tokens across settled work, divided by the accepted count |
 | `usd_per_accepted` | recorded cost across settled work divided by the accepted count, with `≥` when only some attempts have a price and `-` when none do |
 | `billing` | `metered`, `subscription` or `mixed` across settled attempts, or `-` when unknown |
 
-A row with only open work shows `-` for all rates, costs, timing and billing. Work whose newest attempt failed for a provider, infra or interruption reason is open: it waits for its rerun. Work accepted after an escalation stays in its starting row, so `first_pass` shows how often the starting tier was enough. A failed attempt on settled work contributes its cost, including provider and infra failures and interruptions. Subscription dollars express the API-equivalent cost. With fewer than 30 settled pieces, only large differences are meaningful.
+A settled piece can count in more than one failure column, even if a later attempt was accepted. A row with only open work shows `-` for all rates, costs, timing and billing. Work whose newest attempt failed for a provider, infra or interruption reason is open: it waits for its rerun. Work accepted after an escalation stays in its starting row, so `first_pass` shows how often the starting tier was enough. A failed attempt on settled work contributes its cost, including provider and infra failures and interruptions. Subscription dollars express the API-equivalent cost. With fewer than 30 settled pieces, only large differences are meaningful.
 
 ## How it works
 
