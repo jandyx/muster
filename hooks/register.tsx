@@ -432,8 +432,8 @@ export const register: Register = on => {
 
     const loadTasks = async (name: string): Promise<Task[]> => {
       const dirs = (await $.fs.list(`${root}/${name}`)).filter(d => d.kind === 'dir').map(d => d.name).sort()
-      return Promise.all(
-        dirs.map(async (id): Promise<Task> => {
+      const tasks = await Promise.all(
+        dirs.map(async (id): Promise<Task | null> => {
           const dir = `${root}/${name}/${id}`
           const [status, meta, result, prompt, usageText, reviewText, decisionText] = await Promise.all([
             readText(`${dir}/status`),
@@ -444,6 +444,8 @@ export const register: Register = on => {
             readText(`${dir}/review.md`),
             readText(`${dir}/decision.md`),
           ])
+          // A folder with none of these is not a task, e.g. notes Claude saved in the run folder.
+          if (!status && !meta && !prompt) return null
           let usage: Usage | null = null
           try {
             usage = usageText ? (JSON.parse(usageText) as Usage) : null
@@ -534,6 +536,7 @@ export const register: Register = on => {
           }
         }),
       )
+      return tasks.filter((t): t is Task => t !== null)
     }
 
     // A run's session never changes, so its owner is read once per run and kept.
