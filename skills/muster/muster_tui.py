@@ -52,29 +52,25 @@ def compact(value):
     return f"{value:.0f}"
 
 
-def heatmap(counts, width, today):
-    monday = today - today.weekday() * DAY
-    weeks = min(53, max(0, (width - 4) // 2))  # Fill the width with up to a year, empty weeks included.
-    mondays = [monday - i * 7 * DAY for i in reversed(range(weeks))]
-    labels = ""
-    for col, date in enumerate(mondays):
-        end = min(today, date + 6 * DAY)
-        starts_month = date.day == 1 or date.month != end.month
-        if starts_month or (col == 0 and (weeks == 1 or (end + 7 * DAY).month == end.month)):
+def heatmap(model, width):
+    labels = model["labels"]
+    count = max(0, (width - 4) // 2)
+    weeks = model["weeks"][-count:] if count else []
+    months = ""
+    for col, week in enumerate(weeks):
+        if week["starts_month"] or (col == 0 and (len(weeks) == 1 or week["first_label"])):
             label_start = min(2 * col, max(0, width - 7))  # Keep the last three-letter label on screen.
-            labels = labels.ljust(label_start) + MONTHS[end.month - 1]
-    lines = [[("    " + labels, "muted")]]
-    values = list(counts.values())
-    cuts = statistics.quantiles(values, method="inclusive") if len(values) > 1 else []
-    for weekday, label in enumerate(("Mon", "", "Wed", "", "Fri", "", "")):
+            months = months.ljust(label_start) + week["month"]
+    lines = [[("    " + months, "muted")]]
+    for weekday, label in enumerate(labels["weekdays"]):
         row = [(f"{label:4}", "muted")]
-        for date in mondays:
-            count = counts.get(date + weekday * DAY, 0)
-            level = 1 + sum(count > q for q in cuts) if count else 0
-            row.append((SHADES[level] * 2, f"heat{level}"))
+        for week in weeks:
+            level = model["days"].get(week["days"][weekday], 0)
+            row.append((labels["shades"][level] * 2, f"heat{level}"))
         lines.append(row)
-    lines.append([("Less ", "muted"), *[(char + " ", f"heat{i}") for i, char in enumerate(SHADES[1:], 1)],
-                  ("More", "muted")])
+    lines.append([(labels["less"] + " ", "muted"),
+                  *[(char + " ", f"heat{i}") for i, char in enumerate(labels["shades"][1:], 1)],
+                  (labels["more"], "muted")])
     return lines
 
 
@@ -94,11 +90,11 @@ def cost(summary, per_accepted=False):
     return f"{prefix or '≈'}${dollars}"
 
 
-def comparison(summary, width):
+def comparison(summary):
     added = summary["lines_added"]
     if added:
         value, verb, unit = added, "added", "lines"
-        references = [(10000, "200 pages of code at 50 lines per page"), (9000, "the original UNIX v6 kernel")]
+        references = [(9000, "the original UNIX v6 kernel")]
     else:
         value = summary["tokens_in"] + summary["tokens_out"]
         verb, unit = "used", "tokens"
@@ -112,10 +108,10 @@ def comparison(summary, width):
         size, title = min(references)
         text = f"Workers {verb} {compact(value)} of the ~{compact(size)} {unit} in {title}."
         short = f"{compact(value)} / ~{compact(size)} {unit} of {title}"
-    return text if len(text) <= width else short
+    return text, short
 
 
-def overview(records, counts, span, today, width):
+def range_view(name, records, counts, span, today):
     g = stats_summary(records)
     longest = current = streak = 0
     previous = None
@@ -131,73 +127,138 @@ def overview(records, counts, span, today, width):
     attempts = f"{g['attempts'] / g['settled']:.1f}" if g["settled"] else "-"
     minutes = f"{g['median_minutes']:.1f}" if g["median_minutes"] is not None else "-"
     metrics = [
-        ("Pieces of work", f"{len(records)} ({g['settled']} settled/{g['open']} open)", "First pass", first_pass(g)),
-        ("Accepted", g["accepted"], "Attempts per work", attempts),
-        ("Sent back", g["needs_fixes"], "Claude fixed", g["claude_fixed"]),
-        ("Blocked", g["blocked"], "Check failed", g["check_failed"]),
-        ("Outside failures", g["outside_failures"], "Active days", f"{len(counts)}/{span}"),
-        ("Busiest day", busiest, "Longest streak", longest),
-        ("Favorite worker type", favorite, "Current streak", current),
-        ("Median minutes", minutes, "", ""),
+        ["Pieces of work", f"{len(records)} ({g['settled']} settled/{g['open']} open)"],
+        ["First pass", first_pass(g)],
+        ["Accepted", str(g["accepted"])],
+        ["Attempts per work", attempts],
+        ["Sent back", str(g["needs_fixes"])],
+        ["Claude fixed", str(g["claude_fixed"])],
+        ["Blocked", str(g["blocked"])],
+        ["Check failed", str(g["check_failed"])],
+        ["Outside failures", str(g["outside_failures"])],
+        ["Active days", f"{len(counts)}/{span}"],
+        ["Busiest day", busiest],
+        ["Longest streak", str(longest)],
+        ["Favorite worker type", favorite],
+        ["Current streak", str(current)],
+        ["Median minutes", minutes],
     ]
-    left_width = max(cell_width(f"{label} {value}") for label, value, _, _ in metrics) + 3
-    right_width = max(cell_width(f"{label} {value}") for _, _, label, value in metrics)
-    split = min(left_width, max(1, width - right_width))
-    lines = []
-    for label, value, label2, value2 in metrics:
-        left = [(label + " ", "plain"), (str(value), "accent")]
-        if label2:
-            left = clip(left, split - 1)
-            used = sum(cell_width(text) for text, _ in left)
-            left.extend([(" " * (split - used) + label2 + " ", "plain"), (str(value2), "accent")])
-        lines.append(left)
     usage = f"Input {compact(g['tokens_in'])} · Output {compact(g['tokens_out'])} · Cost {cost(g)}"
     changed = f"Lines +{compact(g['lines_added'])} -{compact(g['lines_removed'])}"
-    if len(usage) + 3 + len(changed) <= width:
-        lines.append([(usage + " · " + changed, "muted")])
-    else:
-        lines.extend([[(usage, "muted")], [(changed, "muted")]])
     # Name the rate once so the type comparison reads as a single sentence.
     rates = []
     for (kind,), group in sorted(types, key=lambda item: item[0] != ("codex",)):
         totals = stats_summary(group)
         label = "" if rates else " first pass"
         rates.append(f"{kind} {first_pass(totals)}{label} (n={totals['accepted']})")
-    if rates:
-        lines.append([(" · ".join(rates), "plain")])
-    lines.append([(comparison(g, width), "link")])
-    return lines
+    fun, short = comparison(g)
+    tables = {"Repos": table_view(records, ("repo", "type")),
+              "Workers": table_view(records, ("tier", "worker", "model"))}
+    small = any(table["has_small"] for table in tables.values())
+    return {"name": name, "metrics": metrics, "usage": usage + " · " + changed, "types": " · ".join(rates) or None,
+            "fun": fun, "fun_short": short, "tables": tables, "sample_note": SAMPLE_NOTE if small else None}
 
 
-def table(records, tab, width):
-    keys = ("repo", "type") if tab == "Repos" else ("tier", "worker", "model")
+def table_view(records, keys):
     rows = []
-    small_sample = False
+    has_small = False
     for key, group in stats_groups(records, keys):
         g = stats_summary(group)
         small = g["settled"] < 30
-        small_sample |= small
+        has_small |= small
         rate = first_pass(g).rjust(4) + ("*" if small else " ")
         bars = round(10 * g["first_pass"] / g["accepted"]) if g["accepted"] else 0
-        row = [[(field, "plain")] for field in key]
-        row += [[(str(g["settled"]), "plain")], [(rate, "muted" if small else "plain"),
-                (" " + "█" * bars + "·" * (10 - bars), "accent")]]
-        row.extend([[(str(g[field]), "plain")] for field in ("needs_fixes", "claude_fixed", "blocked", "check_failed")])
-        row.append([(cost(g, per_accepted=True), "plain")])
-        rows.append(row)
+        cells = [*key, str(g["settled"]), rate]
+        cells.extend(str(g[field]) for field in ("needs_fixes", "claude_fixed", "blocked", "check_failed"))
+        cells.append(cost(g, per_accepted=True))
+        rows.append({"cells": cells, "bar": bars, "small": small})
+    labels = [key.title() for key in keys]
+    return {
+        "columns": labels + ["Settled", "First pass", "Sent back", "Claude fixed", "Blocked", "Check failed", "Cost/accepted"],
+        "medium": labels + ["Settled", "First pass", "Back", "Fixed", "Block", "Check", "$/ok"],
+        "short": labels + ["Set", "First pass", "Back", "Fix", "Blk", "Chk", "$/ok"],
+        "keys": len(keys), "rows": rows, "has_small": has_small,
+    }
+
+
+def view(records, legacy, today):
+    """Build the shared, JSON-serialisable snapshot for the terminal and the pane."""
+    counts = {}
+    for record in records:
+        if record["started"]:
+            day = record["started"].date()
+            if day <= today:
+                counts[day] = counts.get(day, 0) + 1
+    values = list(counts.values())
+    cuts = statistics.quantiles(values, method="inclusive") if len(values) > 1 else []
+    days = {day.isoformat(): 1 + sum(count > q for q in cuts) for day, count in counts.items()
+            if day > today - 371 * DAY}
+    monday = today - today.weekday() * DAY
+    weeks = []
+    for offset in reversed(range(53)):
+        start = monday - offset * 7 * DAY
+        end = min(today, start + 6 * DAY)
+        weeks.append({"days": [(start + i * DAY).isoformat() for i in range(7)], "month": MONTHS[end.month - 1],
+                      "starts_month": start.day == 1 or start.month != end.month,
+                      "first_label": (end + 7 * DAY).month == end.month})
+    span = (today - min(counts)).days + 1 if counts else 0
+    ranges = [range_view(RANGES[0], records, counts, span, today)]
+    for name, span in zip(RANGES[1:], (7, 30)):
+        since = today - span * DAY
+        recent = [r for r in records if r["started"] and since < r["started"].date() <= today]
+        ranges.append(range_view(name, recent, {day: n for day, n in counts.items() if day > since}, span, today))
+    labels = {"tabs": list(TABS), "weekdays": ["Mon", "", "Wed", "", "Fri", "", ""],
+              "less": "Less", "more": "More", "shades": SHADES,
+              "pane_hint": "tab/shift+tab select · ↑/↓ scroll · esc to prompt"}
+    return {"version": 1, "today": today.isoformat(), "days": days, "weeks": weeks, "ranges": ranges, "labels": labels,
+            "legacy_note": f"{legacy} pieces from before reviews were recorded are left out." if legacy else None}
+
+
+def overview(selected, width):
+    metrics = selected["metrics"]
+    left_width = max(cell_width(f"{label} {value}") for label, value in metrics[::2]) + 3
+    right_width = max(cell_width(f"{label} {value}") for label, value in metrics[1::2])
+    split = min(left_width, max(1, width - right_width))
+    lines = []
+    for i in range(0, len(metrics), 2):
+        label, value = metrics[i]
+        left = [(label + " ", "plain"), (value, "accent")]
+        if i + 1 < len(metrics):
+            label2, value2 = metrics[i + 1]
+            left = clip(left, split - 1)
+            used = sum(cell_width(text) for text, _ in left)
+            left.extend([(" " * (split - used) + label2 + " ", "plain"), (value2, "accent")])
+        lines.append(left)
+    usage = selected["usage"]
+    for line in ([usage] if len(usage) <= width else usage.rsplit(" · ", 1)):
+        lines.append([(line, "muted")])
+    if selected["types"]:
+        lines.append([(selected["types"], "plain")])
+    fun = selected["fun"]
+    lines.append([(fun if len(fun) <= width else selected["fun_short"], "link")])
+    return lines
+
+
+def table(data, width):
+    keys = data["keys"]
+    rows = []
+    for row in data["rows"]:
+        cells = [[(value, "plain")] for value in row["cells"]]
+        bar = row["bar"]
+        cells[keys + 1] = [(row["cells"][keys + 1], "muted" if row["small"] else "plain"),
+                           (" " + "█" * bar + "·" * (10 - bar), "accent")]
+        rows.append(cells)
 
     # Shorter headers first: names are what tells the rows apart, so they are cut last.
-    for names in (["Settled", "First pass", "Sent back", "Claude fixed", "Blocked", "Check failed", "Cost/accepted"],
-                  ["Settled", "First pass", "Back", "Fixed", "Block", "Check", "$/ok"],
-                  ["Set", "First pass", "Back", "Fix", "Blk", "Chk", "$/ok"]):
-        header = [[(name, "muted")] for name in [k.title() for k in keys] + names]
+    for names in (data["columns"], data["medium"], data["short"]):
+        header = [[(name, "muted")] for name in names]
         widths = [min(width, max(sum(cell_width(text) for text, _ in cell) for cell in cells))
                   for cells in zip(header, *rows)]
         if sum(widths) + len(widths) - 1 <= width:
             break
     excess = sum(widths) + len(widths) - 1 - width
     while excess > 0:
-        col = max(range(len(keys)), key=widths.__getitem__)
+        col = max(range(keys), key=widths.__getitem__)
         if widths[col] <= 3:
             break
         widths[col] -= 1
@@ -207,13 +268,13 @@ def table(records, tab, width):
         result = []
         for i, (cell, size) in enumerate(zip(cells, widths)):
             trimmed = clip(cell, size)
-            if i < len(keys) and size >= 3 and cell_width(cell[0][0]) > size:
+            if i < keys and size >= 3 and cell_width(cell[0][0]) > size:
                 name, style = cell[0]
                 prefix = clip(cell, size // 2)
                 suffix = clip([(name[::-1], style)], size - size // 2 - 1)
                 trimmed = prefix + [("…", style)] + [(s[::-1], style) for s, _ in suffix]
             pad = " " * (size - sum(cell_width(text) for text, _ in trimmed))
-            if i < len(keys):
+            if i < keys:
                 result.extend(trimmed + [(pad, "plain")])
             else:
                 result.extend([(pad, "plain")] + trimmed)  # Numbers line up on the right.
@@ -221,44 +282,32 @@ def table(records, tab, width):
                 result.append((" ", "plain"))
         return result
 
-    return columns_line(header), [columns_line(row) for row in rows], small_sample
+    return columns_line(header), [columns_line(row) for row in rows]
 
 
-def _screen(records, legacy, *, tab, range_name, width, height, today, scroll=0):
+def _screen(model, *, tab, range_name, width, height, scroll=0):
     if height <= 0:
         return [], 0
     tabs = []
     ranges = []
     for names, selected, segments, separator, on, off in (
-            (TABS, tab, tabs, "   ", "tab_selected", "tab"),
-            (RANGES, range_name, ranges, " · ", "accent_bold", "muted")):
+            (model["labels"]["tabs"], tab, tabs, "   ", "tab_selected", "tab"),
+            ([r["name"] for r in model["ranges"]], range_name, ranges, " · ", "accent_bold", "muted")):
         for name in names:
             if segments:
                 segments.append((separator, "muted"))
             segments.append((name, on if name == selected else off))
 
-    span = (None, 7, 30)[RANGES.index(range_name)]
-    counts = {}
-    for record in records:
-        if record["started"]:
-            day = record["started"].date()
-            if day <= today:
-                counts[day] = counts.get(day, 0) + 1
+    selected = next(r for r in model["ranges"] if r["name"] == range_name)
     head = [tabs]
     if tab == "Overview":
-        head.extend(heatmap(counts, width, today))
-    if span:
-        since = today - span * DAY
-        records = [r for r in records if r["started"] and since < r["started"].date() <= today]
-        counts = {day: n for day, n in counts.items() if day > since}
-    else:
-        span = (today - min(counts)).days + 1 if counts else 0
+        head.extend(heatmap(model, width))
     head.append(ranges)
     foot = [[(HINT, "muted")]]
     if tab == "Overview":
-        body = overview(records, counts, span, today, width)
-        if legacy and height >= 4:
-            foot.insert(0, [(f"{legacy} pieces from before reviews were recorded are left out.", "muted")])
+        body = overview(selected, width)
+        if model["legacy_note"] and height >= 4:
+            foot.insert(0, [(model["legacy_note"], "muted")])
         if height < len(head) + len(foot):
             head = [tabs, ranges] + head[1:-1]
         spare = height - len(head) - len(body) - len(foot)
@@ -270,13 +319,14 @@ def _screen(records, legacy, *, tab, range_name, width, height, today, scroll=0)
             body.insert(8, [])  # Separate the KPI block from usage and the type comparison.
         scroll = 0
     else:
-        header, body, small = table(records, tab, width)
+        data = selected["tables"][tab]
+        header, body = table(data, width)
         if height >= 16:
             head.append([])
             head.insert(1, [])
         head.append(header)
-        if small and height >= len(head) + 3:
-            foot.insert(0, [(SAMPLE_NOTE, "muted")])
+        if data["has_small"] and height >= len(head) + 3:
+            foot.insert(0, [(selected["sample_note"], "muted")])
         room = max(0, height - len(head) - len(foot))
         scroll = min(max(0, scroll), max(0, len(body) - room))
     available = max(0, height - len(foot))
@@ -287,8 +337,8 @@ def _screen(records, legacy, *, tab, range_name, width, height, today, scroll=0)
 
 def render(records, legacy, *, tab, range_name, width, height, today, scroll=0):
     """Return screen rows as (text, style) segments, clipped to the viewport."""
-    lines, _ = _screen(records, legacy, tab=tab, range_name=range_name, width=width, height=height,
-                       today=today, scroll=scroll)
+    lines, _ = _screen(view(records, legacy, today), tab=tab, range_name=range_name, width=width,
+                       height=height, scroll=scroll)
     return lines
 
 
@@ -342,11 +392,15 @@ def run(records, legacy):
         curses.set_escdelay(100)
         styles = terminal_styles()
         italic = getattr(curses, "A_ITALIC", 0) if curses.has_colors() else 0
+        model = None
         tab = range_index = scroll = 0
         while True:
+            today = datetime.date.today()
+            if model is None or model["today"] != today.isoformat():
+                model = view(records, legacy, today)
             height, width = screen.getmaxyx()
-            lines, scroll = _screen(records, legacy, tab=TABS[tab], range_name=RANGES[range_index],
-                                    width=width, height=height, today=datetime.date.today(), scroll=scroll)
+            lines, scroll = _screen(model, tab=TABS[tab], range_name=RANGES[range_index],
+                                    width=width, height=height, scroll=scroll)
             screen.erase()
             for y, line in enumerate(lines):
                 x = 0

@@ -124,7 +124,11 @@ test('the band above the prompt colors each running run', async ($, on) => {
 
 test('a muster prompt opens the pane; other prompts do not', async ($, on) => {
   const opened: string[] = []
-  on('command.register', () => ({ value: { command: 'muster-panel' } }))
+  const registered: string[] = []
+  on('command.register', (_, e) => {
+    registered.push(e.name)
+    return { value: { command: e.name } }
+  })
   on('ui.open', (_, e: any) => {
     opened.push(e.id)
     return { value: { isPlaced: true } }
@@ -138,8 +142,10 @@ test('a muster prompt opens the pane; other prompts do not', async ($, on) => {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('prompt.submit', (_, e: any) => ({ text: e.text }))
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  expect(registered).toContain('muster-stats')
 
   await $.prompt.submit({ text: 'fix the login bug' })
+  await $.prompt.submit({ text: '/muster-stats', wait: false, origin: { kind: 'composer' } })
   expect(opened).toEqual([])
   await $.prompt.submit({ text: '/muster profile the slowest tests' })
   await $.prompt.submit({ text: 'muster: audit the serial group' })
@@ -895,5 +901,166 @@ test('CJK lines of a decision join without a space, and a wrapped line never sta
   expect(lines.some(l => l.startsWith('\u3002'))).toBe(false)
   // 21 wide characters fill the 43-cell line, so the full stop falls at the break and takes the character before it down.
   expect(lines).toContain('\u516b\u3002')
+  await ui.unmount()
+})
+
+const processReport = (stdout: string, exitCode = 0, stderr = '') => ({
+  stdout, stderr, exitCode, isStdoutTruncated: false, isStderrTruncated: false,
+})
+const statsCommand = {
+  command: 'muster-stats', args: '', origin: { kind: 'composer' },
+  presentation: { isFullscreen: true, columns: 120 },
+} as const
+const statsPane = {
+  ...PANE, surface: 'terminal', requestId: 'muster-stats',
+  props: { ...PANE.props, title: 'Muster stats', bodyColumns: 116, isFocused: true },
+} as const
+const statsTable = (group: string[], groups: string[][]) => ({
+  columns: [...group, 'Settled', 'First pass', 'Sent back', 'Claude fixed', 'Blocked', 'Check failed', 'Cost/accepted'],
+  medium: [...group, 'Settled', 'First pass', 'Back', 'Fixed', 'Block', 'Check', '$/ok'],
+  short: [...group, 'Set', 'First pass', 'Back', 'Fix', 'Blk', 'Chk', '$/ok'],
+  keys: group.length, has_small: true,
+  rows: groups.map(values => ({ cells: [...values, '4', ' 75%*', '1', '0', '0', '0', '≥$0.26'], bar: 8, small: true })),
+})
+const statsView = {
+  version: 1, today: '2026-11-27', legacy_note: '2 pieces from before reviews were recorded are left out.',
+  labels: {
+    tabs: ['Overview', 'Repos', 'Workers'], weekdays: ['Mon', '', 'Wed', '', 'Fri', '', ''],
+    less: 'Less', more: 'More', shades: '·░▒▓█', pane_hint: 'Navigation hint from Python',
+  },
+  days: { '2026-11-23': 1, '2026-11-24': 2, '2026-11-25': 3, '2026-11-26': 4 },
+  weeks: [{
+    days: ['2026-11-23', '2026-11-24', '2026-11-25', '2026-11-26', '2026-11-27', '2026-11-28', '2026-11-29'],
+    month: 'Nov', starts_month: false, first_label: false,
+  }],
+  ranges: ['All time', 'Last 7 days', 'Last 30 days'].map((name, i) => ({
+    name, metrics: [['Pieces of work', i === 1 ? '2 (2 settled/0 open)' : '4 (4 settled/0 open)']],
+    usage: 'Input 1.7b · Output 4.6m · Cost ≥$1 · Lines +8 -2',
+    types: 'codex 75% first pass (n=4)', fun: 'Workers added 8 of the ~9k lines in the original UNIX v6 kernel.',
+    fun_short: '8 / ~9k lines of the original UNIX v6 kernel',
+    tables: {
+      Repos: statsTable(['Repo', 'Type'], ['project-a', 'project-b', 'project-c', 'project-d', 'project-e', 'project-f'].map(repo => [repo, 'codex'])),
+      Workers: statsTable(['Tier', 'Worker', 'Model'], [['low', 'worker-a', 'model-a']]),
+    },
+    sample_note: '* fewer than 30 settled: small sample',
+  })),
+}
+
+test('muster-stats runs the Python report and returns its summary when the pane cannot be placed', async ($, on) => {
+  const opened: string[] = []
+  on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: '/my plugin' } }))
+  on('env.get', (_, e) => ({ value: e.name === 'MUSTER_CONFIG' ? '/custom/config.json' : undefined }))
+  on('process.run', (_, e) => {
+    expect(e.argv).toEqual(['python3', '/my plugin/skills/muster/muster.py', 'stats', '--json'])
+    expect(e.init?.env?.MUSTER_CONFIG).toBe('/custom/config.json')
+    expect(e.init?.timeoutMs).toBe(30000)
+    return { value: processReport(JSON.stringify(statsView)) }
+  })
+  on('ui.open', (_, e) => {
+    expect(e.title).toBe('Muster stats')
+    expect(e.focus).toBe(true)
+    opened.push(e.id)
+    return { value: { isPlaced: false, reason: 'no-surface' } }
+  })
+  const result = await $.command.run(statsCommand)
+  expect(opened).toEqual(['muster-stats'])
+  expect(result.text?.split('\n')).toEqual([
+    'Pieces of work: 4 (4 settled/0 open)', statsView.ranges[0]!.usage, statsView.ranges[0]!.types, statsView.ranges[0]!.fun,
+  ])
+})
+
+for (const [problem, reply, reason] of [
+  ['Python exits with an error', { value: processReport('', 1, 'cannot read runs\nsecond line') }, /^Muster stats failed: cannot read runs$/],
+  ['Python times out', { deny: 'process timed out' }, /^Muster stats failed: .*timed out/],
+  ['Python returns invalid JSON', { value: processReport('{') }, /^Muster stats failed: .+/],
+] as const) {
+  test(`muster-stats shows the error and opens nothing when ${problem}`, async ($, on) => {
+    const opened: string[] = []
+    on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: '/plugin' } }))
+    on('env.get', () => ({ value: undefined }))
+    on('process.run', () => reply)
+    on('ui.open', (_, e) => {
+      opened.push(e.id)
+      return { value: { isPlaced: true } }
+    })
+    expect((await $.command.run(statsCommand)).text).toMatch(reason)
+    expect(opened).toEqual([])
+  })
+}
+
+test('muster-stats rejects a malformed table without reopening a previous report', async ($, on) => {
+  let stdout = JSON.stringify(statsView)
+  const opened: string[] = []
+  on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: '/plugin' } }))
+  on('env.get', () => ({ value: undefined }))
+  on('process.run', () => ({ value: processReport(stdout) }))
+  on('ui.open', (_, e) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true } }
+  })
+  expect((await $.command.run(statsCommand)).text).toContain('Pieces of work: 4')
+  stdout = JSON.stringify(statsView, (key, value) => key === 'bar' ? 15 : value)
+  expect((await $.command.run(statsCommand)).text).toMatch(/^Muster stats failed: .+/)
+  expect(opened).toEqual(['muster-stats'])
+})
+
+test('the stats pane lays out Python values and follows focus and supplies every table row for native scrolling', async ($, on) => {
+  let runs = 0
+  const view = { ...statsView, labels: { ...statsView.labels, less: 'Less activity', more: 'More activity' } }
+  on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: '/plugin' } }))
+  on('env.get', () => ({ value: undefined }))
+  on('process.run', () => {
+    runs++
+    return { value: processReport(JSON.stringify(view)) }
+  })
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  const landed: string[] = []
+  on('ui.focus', { plugin: 'muster' }, (_, e) => {
+    if (e.element) landed.push(e.element)
+    return {}
+  })
+  await $.command.run(statsCommand)
+  const ui = await $.ui.mount({ ...statsPane, props: { ...statsPane.props, scroll: { offset: 0, bodyRows: 7 } } })
+  const line = async (text: RegExp | string) => (await ui.find({ type: 'Text', text }))?.text
+  for (const name of ['Overview', 'Repos', 'Workers']) expect(await ui.find({ text: name })).toBeDefined()
+  expect(await line(/Mon\s+░░/)).toBeDefined()
+  expect(await line(/▒▒/)).toBeDefined()
+  expect(await line(/Wed\s+▓▓/)).toBeDefined()
+  expect(await line(/██/)).toBeDefined()
+  expect(await line(/Fri\s+··/)).toBeDefined()
+  expect(await line(/Less activity ░ ▒ ▓ █ More activity/)).toBeDefined()
+  for (const text of [statsView.ranges[0]!.usage, statsView.ranges[0]!.types, statsView.ranges[0]!.fun, statsView.legacy_note]) {
+    expect(await line(text)).toBeDefined()
+  }
+  expect((await ui.find({ type: 'Text', text: statsView.ranges[0]!.fun }))?.props.color).toBe('suggestion')
+  expect(await line(view.labels.pane_hint)).toBeDefined()
+  expect(await line(/4 \(4 settled\/0 open\)/)).toBeDefined()
+  const autofocus = async () => (await ui.findAll({ type: 'Button' })).filter(button => button.props.autoFocus).map(button => button.text)
+  expect(await autofocus()).toEqual(['Overview'])
+  const focus = (element: string) => $.ui.focus({
+    component: 'Pane', requestId: 'muster-stats', plugin: 'muster', element, origin: { kind: 'person' },
+  })
+  await focus('stats-range-1')
+  expect(await line(/2 \(2 settled\/0 open\)/)).toBeDefined()
+  await focus('stats-tab-1')
+  expect(await autofocus()).toEqual(['Repos'])
+  expect(await line(/Cost\/accepted/)).toBeDefined()
+  expect(await line(/project-a.*75%\* ████████··.*≥\$0\.26/)).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /^\s*████████··$/ }))?.props.color).toBe('claude')
+  expect((await ui.find({ type: 'Text', text: /^\s*75%\*$/ }))?.props.dimColor).toBe(true)
+  expect(await line(statsView.ranges[0]!.sample_note)).toBeDefined()
+  expect(await line(/project-f/)).toBeDefined()
+  await focus('stats-tab-2')
+  expect(await line(/low\s+worker-a\s+model-a/)).toBeDefined()
+  await focus('stats-tab-1')
+  expect(await line(/project-a/)).toBeDefined()
+  expect(landed).toEqual(['stats-range-1', 'stats-tab-1', 'stats-tab-2', 'stats-tab-1'])
+  await ui.redraw({ ...statsPane.props, bodyColumns: 70 })
+  expect(await line(/Repo\s+Type\s+Set\s+First pass.*\$\/ok/)).toBeDefined()
+  await ui.press({ key: 'stats-tab-0' })
+  expect(await line(/2 \(2 settled\/0 open\)/)).toBeDefined()
+  await ui.press({ key: 'stats-range-0' })
+  expect(await line(/4 \(4 settled\/0 open\)/)).toBeDefined()
+  expect(runs).toBe(1)
   await ui.unmount()
 })
