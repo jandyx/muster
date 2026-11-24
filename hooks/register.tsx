@@ -778,14 +778,20 @@ export const register: Register = on => {
         </Text>)}
         <Text dimColor>{labels.less} <Text color="claude">{[...labels.shades.slice(1)].join(' ')}</Text> {labels.more}</Text>
         {rangeLine}
-        {range.metrics.map(([label, value], i) => {
-          if (i % 2) return null
-          const right = range.metrics[i + 1]
-          return <Box flexDirection="row">
-            <Box width="50%"><Text>{label} <Text color="claude">{value}</Text></Text></Box>
-            {right && <Text>{right[0]} <Text color="claude">{right[1]}</Text></Text>}
-          </Box>
-        })}
+        {(() => {
+          // Two columns sized to the longest left pair; one pair per line when both do not fit.
+          const pairWidth = ([label, value]: [string, string]) => width(`${label} ${value}`)
+          const lefts = range.metrics.filter((_, i) => i % 2 === 0)
+          const rights = range.metrics.filter((_, i) => i % 2 === 1)
+          const leftWidth = Math.max(0, ...lefts.map(pairWidth)) + 3
+          const twoColumns = leftWidth + Math.max(0, ...rights.map(pairWidth)) <= columns
+          const pair = ([label, value]: [string, string]) => <Text>{label} <Text color="claude">{value}</Text></Text>
+          if (!twoColumns) return range.metrics.map(pair)
+          return lefts.map((left, i) => <Box flexDirection="row">
+            <Box width={leftWidth}>{pair(left)}</Box>
+            {rights[i] && pair(rights[i]!)}
+          </Box>)
+        })()}
         <Text dimColor>{range.usage}</Text>
         {range.types && <Text>{range.types}</Text>}
         <Text color="suggestion">{range.fun}</Text>
