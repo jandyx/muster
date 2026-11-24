@@ -1,11 +1,10 @@
 """Self-check for skills/muster/muster.py: usage math and a full run with a fake claude worker.
 Run: python3 -m unittest discover -s tests"""
-import contextlib, datetime, importlib.util, io, threading, time, unittest.mock, json, os, pathlib, re, stat, sys, tempfile, unittest
+import contextlib, datetime, io, threading, time, unittest.mock, json, os, pathlib, re, stat, sys, tempfile, unittest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-spec = importlib.util.spec_from_file_location("muster", ROOT / "skills/muster/muster.py")
-M = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(M)
+sys.path.insert(0, str(ROOT / "skills/muster"))
+import muster as M
 PRICES = json.loads((ROOT / "prices.json").read_text())
 
 
@@ -1574,9 +1573,215 @@ class Stats(unittest.TestCase):
             out = M.stats({"runsDir": d})
             self.assertEqual(out.splitlines()[0], "tier\tworker\tmodel\tsettled\taccepted\topen\tfirst_pass\t"
                                                   "attempts_per_work\tblocked\tcheck_failed\tneeds_fixes\t"
-                                                  "outside_failures\tmedian_minutes\ttokens_per_accepted\t"
+                                                  "claude_fixed\toutside_failures\tmedian_minutes\ttokens_per_accepted\t"
                                                   "usd_per_accepted\tbilling")
             # a and b share a row, odd has malformed usage, and junk predates recorded changes.
             self.assertEqual(len(self.table(out)), 2)
             self.assertEqual(self.table(out)[0]["usd_per_accepted"], "-")
             self.assertEqual(self.table(out)[1]["settled"], "2")
+
+    def test_claude_fix_counts_once_and_prevents_first_pass(self):
+        with tempfile.TemporaryDirectory() as d:
+            approved = "Verdict: Approved\nchanges-sha256: sha\n"
+            self.add(d, "run", "clean", worker="clean", review=approved + "Summary: Fixed by: Claude yesterday")
+            self.add(d, "run", "fixed", review=approved + "Fixed by: Claude: corrected the output")
+            self.add(d, "run", "retry", review=approved + "fixed BY: claude: adjusted the check")
+            self.add(d, "run", "retry-r2")
+            self.add(d, "run", "pending", review="Fixed by: Claude: still checking")
+            rows = self.rows(M.stats({"runsDir": d}))
+            self.assertEqual((rows["clean"]["first_pass"], rows["clean"]["claude_fixed"]), ("100%", "0"))
+            self.assertEqual((rows["w"]["first_pass"], rows["w"]["claude_fixed"]), ("0%", "2"))
+
+    def test_records_join_counted_attempts_with_their_costs_and_line_counts(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = pathlib.Path(d, "sample")
+            self.add(d, "run", "task", worker_type=None, model="", repo=repo, main_repo=repo,
+                     failure="provider", status="failed: usage limit", changes="2 files +5 -3 (cut)",
+                     usage=self.usage(7, 3, None, model="small"))
+            self.add(d, "run", "task-r2", model="large", changes="1 files +4 -2",
+                     usage=self.usage(10, 6, 1.25), started="2026-11-18 10:20:00", finished="2026-11-18 10:25:00")
+            self.add(d, "run", "task-r3", status="canceled: dropped", changes="1 files +100 -100")
+            self.add(d, "run", "unpriced", worker="other", changes="unavailable: no repo")
+            self.add(d, "run", "legacy", changes=None)
+            records, legacy = M.stats_records({"runsDir": d, "workers": {"w": {"type": "codex"}}})
+            self.assertEqual((len(records), legacy), (2, 1))
+            by_worker = {r["worker"]: r for r in records}
+            expected = dict(repo="sample", type="codex", tier="low", worker="w", model="small",
+                            started=datetime.datetime(2026, 11, 18, 10), settled=True, accepted=True,
+                            open=False, first_pass=True, attempts=1, blocked=False, check_failed=False,
+                            needs_fixes=False, claude_fixed=False, outside_failures=1, tokens_in=17,
+                            tokens_out=9, usd=1.25, priced_partially=True, minutes=15, billing="metered",
+                            lines_added=9, lines_removed=5)
+            self.assertEqual({key: by_worker["w"][key] for key in expected}, expected)
+            other = by_worker["other"]
+            self.assertEqual((other["usd"], other["lines_added"], other["lines_removed"]), (None, 0, 0))
+
+    def test_table_rounds_cost_after_adding_each_attempt_in_order(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.add(d, "run", "one", usage=self.usage(1, 1, 0.01))
+            self.add(d, "run", "two", usage=self.usage(1, 1, 0.01))
+            self.add(d, "run", "two-r2", usage=self.usage(1, 1, 0.07))
+            self.assertEqual(self.table(M.stats({"runsDir": d}))[0]["usd_per_accepted"], "0.05")
+
+    def overview_fixture(self, root):
+        for day, count in ((16, 1), (18, 2), (21, 3), (22, 4)):
+            repo = pathlib.Path(root, "older" if day == 16 else "recent")
+            for i in range(count):
+                self.add(root, "run", f"day-{day}-{i}", started=f"2026-11-{day} 10:00:00",
+                         finished=f"2026-11-{day} 10:10:00", repo=repo, main_repo=repo,
+                         review="Verdict: Approved\nchanges-sha256: sha\nFixed by: Claude: repaired" if day == 16 else None)
+        return M.stats_records({"runsDir": root})[0]
+
+    @staticmethod
+    def screen(records, **options):
+        import muster_tui
+        defaults = dict(tab="Overview", range_name="All time", width=140, height=40, today=datetime.date(2026, 11, 23))
+        return muster_tui.render(records, 0, **(defaults | options))
+
+    @staticmethod
+    def screen_text(lines):
+        return "\n".join("".join(text for text, _ in line) for line in lines)
+
+    def test_overview_shows_calendar_and_outcome_metrics(self):
+        with tempfile.TemporaryDirectory() as d:
+            lines = self.screen(self.overview_fixture(d))
+        text = self.screen_text(lines)
+        for label in ("Overview", "Repos", "Workers", "Mon", "Wed", "Fri", "Less ░ ▒ ▓ █ More",
+                      "Pieces of work", "Favorite worker type", "Median minutes", "Sent back", "Check failed"):
+            self.assertIn(label, text)
+        for label, value in (("First pass", "90%"), ("Claude fixed", "1"), ("Accepted", "10"),
+                             ("Active days", "4/8"), ("Busiest day", "2026-11-22"),
+                             ("Longest streak", "2"), ("Current streak", "2")):
+            self.assertRegex(text, re.escape(label) + r"[ %:]*" + re.escape(value))
+        monday = next(i for i, line in enumerate(lines) if "Mon" in self.screen_text([line]))
+        heat = [[(t, s) for t, s in line if s.startswith("heat")] for line in lines[monday:monday + 7]]
+        self.assertEqual([row[-2] for row in heat],  # the week of Nov 16; today's week is last
+                         [("░░", "heat1"), ("··", "heat0"), ("▒▒", "heat2"), ("··", "heat0"),
+                          ("··", "heat0"), ("▓▓", "heat3"), ("██", "heat4")])
+
+    def test_range_filters_outcomes_but_preserves_the_calendar(self):
+        with tempfile.TemporaryDirectory() as d:
+            records = self.overview_fixture(d)
+            all_time = self.screen(records)
+            last_week = self.screen(records, range_name="Last 7 days")
+            repos = self.screen_text(self.screen(records, tab="Repos", range_name="Last 7 days"))
+        self.assertRegex(self.screen_text(last_week), r"First pass[ %:]*100%")
+        self.assertRegex(self.screen_text(last_week), r"Active days[ :]*3/7")
+
+        def cells(screen):
+            return [segment for line in screen for segment in line if segment[1].startswith("heat")]
+
+        self.assertEqual(cells(last_week), cells(all_time))
+        self.assertIn("recent", repos)
+        self.assertNotIn("older", repos)
+
+    def test_overview_formats_usage_and_compares_read_only_work_to_a_book(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.add(d, "run", "read", changes="0 files +0 -0", usage=self.usage(1_000_000, 207_400, 0.25))
+            self.add(d, "run", "unknown", changes="0 files +0 -0")
+            records, _ = M.stats_records({"runsDir": d})
+        lines = self.screen(records)
+        self.assertIn("Input 1m · Output 207.4k · Cost ≥$0.25", self.screen_text(lines))
+        self.assertTrue(any("~1× the tokens of War and Peace" in text
+                            for line in lines for text, style in line if style == "link"))
+
+    def test_group_tables_mark_small_samples_and_show_first_pass_bars(self):
+        with tempfile.TemporaryDirectory() as d:
+            records = self.overview_fixture(d)
+            repos = self.screen(records, tab="Repos")
+            workers = self.screen(records, tab="Workers")
+        for key, lines, bar in (("recent", repos, "█" * 10), ("older", repos, "·" * 10),
+                                ("low", workers, "█" * 9 + "·")):
+            row = next(line for line in lines if key in self.screen_text([line]))
+            self.assertRegex("".join(t for t, s in row if s == "muted"), r"\d+%\*")
+            self.assertIn(bar, "".join(t for t, s in row if s == "accent"))
+            self.assertIn("* fewer than 30 settled: small sample", self.screen_text(lines))
+        self.assertRegex(self.screen_text(workers), r"low\s+w\s+m\s+10")
+
+    def test_repo_scroll_reaches_the_last_group_and_keeps_the_footer(self):
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(20):
+                repo = pathlib.Path(d, f"project-{i:02}")
+                self.add(d, "run", repo.name, repo=repo, main_repo=repo)
+            records, _ = M.stats_records({"runsDir": d})
+        first = self.screen_text(self.screen(records, tab="Repos", height=10))
+        last = self.screen_text(self.screen(records, tab="Repos", height=10, scroll=100))
+        self.assertIn("project-00", first)
+        self.assertNotIn("project-19", first)
+        self.assertIn("project-19", last)
+        self.assertNotIn("project-00", last)
+        self.assertIn("esc close", last.splitlines()[-1])
+
+    def test_render_fits_a_narrow_and_short_window(self):
+        with tempfile.TemporaryDirectory() as d:
+            records = self.overview_fixture(d)
+            june = self.screen(records, width=60, today=datetime.date(2027, 6, 1))
+            self.assertIn("Jun", self.screen_text(june[:3]))
+            for tab in ("Overview", "Repos", "Workers"):
+                for height in (3, 40):
+                    lines = self.screen(records, tab=tab, width=60, height=height)
+                    self.assertLessEqual(len(lines), height)
+                    self.assertTrue(all(sum(len(text) for text, _ in line) <= 60 for line in lines))
+
+    def test_tui_requires_a_terminal_and_its_own_grouping(self):
+        with tempfile.TemporaryDirectory() as d:
+            piped = Cli.run_cli({"runsDir": d}, "stats", "--tui")
+            self.assertEqual((piped.returncode, piped.stderr.strip()), (2, "stats --tui needs a terminal"))
+            grouped = Cli.run_cli({"runsDir": d}, "stats", "--tui", "--by", "repo")
+            self.assertNotEqual(grouped.returncode, 0)
+            self.assertIn("muster.py stats", grouped.stderr)
+
+    def test_tui_switches_tab_and_range_in_a_terminal(self):
+        import errno, pty, select, signal
+
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("archive", "recent"):
+                day = datetime.date.today() - datetime.timedelta(days=14 if name == "archive" else 0)
+                repo = pathlib.Path(d, name)
+                self.add(d, "run", name, repo=repo, main_repo=repo, started=f"{day} 10:00:00")
+            config = pathlib.Path(d, "config.json")
+            config.write_text(json.dumps({"runsDir": d}))
+            env = dict(os.environ, MUSTER_CONFIG=str(config), TERM="xterm-256color", LINES="40", COLUMNS="140")
+            args = [sys.executable, str(ROOT / "skills/muster/muster.py"), "stats", "--tui"]
+            deadline = time.monotonic() + 10
+            pid, fd = pty.fork()
+            if pid == 0:
+                os.execve(sys.executable, args, env)
+            output = bytearray()
+
+            def receive(marker):
+                start = len(output)
+                while marker is None or marker not in output[start:]:
+                    remaining = deadline - time.monotonic()
+                    self.assertGreater(remaining, 0, f"Timed out waiting for {marker!r}")
+                    ready, _, _ = select.select([fd], [], [], remaining)
+                    self.assertTrue(ready, f"Timed out waiting for {marker!r}: {output[-300:]!r}")
+                    try:
+                        data = os.read(fd, 8192)
+                    except OSError as e:
+                        if e.errno != errno.EIO:
+                            raise
+                        data = b""  # Linux reports EIO when the slave closes; macOS reports EOF.
+                    if not data:
+                        self.assertIsNone(marker, f"Terminal closed before {marker!r}: {output[-300:]!r}")
+                        return
+                    output.extend(data)
+
+            try:
+                receive(b"Overview")
+                os.write(fd, b"\x1b[C")
+                receive(b"archive")
+                os.write(fd, b"\t")
+                receive(b"Last 7 days")
+                os.write(fd, b"q")
+                receive(None)
+                _, status = os.waitpid(pid, 0)
+                pid = None
+                self.assertLess(time.monotonic(), deadline)
+                self.assertEqual(os.waitstatus_to_exitcode(status), 0, output[-300:])
+                self.assertIn(b"Repos", output)
+            finally:
+                os.close(fd)
+                if pid is not None:
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
