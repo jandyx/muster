@@ -261,6 +261,8 @@ The full decision chain is drawn in [docs/how-it-works.md](docs/how-it-works.md#
 
 `python3 <plugin>/skills/muster/muster.py stats [--days N] [--since D] [--until D] [--by FIELDS]` reports on run history in read-only mode. Retries linked with `--retry-of` or named `x`, `x-r2` belong to one piece of work. Canceled attempts and attempts that never started are ignored.
 
+Run `python3 <plugin>/skills/muster/muster.py stats --tui` in a terminal for an activity heatmap and breakdowns by repository and worker. Use ←/→ or `h`/`l` to switch tabs, Tab to cycle through all time, the last 7 days and the last 30 days, ↑/↓ or `k`/`j` to scroll the tables, and Esc or `q` to close. The range changes the figures and tables. The heatmap always shows the loaded history, which you can limit with `--days`, `--since` and `--until`.
+
 Use `--by repo,type` to compare worker types within each repository. Choose a comma-separated list from `repo`, `type`, `tier`, `worker` and `model`. These fields appear first, in the order given, and come from the first counted attempt. The default is `tier,worker,model`.
 
 `--since` and `--until` filter by the first counted attempt's start time. Both take `YYYY-MM-DD` or a quoted `"YYYY-MM-DD HH:MM"`. `--since` includes its boundary. A date-only `--until` includes the whole day. An `--until` with a time keeps only work started before that time. Work without a recorded start time is excluded from a date window. Combine either bound with `--days N` to limit run folders by the date in their names.
@@ -275,11 +277,12 @@ The newest counted attempt determines the outcome. If it is `done` and its metad
 | `settled` | accepted work plus work whose newest counted attempt failed |
 | `accepted` | settled work whose current diff has an `Approved` or `User override` verdict, or a `Needs fixes` verdict on an empty diff, and whose status is `done` |
 | `open` | running work, completed work awaiting a current review or a requested fix, or work waiting for a rerun after a provider, infra or interruption failure |
-| `first_pass` | share of accepted work that needed no rework and no `Fixed in:` line, or `-` |
+| `first_pass` | share of accepted work that needed no rework, including fixes by Claude, and had no `Fixed in:` line, or `-` |
 | `attempts_per_work` | mean attempts per settled piece, excluding provider and infra failures and interruptions |
 | `blocked` | settled pieces with at least one attempt marked blocked after the worker reported `BLOCKED` or `NEEDS_CONTEXT` |
 | `check_failed` | settled pieces with at least one failed done check |
 | `needs_fixes` | settled pieces where an attempt's last verdict was `Needs fixes` on a non-empty diff, or the newest attempt's review has a `Fixed in:` line |
+| `claude_fixed` | settled pieces with a `Fixed by: Claude: <what changed>` line in any counted attempt's review. Claude records this when it patches the worker's diff before approval |
 | `outside_failures` | number of provider failures, infra failures and interruptions, counting each attempt across both settled and open work |
 | `median_minutes` | median minutes per settled piece, summing recorded attempt durations for each piece |
 | `tokens_per_accepted` | input plus output tokens across settled work, divided by the accepted count |

@@ -15,7 +15,7 @@
     muster.py clean [--days N]                list what could be removed (runs untouched for N days, default 14;
                                               task worktrees; muster/* branches) with the command for each; deletes
                                               nothing
-    muster.py stats [--days N] [--since D] [--until D] [--by FIELDS]
+    muster.py stats [--days N] [--since D] [--until D] [--by FIELDS] [--tui]
                                               group work by repo, type, tier, worker or model; filter by run
                                               folder age and first attempt's start date or time. Reads only.
     muster.py workers                         list configured workers
@@ -793,8 +793,14 @@ def resolve_stats_repos(attempts):
         a["repo_name"] = names[path]
 
 
-def stats(cfg, days=None, since=None, until=None, by=DEFAULT_STATS_FIELDS):
-    """What each group delivered, read from the run folders. Reads only; writes nothing.
+def stats_billing(kinds):
+    if len(kinds) == 1:
+        return next(iter(kinds))
+    return "mixed" if kinds else "-"
+
+
+def stats_records(cfg, days=None, since=None, until=None, *, resolve_repos=True):
+    """Read one record per piece of work and count pieces that predate reviews.
     Attempts of one piece of work are joined as the pane joins them (`retry_of`, then `x`/`x-r2` naming)."""
     runs = expand(cfg.get("runsDir", "~/.muster/runs"))
     today = datetime.date.today()
@@ -875,9 +881,9 @@ def stats(cfg, days=None, since=None, until=None, by=DEFAULT_STATS_FIELDS):
         return (verdict in ("approved", "user override") and covers) or \
             (fixes and (m.get("changes") or "").startswith("0 files"))
 
-    if "repo" in by:
+    if resolve_repos:
         resolve_stats_repos(attempts.values())
-    groups = {}
+    records = []
     legacy = 0
     for items in works.values():
         counted = [a for a in items if a["counted"]]
@@ -894,57 +900,85 @@ def stats(cfg, days=None, since=None, until=None, by=DEFAULT_STATS_FIELDS):
             legacy += 1
             continue
         meta = first["meta"]
-        fields = {field: meta.get(field) for field in by}
-        if "model" in by and not fields["model"]:
+        fields = {field: meta.get(field) for field in ("tier", "worker", "type", "model")}
+        fields["repo"] = first.get("repo_name")
+        if not fields["model"]:
             fields["model"] = (first["usage"] or {}).get("model")
-        if "type" in by and not fields["type"]:
+        if not fields["type"]:
             workers = cfg.get("workers")
             worker = workers.get(meta.get("worker")) if isinstance(workers, dict) else None
             fields["type"] = worker.get("type") if isinstance(worker, dict) else None
-        if "repo" in by:
-            fields["repo"] = first.get("repo_name")
-        key = tuple(fields[f] if isinstance(fields[f], str) and fields[f] else "-" for f in by)
-        g = groups.setdefault(key, {
-            "settled": 0, "accepted": 0, "open": 0, "first_pass": 0, "attempts": 0, "tokens": 0,
-            "blocked": 0, "check_failed": 0, "needs_fixes": 0, "outside_failures": 0,
-            "usd": 0.0, "priced": False, "unpriced": False, "minutes": [], "billing": set()})
-        rounds = [a for a in counted if a["meta"].get("failure") not in NOT_TASK]
-        g["outside_failures"] += len(counted) - len(rounds)
+        record = {k: v if isinstance(v, str) and v else "-" for k, v in fields.items()}
+        rounds = sum(a["meta"].get("failure") not in NOT_TASK for a in counted)
         ok = accepted(newest)
-        # Work whose newest attempt failed for a reason outside the task is waiting for its rerun.
-        if not ok and (not newest["status"].startswith("failed:") or newest["meta"].get("failure") in NOT_TASK):
-            g["open"] += 1
-            continue
-        g["settled"] += 1
-        if ok:
-            g["accepted"] += 1
-        g["blocked"] += any(a["meta"].get("failure") == "blocked" for a in counted)
-        g["check_failed"] += any(a["status"].startswith("failed: done check failed") for a in counted)
-        if re.search(r"^Fixed in:", newest["review"], re.M) or any(
-                re.match(r"[1-9]\d* files?\b", a["meta"].get("changes", "")) and last_verdict(a) == "needs fixes"
-                for a in counted):
-            g["needs_fixes"] += 1
-        if ok and len(rounds) == 1 and "Fixed in:" not in newest["review"]:
-            g["first_pass"] += 1
-        g["attempts"] += len(rounds)
+        # An outside failure leaves the work open until its rerun.
+        settled = ok or (newest["status"].startswith("failed:") and newest["meta"].get("failure") not in NOT_TASK)
+        claude_fixed = settled and any(re.search(r"^Fixed by:[^\S\n]*Claude", a["review"], re.I | re.M)
+                                       for a in counted)
+        sent_back = settled and (bool(re.search(r"^Fixed in:", newest["review"], re.M)) or any(
+            re.match(r"[1-9]\d* files?\b", a["meta"].get("changes", "")) and last_verdict(a) == "needs fixes"
+            for a in counted))
+
+        costs, minutes, billing = [], [], set()
+        tokens_in = tokens_out = lines_added = lines_removed = 0
         for a in counted:
             u = a["usage"] or {}
-            g["tokens"] += number(u.get("input")) + number(u.get("output"))
+            tokens_in += number(u.get("input"))
+            tokens_out += number(u.get("output"))
             if isinstance(u.get("usd"), (int, float)) and not isinstance(u.get("usd"), bool):
-                g["usd"] += u["usd"]
-                g["priced"] = True
-            else:
-                g["unpriced"] = True
+                costs.append(u["usd"])
             if u.get("billing") in ("metered", "subscription"):
-                g["billing"].add(u["billing"])
-        spent = [(a["finished"] - a["started"]).total_seconds() / 60 for a in counted
-                 if a["started"] and a["finished"]]
-        if spent:
-            g["minutes"].append(sum(spent))
+                billing.add(u["billing"])
+            if a["started"] and a["finished"]:
+                minutes.append((a["finished"] - a["started"]).total_seconds() / 60)
+            changes = re.match(r"\d+ files? \+(\d+) -(\d+)\b", a["meta"].get("changes", ""))
+            if changes:
+                lines_added += int(changes[1])
+                lines_removed += int(changes[2])
 
-    header = (*by, "settled", "accepted", "open", "first_pass", "attempts_per_work",
-              "blocked", "check_failed", "needs_fixes", "outside_failures",
-              "median_minutes", "tokens_per_accepted", "usd_per_accepted", "billing")
+        record.update(
+            started=started, settled=settled, accepted=ok, open=not settled,
+            first_pass=ok and rounds == 1 and not claude_fixed and "Fixed in:" not in newest["review"],
+            attempts=rounds, outside_failures=len(counted) - rounds, needs_fixes=sent_back, claude_fixed=claude_fixed,
+            blocked=settled and any(a["meta"].get("failure") == "blocked" for a in counted),
+            check_failed=settled and any(a["status"].startswith("failed: done check failed") for a in counted),
+            tokens_in=tokens_in, tokens_out=tokens_out, lines_added=lines_added, lines_removed=lines_removed,
+            usd=sum(costs) if costs else None, attempt_costs=costs, priced_partially=0 < len(costs) < len(counted),
+            minutes=sum(minutes) if minutes else None, billing=stats_billing(billing),
+        )
+        records.append(record)
+    return records, legacy
+
+
+def stats_summary(records):
+    """Rates and usage describe settled work; activity and outside failures include open work."""
+    settled = [r for r in records if r["settled"]]
+    totals = {field: sum(r[field] for r in records) for field in (
+        "settled", "accepted", "open", "first_pass", "blocked", "check_failed", "needs_fixes",
+        "claude_fixed", "outside_failures", "lines_added", "lines_removed")}
+    for field in ("attempts", "tokens_in", "tokens_out"):
+        totals[field] = sum(r[field] for r in settled)
+    priced = [r for r in settled if r["usd"] is not None]
+    # Preserve the table's attempt-by-attempt rounding at half-cent boundaries.
+    usd = 0.0
+    for r in priced:
+        for cost in r.get("attempt_costs", (r["usd"],)):
+            usd += cost
+    minutes = [r["minutes"] for r in settled if r["minutes"] is not None]
+    totals.update(
+        usd=usd if priced else None,
+        priced_partially=bool(priced) and (len(priced) < len(settled) or any(r["priced_partially"] for r in priced)),
+        median_minutes=statistics.median(minutes) if minutes else None,
+        billing=stats_billing({r["billing"] for r in settled if r["billing"] != "-"}),
+    )
+    return totals
+
+
+def stats_groups(records, by):
+    groups = {}
+    for r in records:
+        key = tuple(r[field] for field in by)
+        groups.setdefault(key, []).append(r)
     order = {"low": 0, "standard": 1, "high": 2, "-": 3}
 
     def sort_key(key):
@@ -953,27 +987,37 @@ def stats(cfg, days=None, since=None, until=None, by=DEFAULT_STATS_FIELDS):
             return (order.get(key[i], 4), *key[:i], *key[i + 1:])
         return key
 
-    lines = ["\t".join(header)]
     for key in sorted(groups, key=sort_key):
-        g = groups[key]
+        yield key, groups[key]
+
+
+def stats(cfg, days=None, since=None, until=None, by=DEFAULT_STATS_FIELDS):
+    records, legacy = stats_records(cfg, days, since, until, resolve_repos="repo" in by)
+    header = (*by, "settled", "accepted", "open", "first_pass", "attempts_per_work",
+              "blocked", "check_failed", "needs_fixes", "claude_fixed", "outside_failures",
+              "median_minutes", "tokens_per_accepted", "usd_per_accepted", "billing")
+    lines = ["\t".join(header)]
+    small_sample = False
+    for key, group in stats_groups(records, by):
+        g = stats_summary(group)
+        small_sample |= g["settled"] < 30
         ok = g["accepted"]
         usd = "-"
-        if ok and g["priced"]:
-            usd = ("≥" if g["unpriced"] else "") + f"{g['usd'] / ok:.2f}"
+        if ok and g["usd"] is not None:
+            usd = ("≥" if g["priced_partially"] else "") + f"{g['usd'] / ok:.2f}"
         lines.append("\t".join([
             *key, str(g["settled"]), str(ok), str(g["open"]),
             f"{100 * g['first_pass'] / ok:.0f}%" if ok else "-",
             f"{g['attempts'] / g['settled']:.1f}" if g["settled"] else "-",
-            str(g["blocked"]), str(g["check_failed"]), str(g["needs_fixes"]), str(g["outside_failures"]),
-            f"{statistics.median(g['minutes']):.1f}" if g["minutes"] else "-",
-            str(round(g["tokens"] / ok)) if ok else "-",
-            usd,
-            next(iter(g["billing"])) if len(g["billing"]) == 1 else "mixed" if g["billing"] else "-",
+            str(g["blocked"]), str(g["check_failed"]), str(g["needs_fixes"]), str(g["claude_fixed"]),
+            str(g["outside_failures"]), f"{g['median_minutes']:.1f}" if g["median_minutes"] is not None else "-",
+            str(round((g["tokens_in"] + g["tokens_out"]) / ok)) if ok else "-",
+            usd, g["billing"],
         ]))
     lines.append("Subscription dollars are API-equivalent, not money paid.")
     if legacy:
         lines.append(f"{legacy} pieces of work from before reviews were recorded are left out.")
-    if any(g["settled"] < 30 for g in groups.values()):
+    if small_sample:
         lines.append("Rows with fewer than 30 settled pieces of work are small samples: only large differences are meaningful.")
     return "\n".join(lines)
 
@@ -1484,6 +1528,33 @@ def main():
         return
     if cmd == "watch" and (len(args) == 1 or (len(args) == 3 and args[1] == "--stall-min")):  # reads only the run folder
         sys.exit(watch(args[0], float(args[2]) if len(args) == 3 else 10))
+    if cmd == "stats":
+        opts = {}
+        args = iter(args)
+        for opt in args:
+            if opt in opts or opt not in ("--tui", "--days", "--since", "--until", "--by"):
+                sys.exit(__doc__)
+            opts[opt] = True if opt == "--tui" else next(args, None)
+            if opts[opt] is None:
+                sys.exit(__doc__)
+        by = opts["--by"].split(",") if "--by" in opts else DEFAULT_STATS_FIELDS
+        if set(by) - {"repo", "type", *DEFAULT_STATS_FIELDS} or ("--tui" in opts and "--by" in opts):
+            sys.exit(__doc__)
+        try:
+            days = int(opts["--days"]) if "--days" in opts else None
+            since = stats_bound(opts.get("--since"))
+            until = stats_bound(opts.get("--until"), until=True)
+        except ValueError:
+            sys.exit(__doc__)
+        if "--tui" in opts:
+            if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                print("stats --tui needs a terminal", file=sys.stderr)
+                sys.exit(2)
+            import muster_tui
+            muster_tui.run(*stats_records(load_config(), days, since, until))
+        else:
+            print(stats(load_config(), days, since, until, by))
+        return
     cfg = load_config()
     if cmd == "doctor":
         probs = doctor(cfg)
@@ -1504,21 +1575,6 @@ def main():
         return
     if cmd == "clean" and len(args) in (0, 2) and (not args or args[0] == "--days"):
         print(clean(cfg, int(args[1]) if args else 14))
-        return
-    if cmd == "stats":
-        opts = dict(zip(args[::2], args[1::2]))
-        if 2 * len(opts) != len(args) or set(opts) - {"--days", "--since", "--until", "--by"}:
-            sys.exit(__doc__)
-        by = opts["--by"].split(",") if "--by" in opts else DEFAULT_STATS_FIELDS
-        if set(by) - {"repo", "type", *DEFAULT_STATS_FIELDS}:
-            sys.exit(__doc__)
-        try:
-            days = int(opts["--days"]) if "--days" in opts else None
-            since = stats_bound(opts.get("--since"))
-            until = stats_bound(opts.get("--until"), until=True)
-        except ValueError:
-            sys.exit(__doc__)
-        print(stats(cfg, days, since, until, by))
         return
     if cmd == "workers":
         for name, w in cfg["workers"].items():
