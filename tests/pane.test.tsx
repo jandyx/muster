@@ -1004,6 +1004,25 @@ test('muster-stats rejects a malformed table without reopening a previous report
   expect(opened).toEqual(['muster-stats'])
 })
 
+test('the stats pane puts two metrics on a line only when both fit', async ($, on) => {
+  const metrics = [['Pieces of work', '190 (184 settled/6 open)'], ['First pass', '75%'], ['Accepted', '159'], ['Attempts per work', '1.3']]
+  const view = { ...statsView, ranges: statsView.ranges.map(r => ({ ...r, metrics })) }
+  on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_ROOT: '/plugin' } }))
+  on('env.get', () => ({ value: undefined }))
+  on('process.run', () => ({ value: processReport(JSON.stringify(view)) }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  await $.command.run(statsCommand)
+  const ui = await $.ui.mount({ ...statsPane, props: { ...statsPane.props, bodyColumns: 120 } })
+  // A two-column row holds its left pair in a Box of fixed width.
+  const leftColumn = async () => (await ui.findAll({ type: 'Box' }))
+    .filter(box => typeof box.props.width === 'number' && box.text.startsWith('Pieces of work')).map(box => box.props.width)
+  expect(await leftColumn()).toEqual(['Pieces of work 190 (184 settled/6 open)'.length + 3])
+  await ui.redraw({ ...statsPane.props, bodyColumns: 50 })
+  expect(await leftColumn()).toEqual([])
+  for (const [label, value] of metrics) expect(await ui.find({ type: 'Text', text: `${label} ${value}` })).toBeDefined()
+  await ui.unmount()
+})
+
 test('the stats pane lays out Python values and follows focus and supplies every table row for native scrolling', async ($, on) => {
   let runs = 0
   const view = { ...statsView, labels: { ...statsView.labels, less: 'Less activity', more: 'More activity' } }
