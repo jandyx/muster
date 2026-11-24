@@ -15,9 +15,9 @@
     muster.py clean [--days N]                list what could be removed (runs untouched for N days, default 14;
                                               task worktrees; muster/* branches) with the command for each; deletes
                                               nothing
-    muster.py stats [--days N]                show settled, accepted and open work by tier, worker and model;
-                                              compute rates and costs over settled work only. --days N limits
-                                              the run folders by age. Reads only.
+    muster.py stats [--days N] [--since D] [--until D] [--by FIELDS]
+                                              group work by repo, type, tier, worker or model; filter by run
+                                              folder age and first attempt's start date or time. Reads only.
     muster.py workers                         list configured workers
     muster.py detect                          JSON: Codex homes and claude-like CLIs found on this machine
     muster.py doctor                          check the config; exit 1 when something is wrong
@@ -739,10 +739,62 @@ def clean(cfg, days=14):
 # ---------- stats ----------
 
 VERDICT = re.compile(r"^\W*Verdict\W*:\W*(.*?)\W*$", re.I | re.M)
+DEFAULT_STATS_FIELDS = ("tier", "worker", "model")
 
 
-def stats(cfg, days=None):
-    """What each tier, worker and model delivered, read from the run folders. Reads only; writes nothing.
+def stats_bound(value, *, until=False):
+    if value is None:
+        return None
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}( [0-9]{2}:[0-9]{2})?", value):
+        raise ValueError(value)
+    bound = datetime.datetime.strptime(value, "%Y-%m-%d" if len(value) == 10 else "%Y-%m-%d %H:%M")
+    if until and len(value) == 10:  # started is recorded to the second; include the entire day.
+        return datetime.datetime.combine(bound.date(), datetime.time.max)
+    return bound
+
+
+def main_checkout(path):
+    common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common:
+        return os.path.dirname(os.path.normpath(common.rstrip("\n")))
+
+
+def resolve_stats_repos(attempts):
+    names = {}
+    resolved = set()
+    missing = []
+    for a in attempts:
+        meta = a["meta"]
+        path = meta.get("repo") or meta.get("cwd")
+        if path:
+            if meta.get("main_repo"):
+                name = os.path.basename(os.path.normpath(meta["main_repo"]))
+                a["repo_name"] = names[path] = name
+                resolved.add(name)
+            else:
+                missing.append((a, path))
+
+    for _, path in missing:
+        if path in names:
+            continue
+        if not os.path.isdir(path):
+            names[path] = None
+            continue
+        checkout = main_checkout(path)
+        if checkout:
+            names[path] = os.path.basename(checkout)
+            resolved.add(names[path])
+        else:
+            names[path] = os.path.basename(os.path.normpath(path))
+    for a, path in missing:
+        if names[path] is None:
+            base = os.path.basename(os.path.normpath(path))
+            names[path] = max((n for n in resolved if base.startswith(n + "-")), key=len, default=base)
+        a["repo_name"] = names[path]
+
+
+def stats(cfg, days=None, since=None, until=None, by=DEFAULT_STATS_FIELDS):
+    """What each group delivered, read from the run folders. Reads only; writes nothing.
     Attempts of one piece of work are joined as the pane joins them (`retry_of`, then `x`/`x-r2` naming)."""
     runs = expand(cfg.get("runsDir", "~/.muster/runs"))
     today = datetime.date.today()
@@ -808,35 +860,56 @@ def stats(cfg, days=None):
         work, a["round"] = trace(a, {a["key"]})
         works.setdefault(work, []).append(a)
 
+    def last_verdict(a):
+        verdicts = VERDICT.findall(a["review"])
+        return (verdicts[-1] if verdicts else "").lower()
+
     def accepted(a):
         # The pane's rules: the last Verdict line counts, and only when review.md names the current diff.
         if a["status"] != "done" or "changes" not in a["meta"]:
             return False
-        verdicts = VERDICT.findall(a["review"])
-        verdict = (verdicts[-1] if verdicts else "").lower()
+        verdict = last_verdict(a)
         m = a["meta"]
         covers = not m.get("changes_sha256") or m["changes_sha256"] in a["review"]
         fixes = verdict == "needs fixes" and covers
         return (verdict in ("approved", "user override") and covers) or \
             (fixes and (m.get("changes") or "").startswith("0 files"))
 
+    if "repo" in by:
+        resolve_stats_repos(attempts.values())
     groups = {}
     legacy = 0
     for items in works.values():
         counted = [a for a in items if a["counted"]]
         if not counted:
             continue
+        first = min(counted, key=lambda a: (a["started"] or datetime.datetime.min, a["round"]))
+        started = first["started"]
+        if since and (started is None or started < since):
+            continue
+        if until and (started is None or started >= until):
+            continue
         newest = max(counted, key=lambda a: (a["round"], a["started"] or datetime.datetime.min))
         if newest["status"] == "done" and "changes" not in newest["meta"]:
             legacy += 1
             continue
-        first = min(counted, key=lambda a: (a["started"] or datetime.datetime.min, a["round"]))
-        tier, worker = first["meta"].get("tier") or "-", first["meta"].get("worker") or "-"
-        model = first["meta"].get("model") or (first["usage"] or {}).get("model")
-        model = model if isinstance(model, str) and model else "-"  # malformed usage may hold anything
-        g = groups.setdefault((tier, worker, model), {
+        meta = first["meta"]
+        fields = {field: meta.get(field) for field in by}
+        if "model" in by and not fields["model"]:
+            fields["model"] = (first["usage"] or {}).get("model")
+        if "type" in by and not fields["type"]:
+            workers = cfg.get("workers")
+            worker = workers.get(meta.get("worker")) if isinstance(workers, dict) else None
+            fields["type"] = worker.get("type") if isinstance(worker, dict) else None
+        if "repo" in by:
+            fields["repo"] = first.get("repo_name")
+        key = tuple(fields[f] if isinstance(fields[f], str) and fields[f] else "-" for f in by)
+        g = groups.setdefault(key, {
             "settled": 0, "accepted": 0, "open": 0, "first_pass": 0, "attempts": 0, "tokens": 0,
+            "blocked": 0, "check_failed": 0, "needs_fixes": 0, "outside_failures": 0,
             "usd": 0.0, "priced": False, "unpriced": False, "minutes": [], "billing": set()})
+        rounds = [a for a in counted if a["meta"].get("failure") not in NOT_TASK]
+        g["outside_failures"] += len(counted) - len(rounds)
         ok = accepted(newest)
         # Work whose newest attempt failed for a reason outside the task is waiting for its rerun.
         if not ok and (not newest["status"].startswith("failed:") or newest["meta"].get("failure") in NOT_TASK):
@@ -845,7 +918,12 @@ def stats(cfg, days=None):
         g["settled"] += 1
         if ok:
             g["accepted"] += 1
-        rounds = [a for a in counted if a["meta"].get("failure") not in NOT_TASK]
+        g["blocked"] += any(a["meta"].get("failure") == "blocked" for a in counted)
+        g["check_failed"] += any(a["status"].startswith("failed: done check failed") for a in counted)
+        if re.search(r"^Fixed in:", newest["review"], re.M) or any(
+                re.match(r"[1-9]\d* files?\b", a["meta"].get("changes", "")) and last_verdict(a) == "needs fixes"
+                for a in counted):
+            g["needs_fixes"] += 1
         if ok and len(rounds) == 1 and "Fixed in:" not in newest["review"]:
             g["first_pass"] += 1
         g["attempts"] += len(rounds)
@@ -864,20 +942,29 @@ def stats(cfg, days=None):
         if spent:
             g["minutes"].append(sum(spent))
 
-    header = ("tier", "worker", "model", "settled", "accepted", "open", "first_pass", "attempts_per_work",
+    header = (*by, "settled", "accepted", "open", "first_pass", "attempts_per_work",
+              "blocked", "check_failed", "needs_fixes", "outside_failures",
               "median_minutes", "tokens_per_accepted", "usd_per_accepted", "billing")
     order = {"low": 0, "standard": 1, "high": 2, "-": 3}
+
+    def sort_key(key):
+        if "tier" in by:
+            i = by.index("tier")
+            return (order.get(key[i], 4), *key[:i], *key[i + 1:])
+        return key
+
     lines = ["\t".join(header)]
-    for key in sorted(groups, key=lambda k: (order.get(k[0], 4), k[1], k[2])):
+    for key in sorted(groups, key=sort_key):
         g = groups[key]
         ok = g["accepted"]
         usd = "-"
         if ok and g["priced"]:
             usd = ("≥" if g["unpriced"] else "") + f"{g['usd'] / ok:.2f}"
         lines.append("\t".join([
-            key[0], key[1], key[2], str(g["settled"]), str(ok), str(g["open"]),
+            *key, str(g["settled"]), str(ok), str(g["open"]),
             f"{100 * g['first_pass'] / ok:.0f}%" if ok else "-",
             f"{g['attempts'] / g['settled']:.1f}" if g["settled"] else "-",
+            str(g["blocked"]), str(g["check_failed"]), str(g["needs_fixes"]), str(g["outside_failures"]),
             f"{statistics.median(g['minutes']):.1f}" if g["minutes"] else "-",
             str(round(g["tokens"] / ok)) if ok else "-",
             usd,
@@ -958,6 +1045,9 @@ def mark_start(task, cwd):
     head = (git(top, "rev-parse", "--verify", "-q", "HEAD") or "").strip()
     branch = (git(top, "symbolic-ref", "-q", "--short", "HEAD") or "").strip()
     append_meta(task, base=base, base_head=head, branch=branch, repo=top)
+    main = main_checkout(top)
+    if main:
+        append_meta(task, main_repo=main)
 
 
 def overlapping(task, top):
@@ -1415,8 +1505,20 @@ def main():
     if cmd == "clean" and len(args) in (0, 2) and (not args or args[0] == "--days"):
         print(clean(cfg, int(args[1]) if args else 14))
         return
-    if cmd == "stats" and len(args) in (0, 2) and (not args or args[0] == "--days"):
-        print(stats(cfg, int(args[1]) if args else None))
+    if cmd == "stats":
+        opts = dict(zip(args[::2], args[1::2]))
+        if 2 * len(opts) != len(args) or set(opts) - {"--days", "--since", "--until", "--by"}:
+            sys.exit(__doc__)
+        by = opts["--by"].split(",") if "--by" in opts else DEFAULT_STATS_FIELDS
+        if set(by) - {"repo", "type", *DEFAULT_STATS_FIELDS}:
+            sys.exit(__doc__)
+        try:
+            days = int(opts["--days"]) if "--days" in opts else None
+            since = stats_bound(opts.get("--since"))
+            until = stats_bound(opts.get("--until"), until=True)
+        except ValueError:
+            sys.exit(__doc__)
+        print(stats(cfg, days, since, until, by))
         return
     if cmd == "workers":
         for name, w in cfg["workers"].items():

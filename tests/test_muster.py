@@ -103,7 +103,8 @@ class Run(unittest.TestCase):
             self.assertEqual(subprocess.run(["git", "-C", str(repo), "diff", "--cached", "--name-only"],
                                             capture_output=True, text=True).stdout, "")  # index untouched
 
-    def git_repo(self, d, files):
+    @staticmethod
+    def git_repo(d, files):
         import subprocess
         repo = pathlib.Path(d, "repo")
         repo.mkdir()
@@ -142,15 +143,20 @@ class Run(unittest.TestCase):
             self.assertEqual(M.read_meta(str(task))["changes"], "1 files +1 -0")
 
     def test_changes_diff_from_a_subdirectory_covers_the_whole_repo(self):
+        import subprocess
         with tempfile.TemporaryDirectory() as d:
             repo = self.git_repo(d, {"sub/q.sql": "-- old comment\nselect 1;\n"})
+            tree = pathlib.Path(d, "tree")
+            subprocess.run(["git", "-C", repo, "worktree", "add", "--detach", tree], check=True, capture_output=True)
             rc, task = self.run_script(d, repo, "printf 'select 1;\\n' > q.sql\necho top > ../top.txt\n"
-                                       "echo s > 'sp ace.txt'\necho '++ x' > -dash", cwd=repo / "sub")
+                                       "echo s > 'sp ace.txt'\necho '++ x' > -dash", cwd=tree / "sub")
             self.assertEqual(rc, 0)
             diff = (task / "changes.diff").read_text()
             for path in ("a/sub/q.sql", "b/top.txt", "b/sub/sp ace.txt", "b/sub/-dash"):
                 self.assertIn(path, diff)
-            self.assertEqual(M.read_meta(str(task))["changes"], "4 files +3 -1")  # `-- old` and `++ x` are lines too
+            meta = M.read_meta(str(task))
+            self.assertEqual(meta["main_repo"], str(repo.resolve()))
+            self.assertEqual(meta["changes"], "4 files +3 -1")  # `-- old` and `++ x` are lines too
 
     def test_check_runs_after_the_worker_and_its_exit_code_decides(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1010,7 +1016,8 @@ class Clean(unittest.TestCase):
 
 
 class Cli(unittest.TestCase):
-    def run_cli(self, cfg, *args):
+    @staticmethod
+    def run_cli(cfg, *args):
         import subprocess
         with tempfile.TemporaryDirectory() as d:
             p = pathlib.Path(d, "config.json")
@@ -1263,7 +1270,7 @@ class FailureKind(unittest.TestCase):
 class Stats(unittest.TestCase):
     def add(self, root, run, tid, *, tier="low", worker="w", model="m", status="done",
             started="2026-11-18 10:00:00", finished="2026-11-18 10:10:00", changes="1 files +1 -0",
-            sha="sha", review=None, usage=None, retry_of="", failure=""):
+            sha="sha", review=None, usage=None, retry_of="", failure="", worker_type="claude", **meta):
         t = pathlib.Path(root, run, tid)
         t.mkdir(parents=True)
         lines = [f"workers={worker or 'w'}", f"tier={tier}", f"model={model}",
@@ -1271,7 +1278,10 @@ class Stats(unittest.TestCase):
         if changes is not None:
             lines.append(f"changes={changes}")
         if worker:
-            lines += [f"worker={worker}", "type=claude"]
+            lines.append(f"worker={worker}")
+            if worker_type:
+                lines.append(f"type={worker_type}")
+        lines.extend(f"{k}={v}" for k, v in meta.items())
         if sha:
             lines.append(f"changes_sha256={sha}")
         if started:
@@ -1299,6 +1309,108 @@ class Stats(unittest.TestCase):
 
     def rows(self, out):
         return {row["worker"]: row for row in self.table(out)}
+
+    def cli_rows(self, cfg, *args):
+        result = Cli.run_cli(cfg, "stats", *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.table(result.stdout)
+
+    def test_repo_and_type_group_live_and_deleted_worktrees(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            repo = Run.git_repo(d, {"file": "base"})
+            runs = pathlib.Path(d, "runs")
+            for name in ("left", "right", "repo-gone"):
+                tree = pathlib.Path(d, name)
+                subprocess.run(["git", "-C", repo, "worktree", "add", "--detach", tree], check=True, capture_output=True)
+                if name == "repo-gone":
+                    subprocess.run(["git", "-C", repo, "worktree", "remove", tree], check=True, capture_output=True)
+                self.add(runs, "run", "gone" if name == "repo-gone" else name, cwd=tree, worker_type=None)
+            self.add(runs, "run", "typed", repo=repo)
+            cfg = {"runsDir": str(runs), "workers": {"w": {"type": "codex"}}}
+            rows = self.cli_rows(cfg, "--by", "repo,type")
+            self.assertEqual(list(rows[0])[:3], ["repo", "type", "settled"])
+            self.assertEqual([(r["repo"], r["type"], r["accepted"]) for r in rows],
+                             [("repo", "claude", "1"), ("repo", "codex", "3")])
+
+    def test_saved_main_repo_wins_and_longest_name_matches_a_deleted_tree(self):
+        with tempfile.TemporaryDirectory() as d:
+            runs = pathlib.Path(d, "runs")
+            repo = Run.git_repo(d, {"file": "base"})
+            self.add(runs, "run", "a", repo=repo, main_repo=pathlib.Path(d, "project"))
+            self.add(runs, "run", "b", repo=pathlib.Path(d, "other"), main_repo=pathlib.Path(d, "project-api"))
+            self.add(runs, "run", "c", repo=pathlib.Path(d, "project-api-gone"))
+            self.add(runs, "run", "d", repo=pathlib.Path(d, "unrelated"))
+            self.add(runs, "run", "e")
+            rows = self.cli_rows({"runsDir": str(runs)}, "--by", "repo")
+            self.assertEqual([(r["repo"], r["accepted"]) for r in rows],
+                             [("-", "1"), ("project", "1"), ("project-api", "2"), ("unrelated", "1")])
+
+    def test_sort_uses_tier_rank_before_other_requested_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            for tier, worker in (("high", "a"), ("low", "z"), ("standard", "a"), ("low", "b"), ("-", "c")):
+                self.add(d, "run", tier + worker, tier=tier, worker=worker)
+            rows = self.cli_rows({"runsDir": d}, "--by", "worker,tier")
+            self.assertEqual([(r["worker"], r["tier"]) for r in rows],
+                             [("b", "low"), ("z", "low"), ("a", "standard"), ("a", "high"), ("c", "-")])
+
+    def test_window_uses_first_counted_start_and_includes_the_whole_until_day(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = datetime.date.today().strftime("%Y%m%d") + "-0000-run"
+            for name, started in (("before", "2026-01-01 23:59:59"), ("early", "2026-01-02 00:00:00"),
+                                  ("exact", "2026-01-02 12:34:00"), ("last", "2026-01-02 23:59:59"),
+                                  ("next", "2026-01-03 00:00:00"), ("missing", "")):
+                self.add(d, run, name, started=started, worker=name)
+            self.add(d, run, "before-r2", worker="retry", started="2026-01-02 12:35:00")
+            self.add(d, "20000101-0000-old", "old", worker="old", started="2026-01-02 12:35:00")
+            cfg = {"runsDir": d}
+            day = self.cli_rows(cfg, "--until", "2026-01-02", "--days", "1", "--by", "worker", "--since", "2026-01-02")
+            self.assertEqual([r["worker"] for r in day], ["early", "exact", "last"])
+            minute = self.cli_rows(cfg, "--since", "2026-01-02 12:34", "--until", "2026-01-03 00:00", "--days", "1")
+            self.assertEqual([r["worker"] for r in minute], ["exact", "last"])
+
+    def test_bad_stats_arguments_print_usage(self):
+        with tempfile.TemporaryDirectory() as d:
+            for args in (("--by", "worker,unknown"), ("--since", "2026-02-30"), ("--until", "2026-1-2"),
+                         ("--since", "2026-01-02 24:00"), ("--days", "1", "--days", "2")):
+                with self.subTest(args=args):
+                    result = Cli.run_cli({"runsDir": d}, "stats", *args)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("stats [--days", result.stderr + result.stdout)
+
+    def test_blocked_and_check_failures_count_settled_pieces_once_per_reason(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name, reason, failure in (("a", "worker reported BLOCKED", "blocked"),
+                                          ("a-r2", "worker reported NEEDS_CONTEXT", "blocked"),
+                                          ("a-r3", "done check failed (exit 1)", "task"),
+                                          ("b", "done check failed", "task"),
+                                          ("c", "worker reported BLOCKED", "blocked")):
+                self.add(d, "run", name, status="failed: " + reason, failure=failure)
+            for name in ("a-r4", "b-r2"):
+                self.add(d, "run", name)
+            self.add(d, "run", "c-r2", status="running")
+            row = self.table(M.stats({"runsDir": d}))[0]
+            self.assertEqual((row["accepted"], row["open"], row["blocked"], row["check_failed"]), ("2", "1", "1", "2"))
+
+    def test_needs_fixes_counts_a_settled_sendback_or_a_fixed_in_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.add(d, "run", "a", review="Verdict: Needs fixes\nchanges-sha256: sha\n")
+            self.add(d, "run", "a-r2")
+            self.add(d, "run", "b", review="Verdict: Approved\nchanges-sha256: sha\nFixed in: abc\n")
+            self.add(d, "run", "c", changes="0 files +0 -0", review="Verdict: Needs fixes\nchanges-sha256: sha\n")
+            self.add(d, "run", "d", review="Verdict: Approved\nchanges-sha256: sha\nSummary: Fixed in: abc\n")
+            self.add(d, "run", "e", review="Verdict: Needs fixes\nVerdict: Approved\nchanges-sha256: sha\n")
+            self.add(d, "run", "f", review="Verdict: Needs fixes\nchanges-sha256: sha\n")
+            row = self.table(M.stats({"runsDir": d}))[0]
+            self.assertEqual((row["accepted"], row["open"], row["needs_fixes"]), ("5", "1", "2"))
+
+    def test_outside_failures_counts_attempts_on_open_and_settled_work(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("a", "a-r2", "b"):
+                self.add(d, "run", name, failure="provider", status="failed: usage limit")
+            self.add(d, "run", "a-r3")
+            row = self.table(M.stats({"runsDir": d}))[0]
+            self.assertEqual((row["accepted"], row["open"], row["outside_failures"]), ("1", "1", "3"))
 
     def test_first_pass_fix_round_and_cross_run_retry(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1461,7 +1573,8 @@ class Stats(unittest.TestCase):
             pathlib.Path(d, run, "empty").mkdir()
             out = M.stats({"runsDir": d})
             self.assertEqual(out.splitlines()[0], "tier\tworker\tmodel\tsettled\taccepted\topen\tfirst_pass\t"
-                                                  "attempts_per_work\tmedian_minutes\ttokens_per_accepted\t"
+                                                  "attempts_per_work\tblocked\tcheck_failed\tneeds_fixes\t"
+                                                  "outside_failures\tmedian_minutes\ttokens_per_accepted\t"
                                                   "usd_per_accepted\tbilling")
             # a and b share a row, odd has malformed usage, and junk predates recorded changes.
             self.assertEqual(len(self.table(out)), 2)
