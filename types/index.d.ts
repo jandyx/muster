@@ -47,6 +47,39 @@ export type Usage = {
 }
 export type Run = { name: string; tasks: Task[] }
 
+export type StatsTable = {
+  columns: string[]
+  short: string[]
+  keys: number
+  has_small: boolean
+  rows: { cells: string[]; bar: number; small: boolean }[]
+}
+export type StatsView = {
+  version: 1
+  today: string
+  legacy_note: string | null
+  days: Record<string, number>
+  labels: {
+    tabs: string[]
+    weekdays: string[]
+    less: string
+    more: string
+    shades: string
+    pane_hint: string
+  }
+  weeks: { days: string[]; month: string; starts_month: boolean; first_label: boolean }[]
+  ranges: {
+    name: string
+    metrics: [string, string][]
+    usage: string
+    types: string | null
+    fun: string
+    tables: { Repos: StatsTable; Workers: StatsTable }
+    sample_note: string | null
+  }[]
+}
+export type StatsState = { view: StatsView; tab: number; range: number }
+
 // One subagent the session spawned (the Agent tool), as `$.agent.list()` reports it.
 export type Agent = {
   id: string
@@ -62,6 +95,7 @@ declare module 'claude-code' {
   interface PluginState {
     'muster': {
       runs: Shaped<Run[]>
+      stats: Shaped<StatsState | null>
       agents: Shaped<Agent[]>
       notified: Shaped<string[]>
       reminded: Shaped<string[]>

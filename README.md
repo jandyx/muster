@@ -248,6 +248,10 @@ At the top, **To decide** lists what only you can settle, in your language: a qu
 
 Finished runs fold to one line with their totals; a run with work left to review or fix stays open. A toast tells you when a task ends. Each worker keeps one color everywhere, and each task names the model it ran on (with its reasoning effort for Codex).
 
+### Open stats in Claude Code
+
+`/muster-stats` opens with Overview focused. Press Tab or Shift+Tab to move through Overview, Repos, Workers and the date ranges. Each selection takes effect immediately. Use ↑/↓ to scroll one row at a time, Page Down to see the next page, and Esc to return to the prompt. The command runs `muster.py stats --json` once and also returns the overview as text, including in sessions without panes.
+
 ## Tokens and cost
 
 - **Metered workers** (an API key, DeepSeek) show billed dollars in green, marked `peak` when they started in DeepSeek's peak hours (weekdays 01:00–04:00 and 06:00–10:00 UTC, double price). The skill warns before sending a large, non-urgent batch into peak hours.
@@ -262,6 +266,8 @@ The full decision chain is drawn in [docs/how-it-works.md](docs/how-it-works.md#
 `python3 <plugin>/skills/muster/muster.py stats [--days N] [--since D] [--until D] [--by FIELDS]` reports on run history in read-only mode. Retries linked with `--retry-of` or named `x`, `x-r2` belong to one piece of work. Canceled attempts and attempts that never started are ignored.
 
 Run `python3 <plugin>/skills/muster/muster.py stats --tui` in a terminal for an activity heatmap and breakdowns by repository and worker. Use ←/→ or `h`/`l` to switch tabs, Tab to cycle through all time, the last 7 days and the last 30 days, ↑/↓ or `k`/`j` to scroll the tables, and Esc or `q` to close. The range changes the figures and tables. The heatmap always shows the loaded history, which you can limit with `--days`, `--since` and `--until`.
+
+`stats --json` writes the same heatmap levels, formatted metrics and table rows to standard output without a TTY. It accepts the same date filters.
 
 Use `--by repo,type` to compare worker types within each repository. Choose a comma-separated list from `repo`, `type`, `tier`, `worker` and `model`. These fields appear first, in the order given, and come from the first counted attempt. The default is `tier,worker,model`.
 

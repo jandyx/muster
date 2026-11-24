@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Agent, Decision, Run, Task, Usage } from '../types'
+import type { Agent, Decision, Run, StatsState, StatsTable, StatsView, Task, Usage } from '../types'
 
 const PANE = 'muster'
 const TITLE = 'Muster'
@@ -9,6 +9,7 @@ const POLL_MS = 5000
 
 // Change a tag when its value's fields change, so a reload declines old values.
 const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-15' })
+const statsAtom = atom({ plugin: 'muster', key: 'stats' } as const, null, { shape: 'stats-2' })
 // The session's own subagents (`$.agent.list()`), refreshed every poll. They are not Muster runs: no worker,
 // no cost; the list is already bound to this session, so it needs no session filter.
 const agentsAtom = atom({ plugin: 'muster', key: 'agents' } as const, [] as Agent[], { shape: 'agents-1' })
@@ -23,6 +24,39 @@ const sentAtom = atom({ plugin: 'muster', key: 'sent' } as const, {}, { shape: '
 
 // Cells in the band's overall progress bar.
 const BAND_BAR = 8
+
+function parseStats(json: string): StatsView {
+  const view: StatsView = JSON.parse(json)
+  const text = (v: unknown) => typeof v === 'string'
+  const strings = (v: unknown) => Array.isArray(v) && v.every(text)
+  const note = (v: unknown) => v === null || text(v)
+  if (view?.version !== 1 || !text(view.today) || !note(view.legacy_note)) throw new Error('Invalid stats view (expected version 1)')
+  const { labels, days, weeks, ranges } = view
+  if (!labels || !strings(labels.tabs) || labels.tabs.length !== 3 ||
+      !strings(labels.weekdays) || labels.weekdays.length !== 7 || !text(labels.shades) || labels.shades.length !== 5 ||
+      ![labels.less, labels.more, labels.pane_hint].every(text)) {
+    throw new Error('Invalid stats labels')
+  }
+  if (!days || typeof days !== 'object' || Array.isArray(days) ||
+      !Object.values(days).every(level => Number.isInteger(level) && level >= 1 && level <= 4) ||
+      !Array.isArray(weeks) || !weeks.every(week => week && strings(week.days) && week.days.length === 7 &&
+        text(week.month) && typeof week.starts_month === 'boolean' && typeof week.first_label === 'boolean')) {
+    throw new Error('Invalid stats calendar')
+  }
+  const validTable = (table: StatsTable) =>
+    table && strings(table.columns) && strings(table.short) && table.columns.length === table.short.length &&
+    Number.isInteger(table.keys) && table.keys > 0 && table.keys + 1 < table.columns.length &&
+    typeof table.has_small === 'boolean' && Array.isArray(table.rows) && table.rows.every(row =>
+      row && strings(row.cells) && row.cells.length === table.columns.length && typeof row.small === 'boolean' &&
+      Number.isInteger(row.bar) && row.bar >= 0 && row.bar <= 10)
+  if (!Array.isArray(ranges) || !ranges.length || !ranges.every(range =>
+    range && text(range.name) && Array.isArray(range.metrics) && range.metrics.every(pair => strings(pair) && pair.length === 2) &&
+    text(range.usage) && note(range.types) && text(range.fun) && note(range.sample_note) &&
+    range.tables && validTable(range.tables.Repos) && validTable(range.tables.Workers))) {
+    throw new Error('Invalid stats range or table')
+  }
+  return view
+}
 
 const isRunning = (t: Task) => t.status === 'running'
 const isFailed = (t: Task) => t.status.startsWith('failed')
@@ -382,6 +416,7 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'muster-panel', description: 'Open the Muster pane' })
+    await $.command.register({ name: 'muster-stats', description: 'Open Muster stats' })
     const home = (await $.env.get('HOME')) ?? ''
     // runsDir comes from ~/.muster/config.json (MUSTER_CONFIG overrides the path); default ~/.muster/runs.
     const expand = (p: string) => p.replace(/^~(?=\/|$)/, home)
@@ -639,7 +674,7 @@ export const register: Register = on => {
   // Starting a batch ("/muster …", "muster: …") opens the pane too. Opened from the person's own prompt,
   // it is placed at any terminal width; without focus, so typing goes on in the prompt.
   on('prompt.submit', async ($, e, next) => {
-    if (/^\s*(\/muster(:muster)?\b|muster\s*:)/i.test(e.text ?? '')) void $.ui.open({ id: PANE, title: TITLE })
+    if (/^\s*(\/muster(?!-stats(?:\s|$))(:muster)?\b|muster\s*:)/i.test(e.text ?? '')) void $.ui.open({ id: PANE, title: TITLE })
     return next(e)
   })
 
@@ -655,6 +690,31 @@ export const register: Register = on => {
       }
     }
     return next(e)
+  })
+
+  on('command.run', { command: 'muster-stats' }, async $ => {
+    let stderr = ''
+    let view: StatsView
+    try {
+      const env = await $.process.hookEnv()
+      if (!env.CLAUDE_PLUGIN_ROOT) throw new Error('CLAUDE_PLUGIN_ROOT is unset')
+      const config = await $.env.get('MUSTER_CONFIG')
+      const report = await $.process.run(['python3', `${env.CLAUDE_PLUGIN_ROOT}/skills/muster/muster.py`, 'stats', '--json'], {
+        env: config === undefined ? env : { ...env, MUSTER_CONFIG: config }, timeoutMs: 30000,
+      })
+      stderr = report.stderr.trim()
+      if (report.exitCode !== 0) throw new Error(`Python exited with status ${report.exitCode}`)
+      if (report.isStdoutTruncated) throw new Error('Python output was truncated')
+      view = parseStats(report.stdout)
+    } catch (error) {
+      const reason = stderr || (error instanceof Error ? error.message : String(error))
+      return { text: `Muster stats failed: ${reason.split(/\r?\n/, 1)[0]}` }
+    }
+    await update($, statsAtom, () => ({ view, tab: 0, range: 0 }))
+    await $.ui.open({ id: 'muster-stats', title: 'Muster stats', focus: true })
+    const range = view.ranges[0]!
+    const metrics = range.metrics.map(([label, value]) => `${label}: ${value}`)
+    return { text: [...metrics, range.usage, range.types, range.fun].filter(Boolean).join('\n') }
   })
 
   on('command.run', { command: 'muster-panel' }, async $ => {
@@ -674,6 +734,115 @@ export const register: Register = on => {
     return {
       text: rows.length === 0 ? 'Muster pane focused. Nothing runs right now.' : `Muster pane focused (Esc returns).\n${rows.join('\n')}`,
     }
+  })
+
+  const selectStats = (field: 'tab' | 'range', index: number) => (state: StatsState | null) =>
+    state && state[field] !== index ? { ...state, [field]: index } : state
+
+  on('ui.focus', { requestId: 'muster-stats' }, async ($, e, next) => {
+    const button = /^stats-(tab|range)-(\d+)$/.exec(e.element ?? '')
+    if (button) await update($, statsAtom, selectStats(button[1] === 'tab' ? 'tab' : 'range', Number(button[2])))
+    return next(e)
+  })
+
+  on('ui.render', { component: 'Pane', requestId: 'muster-stats' }, async ($, e) => {
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const state = await read($, statsAtom)
+    if (!state) return <Box/>
+    const { view, tab } = state
+    const { labels } = view
+    const range = view.ranges[state.range]!
+    const columns = e.props.bodyColumns
+    const rangeLine = <Box flexDirection="row">{view.ranges.map((r, i) => [
+      i > 0 && <Text dimColor> · </Text>,
+      <Button plain key={`stats-range-${i}`} onPress={() => void update($, statsAtom, selectStats('range', i))}>
+        <Text bold={i === state.range} color={i === state.range ? 'claude' : undefined} dimColor={i !== state.range}>{r.name}</Text>
+      </Button>,
+    ])}</Box>
+    const overview = () => {
+      const count = Math.max(0, Math.min(53, Math.floor((columns - 4) / 2)))
+      const weeks = count ? view.weeks.slice(-count) : []
+      let months = ''
+      for (const [i, week] of weeks.entries()) {
+        if (week.starts_month || (i === 0 && (weeks.length === 1 || week.first_label))) {
+          months = months.padEnd(Math.min(i * 2, Math.max(0, columns - 7))) + week.month
+        }
+      }
+      return <Box flexDirection="column">
+        <Text dimColor>{'    '}{months}</Text>
+        {labels.weekdays.map((label, weekday) => <Text>
+          <Text dimColor>{label.padEnd(4)}</Text>{weeks.map(week => {
+            const level = view.days[week.days[weekday]!] ?? 0
+            return <Text color={level ? 'claude' : undefined} dimColor={!level}>{labels.shades[level]!.repeat(2)}</Text>
+          })}
+        </Text>)}
+        <Text dimColor>{labels.less} <Text color="claude">{[...labels.shades.slice(1)].join(' ')}</Text> {labels.more}</Text>
+        {rangeLine}
+        {range.metrics.map(([label, value], i) => {
+          if (i % 2) return null
+          const right = range.metrics[i + 1]
+          return <Box flexDirection="row">
+            <Box width="50%"><Text>{label} <Text color="claude">{value}</Text></Text></Box>
+            {right && <Text>{right[0]} <Text color="claude">{right[1]}</Text></Text>}
+          </Box>
+        })}
+        <Text dimColor>{range.usage}</Text>
+        {range.types && <Text>{range.types}</Text>}
+        <Text color="suggestion">{range.fun}</Text>
+        {view.legacy_note && <Text dimColor>{view.legacy_note}</Text>}
+      </Box>
+    }
+    const tableRows = () => {
+      const table = range.tables[tab === 1 ? 'Repos' : 'Workers']
+      const rate = table.keys + 1
+      const sizes = table.columns.map(() => 0)
+      for (const row of table.rows) {
+        row.cells.forEach((cell, i) => {
+          sizes[i] = Math.max(sizes[i]!, width(cell) + (i === rate ? 11 : 0))
+        })
+      }
+      const widths = (header: string[]) => header.map((label, i) => Math.min(columns, Math.max(sizes[i]!, width(label))))
+      const totalWidth = (sizes: number[]) => sizes.reduce((sum, n) => sum + n, sizes.length - 1)
+      const header = totalWidth(widths(table.columns)) <= columns ? table.columns : table.short
+      const widthsUsed = widths(header)
+      let excess = totalWidth(widthsUsed) - columns
+      while (excess > 0) {
+        const largest = Math.max(...widthsUsed.slice(0, table.keys))
+        if (largest <= 3) break
+        widthsUsed[widthsUsed.indexOf(largest)] = largest - 1
+        excess--
+      }
+      const line = (fields: string[], row?: (typeof table.rows)[number]) => <Text wrap="clip" dimColor={!row}>{fields.map((field, i) => {
+        const bar = row && i === rate ? ' ' + labels.shades[4]!.repeat(row.bar) + labels.shades[0]!.repeat(10 - row.bar) : ''
+        const used = widthsUsed[i]!
+        const pad = ' '.repeat(Math.max(0, used - width(field) - bar.length))
+        const key = i < table.keys
+        let content = field
+        if (key && width(field) > used) {
+          content = ''
+          for (const ch of field) {
+            if (width(content) + cells(ch) >= used) break
+            content += ch
+          }
+          content += '…' + ' '.repeat(Math.max(0, used - width(content) - 1))
+        }
+        return <Text>{i > 0 && ' '}{!key && pad}<Text dimColor={row?.small && i === rate}>{content}</Text>{bar && <Text color="claude">{bar}</Text>}{key && pad}</Text>
+      })}</Text>
+      return <Box flexDirection="column">
+        {rangeLine}
+        {line(header)}
+        {table.rows.map(row => line(row.cells, row))}
+        {table.has_small && range.sample_note && <Text dimColor>{range.sample_note}</Text>}
+      </Box>
+    }
+    return <Box flexDirection="column">
+      <Box flexDirection="row" gap={3}>{labels.tabs.map((name, i) =>
+        <Button plain key={`stats-tab-${i}`} autoFocus={i === tab || undefined} onPress={() => void update($, statsAtom, selectStats('tab', i))}>
+          <Text bold={i === tab} inverse={i === tab}>{name}</Text>
+        </Button>)}</Box>
+      {tab === 0 ? overview() : tableRows()}
+      <Text dimColor>{labels.pane_hint}</Text>
+    </Box>
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {

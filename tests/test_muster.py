@@ -1371,7 +1371,8 @@ class Stats(unittest.TestCase):
     def test_bad_stats_arguments_print_usage(self):
         with tempfile.TemporaryDirectory() as d:
             for args in (("--by", "worker,unknown"), ("--since", "2026-02-30"), ("--until", "2026-1-2"),
-                         ("--since", "2026-01-02 24:00"), ("--days", "1", "--days", "2")):
+                         ("--since", "2026-01-02 24:00"), ("--days", "1", "--days", "2"),
+                         ("--json", "--tui"), ("--json", "--by", "repo")):
                 with self.subTest(args=args):
                     result = Cli.run_cli({"runsDir": d}, "stats", *args)
                     self.assertNotEqual(result.returncode, 0)
@@ -1633,14 +1634,72 @@ class Stats(unittest.TestCase):
         return M.stats_records({"runsDir": root})[0]
 
     @staticmethod
-    def screen(records, **options):
+    def screen(records, legacy=0, **options):
         import muster_tui
         defaults = dict(tab="Overview", range_name="All time", width=140, height=40, today=datetime.date(2026, 11, 23))
-        return muster_tui.render(records, 0, **(defaults | options))
+        return muster_tui.render(records, legacy, **(defaults | options))
 
     @staticmethod
     def screen_text(lines):
         return "\n".join("".join(text for text, _ in line) for line in lines)
+
+    def test_json_stats_match_the_overview_and_tables_for_filtered_work(self):
+        today = datetime.date.today()
+        day = today - datetime.timedelta(days=1)
+        run = today.strftime("%Y%m%d") + "-1200-run"
+        with tempfile.TemporaryDirectory() as d:
+            repo = pathlib.Path(d, "sample")
+            self.add(d, run, "kept", started=f"{day} 10:00:00", finished=f"{day} 10:10:00",
+                     repo=repo, main_repo=repo, usage=self.usage(1234, 250, 0.25))
+            self.add(d, run, "legacy", started=f"{day} 11:00:00", changes=None)
+            self.add(d, run, "early", started=f"{day - datetime.timedelta(days=1)} 10:00:00")
+            self.add(d, run, "late", started=f"{today} 10:00:00")
+            self.add(d, "20000101-1200-old", "old-run", started=f"{day} 10:00:00")
+            cfg = {"runsDir": d}
+            result = Cli.run_cli(cfg, "stats", "--json", "--days", "5", "--since", str(day), "--until", str(day))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            records, legacy = M.stats_records(cfg, 5, M.stats_bound(str(day)), M.stats_bound(str(day), until=True))
+        as_of = datetime.date.fromisoformat(data["today"])
+        self.assertLessEqual(today, as_of)
+        self.assertLessEqual(as_of, datetime.date.today())
+        self.assertEqual((data["version"], data["days"]), (1, {str(day): 1}))
+        self.assertEqual(legacy, 1)
+        self.assertEqual([r["name"] for r in data["ranges"]], ["All time", "Last 7 days", "Last 30 days"])
+        for r in data["ranges"]:
+            overview = self.screen_text(self.screen(records, legacy, range_name=r["name"], today=as_of))
+            self.assertIn(data["legacy_note"], overview.splitlines())
+            self.assertEqual(r["metrics"][0], ["Pieces of work", "1 (1 settled/0 open)"])
+            for label, value in r["metrics"]:
+                self.assertIn(f"{label} {value}", overview)
+            for key in ("usage", "types", "fun"):
+                self.assertIn(r[key], overview)
+            for tab, keys in (("Repos", 2), ("Workers", 3)):
+                table = r["tables"][tab]
+                self.assertEqual(table["keys"], keys)
+                self.assertEqual(table["short"][keys], "Set")
+                lines = self.screen_text(self.screen(records, range_name=r["name"], tab=tab, today=as_of))
+                rows = [" ".join(line.split()) for line in lines.splitlines()]
+                self.assertIn(" ".join(table["columns"]), rows)
+                row, = table["rows"]
+                self.assertEqual((row["bar"], row["small"]), (10, True))
+                cells = [cell.strip() for cell in row["cells"]]
+                cells.insert(keys + 2, "█" * row["bar"])
+                self.assertIn(" ".join(cells), rows)
+                self.assertIn(r["sample_note"], lines)
+
+    def test_heat_levels_use_all_history_but_emit_only_the_last_371_days(self):
+        import muster_tui
+        today = datetime.date(2026, 11, 23)
+        oldest = today - datetime.timedelta(days=370)
+        with tempfile.TemporaryDirectory() as d:
+            for day, count in ((oldest - datetime.timedelta(days=1), 1), (oldest, 2), (today, 3)):
+                for i in range(count):
+                    self.add(d, "run", f"work-{day}-{i}", started=f"{day} 10:00:00", finished=f"{day} 10:10:00")
+            data = muster_tui.view(*M.stats_records({"runsDir": d}), today)
+        self.assertEqual(data["days"], {str(oldest): 2, str(today): 4})
+        self.assertEqual(len(data["weeks"]), 53)
+        self.assertEqual(data["weeks"][-1]["days"][0], str(today))
 
     def test_overview_shows_calendar_and_outcome_metrics(self):
         with tempfile.TemporaryDirectory() as d:
