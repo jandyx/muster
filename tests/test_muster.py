@@ -5,6 +5,7 @@ import contextlib, datetime, io, threading, time, unittest.mock, json, os, pathl
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "skills/muster"))
 import muster as M
+import stats_view
 PRICES = json.loads((ROOT / "prices.json").read_text())
 
 
@@ -1372,7 +1373,7 @@ class Stats(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             for args in (("--by", "worker,unknown"), ("--since", "2026-02-30"), ("--until", "2026-1-2"),
                          ("--since", "2026-01-02 24:00"), ("--days", "1", "--days", "2"),
-                         ("--json", "--tui"), ("--json", "--by", "repo")):
+                         ("--tui",), ("--json", "--by", "repo")):
                 with self.subTest(args=args):
                     result = Cli.run_cli({"runsDir": d}, "stats", *args)
                     self.assertNotEqual(result.returncode, 0)
@@ -1631,17 +1632,15 @@ class Stats(unittest.TestCase):
                 self.add(root, "run", f"day-{day}-{i}", started=f"2026-11-{day} 10:00:00",
                          finished=f"2026-11-{day} 10:10:00", repo=repo, main_repo=repo,
                          review="Verdict: Approved\nchanges-sha256: sha\nFixed by: Claude: repaired" if day == 16 else None)
-        return M.stats_records({"runsDir": root})[0]
+        return stats_view.view(*M.stats_records({"runsDir": root}), datetime.date(2026, 11, 23))
 
-    @staticmethod
-    def screen(records, legacy=0, **options):
-        import muster_tui
-        defaults = dict(tab="Overview", range_name="All time", width=140, height=40, today=datetime.date(2026, 11, 23))
-        return muster_tui.render(records, legacy, **(defaults | options))
-
-    @staticmethod
-    def screen_text(lines):
-        return "\n".join("".join(text for text, _ in line) for line in lines)
+    def test_heatmap_weeks_name_the_month_where_it_starts(self):
+        june = stats_view.view([], 0, datetime.date(2027, 6, 1))["weeks"]
+        self.assertEqual(len(june), 53)
+        self.assertEqual((june[-1]["month"], june[-1]["starts_month"], june[-1]["first_label"]), ("Jun", True, True))
+        self.assertEqual(june[-1]["days"][0], "2027-05-31")  # weeks start on Monday
+        late = stats_view.view([], 0, datetime.date(2026, 11, 30))["weeks"][-1]
+        self.assertEqual((late["month"], late["starts_month"], late["first_label"]), ("Nov", False, False))
 
     def test_json_stats_match_the_overview_and_tables_for_filtered_work(self):
         today = datetime.date.today()
@@ -1659,188 +1658,91 @@ class Stats(unittest.TestCase):
             result = Cli.run_cli(cfg, "stats", "--json", "--days", "5", "--since", str(day), "--until", str(day))
             self.assertEqual(result.returncode, 0, result.stderr)
             data = json.loads(result.stdout)
-            records, legacy = M.stats_records(cfg, 5, M.stats_bound(str(day)), M.stats_bound(str(day), until=True))
         as_of = datetime.date.fromisoformat(data["today"])
         self.assertLessEqual(today, as_of)
         self.assertLessEqual(as_of, datetime.date.today())
-        self.assertEqual((data["version"], data["days"]), (1, {str(day): 1}))
-        self.assertEqual(legacy, 1)
+        self.assertEqual((data["version"], data["days"]), (2, {str(day): 1}))
+        self.assertEqual(data["legacy_note"], "1 pieces from before reviews were recorded are left out.")
         self.assertEqual([r["name"] for r in data["ranges"]], ["All time", "Last 7 days", "Last 30 days"])
-        for r in data["ranges"]:
-            overview = self.screen_text(self.screen(records, legacy, range_name=r["name"], today=as_of))
-            self.assertIn(data["legacy_note"], overview.splitlines())
-            self.assertEqual(r["metrics"][0], ["Pieces of work", "1 (1 settled/0 open)"])
-            for label, value in r["metrics"]:
-                self.assertIn(f"{label} {value}", overview)
-            for key in ("usage", "types", "fun"):
-                self.assertIn(r[key], overview)
-            for tab, keys in (("Repos", 2), ("Workers", 3)):
+        for r, span in zip(data["ranges"], ((as_of - day).days + 1, 7, 30)):
+            self.assertEqual(r["metrics"], [
+                ["Pieces of work", "1 (1 settled/0 open)"], ["First pass", "100%"], ["Accepted", "1"],
+                ["Attempts per work", "1.0"], ["Sent back", "0"], ["Claude fixed", "0"], ["Blocked", "0"],
+                ["Check failed", "0"], ["Outside failures", "0"], ["Active days", f"1/{span}"],
+                ["Busiest day", str(day)], ["Longest streak", "1"], ["Favorite worker type", "claude"],
+                ["Current streak", "1" if (as_of - day).days == 1 else "0"], ["Median minutes", "10.0"],
+            ])
+            self.assertEqual(r["usage"], "Input 1.2k · Output 250 · Cost ≈$0.25 · Lines +1 -0")
+            self.assertEqual(r["types"], "claude 100% first pass (n=1)")
+            self.assertEqual(r["fun"], "Workers added 1 of the ~9k lines in the original UNIX v6 kernel.")
+            self.assertEqual(r["sample_note"], "* fewer than 30 settled: small sample")
+            for tab, keys, group in (("Repos", ["Repo", "Type"], ["sample", "claude"]),
+                                     ("Workers", ["Tier", "Worker", "Model"], ["low", "w", "m"])):
                 table = r["tables"][tab]
-                self.assertEqual(table["keys"], keys)
-                self.assertEqual(table["short"][keys], "Set")
-                lines = self.screen_text(self.screen(records, range_name=r["name"], tab=tab, today=as_of))
-                rows = [" ".join(line.split()) for line in lines.splitlines()]
-                self.assertIn(" ".join(table["columns"]), rows)
-                row, = table["rows"]
-                self.assertEqual((row["bar"], row["small"]), (10, True))
-                cells = [cell.strip() for cell in row["cells"]]
-                cells.insert(keys + 2, "█" * row["bar"])
-                self.assertIn(" ".join(cells), rows)
-                self.assertIn(r["sample_note"], lines)
+                self.assertTrue(table["has_small"])
+                self.assertEqual(table["keys"], len(keys))
+                self.assertEqual(table["short"][len(keys)], "Set")
+                self.assertEqual(table["columns"], keys + ["Settled", "First pass", "Sent back", "Claude fixed",
+                                                          "Blocked", "Check failed", "Cost/accepted"])
+                self.assertEqual(table["rows"], [{"cells": group + ["1", "100%*", "0", "0", "0", "0", "$0.25"],
+                                                  "bar": 10, "small": True}])
 
     def test_heat_levels_use_all_history_but_emit_only_the_last_371_days(self):
-        import muster_tui
         today = datetime.date(2026, 11, 23)
         oldest = today - datetime.timedelta(days=370)
         with tempfile.TemporaryDirectory() as d:
             for day, count in ((oldest - datetime.timedelta(days=1), 1), (oldest, 2), (today, 3)):
                 for i in range(count):
                     self.add(d, "run", f"work-{day}-{i}", started=f"{day} 10:00:00", finished=f"{day} 10:10:00")
-            data = muster_tui.view(*M.stats_records({"runsDir": d}), today)
+            data = stats_view.view(*M.stats_records({"runsDir": d}), today)
         self.assertEqual(data["days"], {str(oldest): 2, str(today): 4})
         self.assertEqual(len(data["weeks"]), 53)
         self.assertEqual(data["weeks"][-1]["days"][0], str(today))
 
     def test_overview_shows_calendar_and_outcome_metrics(self):
         with tempfile.TemporaryDirectory() as d:
-            lines = self.screen(self.overview_fixture(d))
-        text = self.screen_text(lines)
-        for label in ("Overview", "Repos", "Workers", "Mon", "Wed", "Fri", "Less ░ ▒ ▓ █ More",
-                      "Pieces of work", "Favorite worker type", "Median minutes", "Sent back", "Check failed"):
-            self.assertIn(label, text)
-        for label, value in (("First pass", "90%"), ("Claude fixed", "1"), ("Accepted", "10"),
+            data = self.overview_fixture(d)
+        labels = data["labels"]
+        self.assertEqual(labels["tabs"], ["Overview", "Repos", "Workers"])
+        self.assertEqual(labels["weekdays"], ["Mon", "", "Wed", "", "Fri", "", ""])
+        self.assertEqual((labels["less"], labels["shades"], labels["more"]), ("Less", "·░▒▓█", "More"))
+        metrics = dict(data["ranges"][0]["metrics"])
+        for label, value in (("Pieces of work", "10 (10 settled/0 open)"), ("Favorite worker type", "claude"),
+                             ("Median minutes", "10.0"), ("Sent back", "0"), ("Check failed", "0"),
+                             ("First pass", "90%"), ("Claude fixed", "1"), ("Accepted", "10"),
                              ("Active days", "4/8"), ("Busiest day", "2026-11-22"),
                              ("Longest streak", "2"), ("Current streak", "2")):
-            self.assertRegex(text, re.escape(label) + r"[ %:]*" + re.escape(value))
-        monday = next(i for i, line in enumerate(lines) if "Mon" in self.screen_text([line]))
-        heat = [[(t, s) for t, s in line if s.startswith("heat")] for line in lines[monday:monday + 7]]
-        self.assertEqual([row[-2] for row in heat],  # the week of Nov 16; today's week is last
-                         [("░░", "heat1"), ("··", "heat0"), ("▒▒", "heat2"), ("··", "heat0"),
-                          ("··", "heat0"), ("▓▓", "heat3"), ("██", "heat4")])
+            self.assertEqual(metrics[label], value, label)
+        self.assertEqual(data["weeks"][-2]["days"], [f"2026-11-{day}" for day in range(16, 23)])
+        self.assertEqual(data["days"], {"2026-11-16": 1, "2026-11-18": 2, "2026-11-21": 3, "2026-11-22": 4})
 
     def test_range_filters_outcomes_but_preserves_the_calendar(self):
         with tempfile.TemporaryDirectory() as d:
-            records = self.overview_fixture(d)
-            all_time = self.screen(records)
-            last_week = self.screen(records, range_name="Last 7 days")
-            repos = self.screen_text(self.screen(records, tab="Repos", range_name="Last 7 days"))
-        self.assertRegex(self.screen_text(last_week), r"First pass[ %:]*100%")
-        self.assertRegex(self.screen_text(last_week), r"Active days[ :]*3/7")
-
-        def cells(screen):
-            return [segment for line in screen for segment in line if segment[1].startswith("heat")]
-
-        self.assertEqual(cells(last_week), cells(all_time))
-        self.assertIn("recent", repos)
-        self.assertNotIn("older", repos)
+            data = self.overview_fixture(d)
+        last_week = next(r for r in data["ranges"] if r["name"] == "Last 7 days")
+        metrics = dict(last_week["metrics"])
+        self.assertEqual(metrics["First pass"], "100%")
+        self.assertEqual(metrics["Active days"], "3/7")
+        self.assertEqual([row["cells"][0] for row in last_week["tables"]["Repos"]["rows"]], ["recent"])
+        self.assertEqual(data["days"]["2026-11-16"], 1)
 
     def test_overview_formats_usage_and_compares_read_only_work_to_a_book(self):
         with tempfile.TemporaryDirectory() as d:
             self.add(d, "run", "read", changes="0 files +0 -0", usage=self.usage(1_000_000, 207_400, 0.25))
             self.add(d, "run", "unknown", changes="0 files +0 -0")
-            records, _ = M.stats_records({"runsDir": d})
-        lines = self.screen(records)
-        self.assertIn("Input 1m · Output 207.4k · Cost ≥$0.25", self.screen_text(lines))
-        self.assertTrue(any("~1× the tokens of War and Peace" in text
-                            for line in lines for text, style in line if style == "link"))
+            data = stats_view.view(*M.stats_records({"runsDir": d}), datetime.date(2026, 11, 23))
+        overview = data["ranges"][0]
+        self.assertEqual(overview["usage"], "Input 1m · Output 207.4k · Cost ≥$0.25 · Lines +0 -0")
+        self.assertEqual(overview["fun"], "Workers used ~1× the tokens of War and Peace (~800k tokens)")
 
     def test_group_tables_mark_small_samples_and_show_first_pass_bars(self):
         with tempfile.TemporaryDirectory() as d:
-            records = self.overview_fixture(d)
-            repos = self.screen(records, tab="Repos")
-            workers = self.screen(records, tab="Workers")
-        for key, lines, bar in (("recent", repos, "█" * 10), ("older", repos, "·" * 10),
-                                ("low", workers, "█" * 9 + "·")):
-            row = next(line for line in lines if key in self.screen_text([line]))
-            self.assertRegex("".join(t for t, s in row if s == "muted"), r"\d+%\*")
-            self.assertIn(bar, "".join(t for t, s in row if s == "accent"))
-            self.assertIn("* fewer than 30 settled: small sample", self.screen_text(lines))
-        self.assertRegex(self.screen_text(workers), r"low\s+w\s+m\s+10")
-
-    def test_repo_scroll_reaches_the_last_group_and_keeps_the_footer(self):
-        with tempfile.TemporaryDirectory() as d:
-            for i in range(20):
-                repo = pathlib.Path(d, f"project-{i:02}")
-                self.add(d, "run", repo.name, repo=repo, main_repo=repo)
-            records, _ = M.stats_records({"runsDir": d})
-        first = self.screen_text(self.screen(records, tab="Repos", height=10))
-        last = self.screen_text(self.screen(records, tab="Repos", height=10, scroll=100))
-        self.assertIn("project-00", first)
-        self.assertNotIn("project-19", first)
-        self.assertIn("project-19", last)
-        self.assertNotIn("project-00", last)
-        self.assertIn("esc close", last.splitlines()[-1])
-
-    def test_render_fits_a_narrow_and_short_window(self):
-        with tempfile.TemporaryDirectory() as d:
-            records = self.overview_fixture(d)
-            june = self.screen(records, width=60, today=datetime.date(2027, 6, 1))
-            self.assertIn("Jun", self.screen_text(june[:3]))
-            for tab in ("Overview", "Repos", "Workers"):
-                for height in (3, 40):
-                    lines = self.screen(records, tab=tab, width=60, height=height)
-                    self.assertLessEqual(len(lines), height)
-                    self.assertTrue(all(sum(len(text) for text, _ in line) <= 60 for line in lines))
-
-    def test_tui_requires_a_terminal_and_its_own_grouping(self):
-        with tempfile.TemporaryDirectory() as d:
-            piped = Cli.run_cli({"runsDir": d}, "stats", "--tui")
-            self.assertEqual((piped.returncode, piped.stderr.strip()), (2, "stats --tui needs a terminal"))
-            grouped = Cli.run_cli({"runsDir": d}, "stats", "--tui", "--by", "repo")
-            self.assertNotEqual(grouped.returncode, 0)
-            self.assertIn("muster.py stats", grouped.stderr)
-
-    def test_tui_switches_tab_and_range_in_a_terminal(self):
-        import errno, pty, select, signal
-
-        with tempfile.TemporaryDirectory() as d:
-            for name in ("archive", "recent"):
-                day = datetime.date.today() - datetime.timedelta(days=14 if name == "archive" else 0)
-                repo = pathlib.Path(d, name)
-                self.add(d, "run", name, repo=repo, main_repo=repo, started=f"{day} 10:00:00")
-            config = pathlib.Path(d, "config.json")
-            config.write_text(json.dumps({"runsDir": d}))
-            env = dict(os.environ, MUSTER_CONFIG=str(config), TERM="xterm-256color", LINES="40", COLUMNS="140")
-            args = [sys.executable, str(ROOT / "skills/muster/muster.py"), "stats", "--tui"]
-            deadline = time.monotonic() + 10
-            pid, fd = pty.fork()
-            if pid == 0:
-                os.execve(sys.executable, args, env)
-            output = bytearray()
-
-            def receive(marker):
-                start = len(output)
-                while marker is None or marker not in output[start:]:
-                    remaining = deadline - time.monotonic()
-                    self.assertGreater(remaining, 0, f"Timed out waiting for {marker!r}")
-                    ready, _, _ = select.select([fd], [], [], remaining)
-                    self.assertTrue(ready, f"Timed out waiting for {marker!r}: {output[-300:]!r}")
-                    try:
-                        data = os.read(fd, 8192)
-                    except OSError as e:
-                        if e.errno != errno.EIO:
-                            raise
-                        data = b""  # Linux reports EIO when the slave closes; macOS reports EOF.
-                    if not data:
-                        self.assertIsNone(marker, f"Terminal closed before {marker!r}: {output[-300:]!r}")
-                        return
-                    output.extend(data)
-
-            try:
-                receive(b"Overview")
-                os.write(fd, b"\x1b[C")
-                receive(b"archive")
-                os.write(fd, b"\t")
-                receive(b"Last 7 days")
-                os.write(fd, b"q")
-                receive(None)
-                _, status = os.waitpid(pid, 0)
-                pid = None
-                self.assertLess(time.monotonic(), deadline)
-                self.assertEqual(os.waitstatus_to_exitcode(status), 0, output[-300:])
-                self.assertIn(b"Repos", output)
-            finally:
-                os.close(fd)
-                if pid is not None:
-                    os.kill(pid, signal.SIGKILL)
-                    os.waitpid(pid, 0)
+            overview = self.overview_fixture(d)["ranges"][0]
+        tables = overview["tables"]
+        self.assertEqual(overview["sample_note"], "* fewer than 30 settled: small sample")
+        for tab, group, settled, rate, bars in (("Repos", ["recent", "claude"], "9", "100%*", 10),
+                                                ("Repos", ["older", "claude"], "1", "  0%*", 0),
+                                                ("Workers", ["low", "w", "m"], "10", " 90%*", 9)):
+            row = next(row for row in tables[tab]["rows"] if row["cells"][0] == group[0])
+            self.assertEqual(row["cells"][:len(group) + 2], group + [settled, rate])
+            self.assertEqual((row["bar"], row["small"]), (bars, True))

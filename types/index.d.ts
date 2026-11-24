@@ -55,7 +55,7 @@ export type StatsTable = {
   rows: { cells: string[]; bar: number; small: boolean }[]
 }
 export type StatsView = {
-  version: 1
+  version: 2
   today: string
   legacy_note: string | null
   days: Record<string, number>

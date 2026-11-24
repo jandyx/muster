@@ -15,7 +15,7 @@
     muster.py clean [--days N]                list what could be removed (runs untouched for N days, default 14;
                                               task worktrees; muster/* branches) with the command for each; deletes
                                               nothing
-    muster.py stats [--days N] [--since D] [--until D] [--by FIELDS | --tui | --json]
+    muster.py stats [--days N] [--since D] [--until D] [--by FIELDS | --json]
                                               group work by repo, type, tier, worker or model; filter by run
                                               folder age and first attempt's start date or time. Use --json
                                               for the stats screen's view model. Reads only.
@@ -1533,13 +1533,13 @@ def main():
         opts = {}
         args = iter(args)
         for opt in args:
-            if opt in opts or opt not in ("--json", "--tui", "--days", "--since", "--until", "--by"):
+            if opt in opts or opt not in ("--json", "--days", "--since", "--until", "--by"):
                 sys.exit(__doc__)
-            opts[opt] = True if opt in ("--tui", "--json") else next(args, None)
+            opts[opt] = True if opt == "--json" else next(args, None)
             if opts[opt] is None:
                 sys.exit(__doc__)
         by = opts["--by"].split(",") if "--by" in opts else DEFAULT_STATS_FIELDS
-        if set(by) - {"repo", "type", *DEFAULT_STATS_FIELDS} or len(opts.keys() & {"--tui", "--json", "--by"}) > 1:
+        if set(by) - {"repo", "type", *DEFAULT_STATS_FIELDS} or ("--json" in opts and "--by" in opts):
             sys.exit(__doc__)
         try:
             days = int(opts["--days"]) if "--days" in opts else None
@@ -1547,16 +1547,10 @@ def main():
             until = stats_bound(opts.get("--until"), until=True)
         except ValueError:
             sys.exit(__doc__)
-        if "--tui" in opts or "--json" in opts:
-            if "--tui" in opts and not (sys.stdin.isatty() and sys.stdout.isatty()):
-                print("stats --tui needs a terminal", file=sys.stderr)
-                sys.exit(2)
-            import muster_tui
+        if "--json" in opts:
+            import stats_view
             records, legacy = stats_records(load_config(), days, since, until)
-            if "--json" in opts:
-                print(json.dumps(muster_tui.view(records, legacy, datetime.date.today()), ensure_ascii=False))
-            else:
-                muster_tui.run(records, legacy)
+            print(json.dumps(stats_view.view(records, legacy, datetime.date.today()), ensure_ascii=False))
         else:
             print(stats(load_config(), days, since, until, by))
         return
