@@ -37,7 +37,7 @@ test('the pane shows each task of the newest run', async ($, on) => {
   on('env.get', (_, e: any) => ({ value: e.name === 'HOME' ? '/h' : 'S1' }))
   on('fs.exists', () => ({ value: true }))
   on('fs.list', (_, e: any) => ({
-    value: e.path === R ? [dir('20261101-0900-old'), dir('20261104-0800-foreign'), dir('20261105-1130-x')] : e.path.endsWith('-x') ? [dir('A'), dir('B'), dir('G'), dir('L'), dir('P')] : e.path.endsWith('-old') ? [dir('Z')] : e.path.endsWith('-foreign') ? [dir('F')] : [],
+    value: e.path === R ? [dir('20261101-0900-old'), dir('20261104-0800-foreign'), dir('20261105-1130-x')] : e.path.endsWith('-x') ? [dir('A'), dir('B'), dir('G'), dir('L'), dir('P'), dir('notes')] : e.path.endsWith('-old') ? [dir('Z')] : e.path.endsWith('-foreign') ? [dir('F')] : [],
   }))
   on('fs.read', (_, e: any) => (e.path in files ? { value: files[e.path] } : { deny: 'ENOENT' }))
   on('clock.every', () => ({ value: undefined }))
@@ -59,6 +59,8 @@ test('the pane shows each task of the newest run', async ($, on) => {
     expect((await ui.find({ type: 'Text', text: /B · deepseek/ }))?.text).toMatch(/B · deepseek · deepseek-flash · \d/)
     expect((await ui.find({ type: 'Button', text: /20261101-0900-old/ }))?.text).toMatch(/[▸▾] 20261101-0900-old 0 running · 1 done/)
     expect(await ui.find({ type: 'Button', text: /foreign/ })).toBeUndefined()
+    // A folder with no status, meta or prompt.md (Claude's notes) is not a queued task.
+    expect(await ui.find({ type: 'Text', text: /notes/ })).toBeUndefined()
     expect((await ui.find({ type: 'Text', text: /in 1\.51M/ }))?.text).toMatch(/in 1\.51M \(95% cached\) · out 14k · ≈\$2\.91/)
     expect((await ui.find({ type: 'Text', text: /in 28k/ }))?.text).toMatch(/out 3 · \$0\.0085 peak/)
     expect((await ui.find({ type: 'Text', text: /Σ/ }))?.text).toMatch(/Σ 1\.55M tokens · \$0\.0085 billed · ≈\$2\.91 sub/)
