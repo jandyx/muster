@@ -33,8 +33,6 @@ export type Task = {
   phaseMs: number
   // decision.md while it waits for the user (no `Decided:` line yet); else null.
   decision: Decision | null
-  // Approved, changed files on a branch, review.md has a `Summary:` and no `Merged:` yet.
-  mergeable: boolean
 }
 // A question Claude hands the user, from decision.md, in the user's language.
 export type Decision = { question: string; context: string; options: string[]; recommend: string }

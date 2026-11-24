@@ -8,7 +8,7 @@ const TITLE = 'Muster'
 const POLL_MS = 5000
 
 // Change a tag when its value's fields change, so a reload declines old values.
-const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-14' })
+const runsAtom = atom({ plugin: 'muster', key: 'runs' } as const, [], { shape: 'runs-15' })
 // The session's own subagents (`$.agent.list()`), refreshed every poll. They are not Muster runs: no worker,
 // no cost; the list is already bound to this session, so it needs no session filter.
 const agentsAtom = atom({ plugin: 'muster', key: 'agents' } as const, [] as Agent[], { shape: 'agents-1' })
@@ -110,16 +110,16 @@ const parseDecision = (text: string): Decision | null => {
   }
   return d.question === '' ? null : d
 }
-type InboxItem = { key: string; task: Task; decision: Decision | null }
-// What only the user can settle, newest attempt only: a question Claude handed over, then work approved and waiting
-// to be merged. A rerun of the task replaces it, so an answered question leaves once Claude acts on it.
+type InboxItem = { key: string; task: Task; decision: Decision }
+// What only the user can settle, newest attempt only: a question Claude handed over. Reviewed work is merged by
+// Claude, not offered here. A rerun of the task replaces it, so an answered question leaves once Claude acts on it.
 // Items the user hid (Hide) stay out, by the same id the sent record uses.
-const itemId = (i: InboxItem) => (i.decision ? `${i.key}|${i.decision.question}` : `${i.key}|merge`)
+const itemId = (i: InboxItem) => `${i.key}|${i.decision.question}`
 const HIDDEN = 'hidden'
-const inboxOf = (runs: Run[], attempts: Lineage, sent: Record<string, string>): InboxItem[] => {
-  const items = runs.flatMap(r => r.tasks.filter(t => attempts.latest.has(t)).map(t => ({ key: `${r.name}/${t.id}`, task: t, decision: t.decision })))
-  return [...items.filter(i => i.decision !== null), ...items.filter(i => i.decision === null && i.task.mergeable)].filter(i => sent[itemId(i)] !== HIDDEN)
-}
+const inboxOf = (runs: Run[], attempts: Lineage, sent: Record<string, string>): InboxItem[] =>
+  runs
+    .flatMap(r => r.tasks.filter(t => attempts.latest.has(t)).flatMap(t => (t.decision ? [{ key: `${r.name}/${t.id}`, task: t, decision: t.decision }] : [])))
+    .filter(i => sent[itemId(i)] !== HIDDEN)
 // Pane sections inside a run, in display order; a task falls into the first whose test it passes.
 const SECTIONS: [string, string | undefined, (t: Task) => boolean][] = [
   ['Running', 'yellow', isRunning],
@@ -430,38 +430,6 @@ export const register: Register = on => {
       return (100 - pct) / ((pct - prev.pct) / dt)
     }
 
-    // A merge made outside Claude (a PR merged on GitHub, a local git merge) leaves no `Merged:` line, so git is asked:
-    // the branch is gone, or trunk holds its commits (by patch, as muster.py's `unmerged` counts rebased work). Workers
-    // do not commit unless told to, so work still uncommitted, or a branch that has not moved past `base_head` (HEAD
-    // when the task started), is never merged, though trunk trivially contains such a branch. Asked
-    // at most once a minute per task, and a merged answer is kept. A squash merge is invisible here until the branch is
-    // deleted; the row's Hide covers that.
-    const landed = new Map<string, { at: number; isMerged: boolean }>()
-    const isLanded = async (key: string, cwd: string, branch: string, baseHead: string) => {
-      const seen = landed.get(key)
-      if (seen && (seen.isMerged || Date.now() - seen.at < 60000)) return seen.isMerged
-      const git = (...args: string[]) => $.process.run(['git', '-C', cwd, ...args], { timeoutMs: 5000 }).catch(() => ({ exitCode: -1, stdout: '' }))
-      const check = async () => {
-        // `rev-parse --verify -q` exits 1 for a missing ref; anything else unexpected means git cannot tell.
-        const ref = await git('rev-parse', '--verify', '-q', `refs/heads/${branch}`)
-        if (ref.exitCode === 1) return true
-        if (ref.exitCode !== 0) return false
-        const dirty = await git('status', '--porcelain')
-        if (dirty.exitCode !== 0 || dirty.stdout.trim() !== '') return false
-        if (baseHead === '' || (await git('rev-parse', branch)).stdout.trim() === baseHead) return false
-        const origin = await git('symbolic-ref', '-q', '--short', 'refs/remotes/origin/HEAD')
-        let trunk = origin.exitCode === 0 ? origin.stdout.trim() : ''
-        for (const b of ['main', 'master']) if (trunk === '' && (await git('rev-parse', '--verify', '-q', `refs/heads/${b}`)).exitCode === 0) trunk = b
-        if (trunk === '' || trunk.endsWith(`/${branch}`) || trunk === branch) return false
-        if ((await git('merge-base', '--is-ancestor', branch, trunk)).exitCode === 0) return true
-        const cherry = await git('cherry', trunk, branch)
-        return cherry.exitCode === 0 && !cherry.stdout.split('\n').some(l => l.startsWith('+'))
-      }
-      const isMerged = await check()
-      landed.set(key, { at: Date.now(), isMerged })
-      return isMerged
-    }
-
     const loadTasks = async (name: string): Promise<Task[]> => {
       const dirs = (await $.fs.list(`${root}/${name}`)).filter(d => d.kind === 'dir').map(d => d.name).sort()
       return Promise.all(
@@ -529,10 +497,8 @@ export const register: Register = on => {
           // A task that changed nothing was a read-only review: its verdict is about what it read, and the review is done.
           const readOnly = kv.changes?.startsWith('0 files') ?? false
           const review = status.trim() !== 'done' || kv.changes === undefined ? '' : approved || (fixes && readOnly) ? 'reviewed' : fixes ? 'needs fixes' : 'needs review'
-          // Claude's one-line account of the change in review.md (`Summary:`), in the user's language; `Merged:` or `Not merging:` once settled.
+          // Claude's one-line account of the change in review.md (`Summary:`), in the user's language.
           const reviewSummary = /^\W*Summary\W*:\s*(.+)$/im.exec(reviewText)?.[1]?.trim() ?? ''
-          const mergeable = status.trim() === 'done' && approved && !readOnly && kv.changes !== undefined && branch !== '' && reviewSummary !== '' &&
-            !/^\W*(Merged|Not merging)\W*:/im.test(reviewText) && !(await isLanded(`${name}/${id}`, kv.cwd ?? '', branch, kv.base_head ?? ''))
           // After the worker exits its log goes quiet on purpose; meta says what the runner is doing instead.
           const phase = !isLive ? '' : kv.check_started ? 'running done check' : kv.check_waiting ? 'waiting for done check' : kv.worker_exited ? 'saving results' : ''
           return {
@@ -554,7 +520,6 @@ export const register: Register = on => {
             finishedMs: parseTime(kv.finished),
             summary: (reviewSummary || tidy).slice(0, 400),
             decision: parseDecision(decisionText),
-            mergeable,
             reason,
             logPath: failed ? (kv.log_path ?? '') : '',
             usage,
@@ -697,7 +662,7 @@ export const register: Register = on => {
     const agents = (await read($, agentsAtom)).filter(isAgentActive)
     const waiting = inboxOf(runs, lineage(runs), await read($, sentAtom))
     const rows = [
-      ...waiting.map(i => `waiting for you · ${i.decision ? i.decision.question : `${i.task.title}: ready to merge`} · ${i.key}`),
+      ...waiting.map(i => `to decide · ${i.decision.question} · ${i.key}`),
       ...runs.flatMap(r =>
         r.tasks.filter(isActive).map(t => `${t.id} · ${t.worker} · ${t.status}${t.pctText ? ` · ${t.pctText}` : ''} · ${t.title}`),
       ),
@@ -755,8 +720,8 @@ export const register: Register = on => {
       const extra = [[n(needsFixes), 'needs fixes'], [n(needsReview), 'needs review'], [n(isQueued), 'queued'], [n(isCanceled), 'canceled'], [retriedAttempts(run.tasks, attempts).length, 'retried']].filter(([k]) => k).map(([k, l]) => ` · ${k} ${l}`).join('')
       return `${run.tasks.filter(isRunning).length} running · ${n(isDone)} done · ${n(isFailed)} failed${extra}`
     }
-    // The inbox: what only the user can settle, at the top. A choice goes to Claude as the user's own message; merging
-    // and sending back only fill the prompt box, so nothing that is hard to undo leaves without the user's Enter.
+    // The inbox: what only the user can settle, at the top. A choice goes to Claude as the user's own message; Other only
+    // fills the prompt box for the user's own answer.
     const sent = await read($, sentAtom)
     const inbox = inboxOf(runs, attempts, sent)
     const record = (id: string, label: string | undefined) =>
@@ -781,25 +746,23 @@ export const register: Register = on => {
       const said = sent[id]
       const lines = (text: string, max: number, lead = '     ') => wrapCells(text, detailWidth - 1, max).map(line => <Text>{lead}{line}</Text>)
       // Self-contained, so a session that has not loaded the muster skill still knows where the answer goes.
-      const ask = `Muster decision for ${key}, "${d?.question ?? ''}"`
+      const ask = `Muster decision for ${key}, "${d.question}"`
       const after = (n: string) => ` (Append "Decided: ${n}" to that task's decision.md in the muster runsDir, then carry it out as step 6 of the muster skill says.)`
       return (
         <Box flexDirection="column" marginTop={1}>
-          <Text bold color={d ? 'warning' : 'success'}>{'  '}{d ? `❓ ${d.question}` : `⇢ ${t.title}: ready to merge`}</Text>
-          {lines(d ? d.context : t.summary, 4)}
-          {d?.options.map((o, i) => wrapCells(`${i + 1}. ${o}`, detailWidth - 1, 2).map((line, j) => <Text>{'     '}{j === 0 ? '' : '   '}{line}</Text>))}
-          {d && d.recommend !== '' && lines(`→ ${d.recommend}`, 2)}
+          <Text bold color="warning">{'  '}⚖️ {d.question}</Text>
+          {lines(d.context, 4)}
+          {d.options.map((o, i) => wrapCells(`${i + 1}. ${o}`, detailWidth - 1, 2).map((line, j) => <Text>{'     '}{j === 0 ? '' : '   '}{line}</Text>))}
+          {d.recommend !== '' && lines(`→ ${d.recommend}`, 2)}
           {said !== undefined ? (
             <Text color="success">{'     '}✓ sent: {said} · waiting for Claude</Text>
           ) : (
             <Box flexDirection="row" gap={2}>
               <Text>{'    '}</Text>
-              {d?.options.map((o, i) => (
+              {d.options.map((o, i) => (
                 <Button key={`decide:${key}:${i + 1}`} onPress={choose(id, `option ${i + 1}`, `${ask}: option ${i + 1}, ${o}.${after(`option ${i + 1}`)}`)}>Option {i + 1}</Button>
               ))}
-              {d && <Button key={`other:${key}`} onPress={fill(`${ask}: `)}>Other…</Button>}
-              {!d && <Button key={`merge:${key}`} onPress={fill(`Muster: merge ${key} (${t.title}).`)}>Merge…</Button>}
-              {!d && <Button key={`back:${key}`} onPress={fill(`Muster: do not merge ${key} (${t.title}) yet: `)}>Send back…</Button>}
+              <Button key={`other:${key}`} onPress={fill(`${ask}: `)}>Other…</Button>
               <Button key={`hide:${key}`} onPress={() => void record(id, HIDDEN)}>Hide</Button>
             </Box>
           )}
@@ -842,7 +805,7 @@ export const register: Register = on => {
         <Text> </Text>
         {inbox.length > 0 && (
           <Box flexDirection="column" marginBottom={1}>
-            <Text bold>✉ Waiting for you · {inbox.length}</Text>
+            <Text bold>⚖️ To decide · {inbox.length}</Text>
             {inbox.map(InboxRow)}
           </Box>
         )}
@@ -1015,7 +978,7 @@ export const register: Register = on => {
     ] as const).map(([test, sign, label, color]) => ({ n: tasks.filter(test).length, sign, label, color })).filter(c => c.n > 0)
     const only = running.length === 1 ? running[0]! : undefined
     const parts = [
-      asks > 0 && <Text color="warning" bold>✉ you ×{asks}</Text>,
+      asks > 0 && <Text color="warning" bold>⚖️ {asks} to decide</Text>,
       planned > 0 && (
         <Text>
           <Text color="green">{'█'.repeat(filled)}</Text>

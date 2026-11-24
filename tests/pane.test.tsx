@@ -149,7 +149,7 @@ const mountWith = async (
   $: any,
   on: any,
   tree: Record<string, string>,
-  opts: { config?: string; session?: string; clock?: boolean; agents?: any[]; toasts?: string[]; git?: (args: string[]) => { exitCode: number; stdout?: string } } = {},
+  opts: { config?: string; session?: string; clock?: boolean; agents?: any[]; toasts?: string[] } = {},
 ) => {
   const dirs = new Map<string, Set<string>>()
   for (const path of Object.keys(tree)) {
@@ -185,10 +185,7 @@ const mountWith = async (
   })
   on('session.id', () => ({ value: opts.session ?? 'S1' }))
   on('agent.list', () => ({ value: opts.agents ?? [] }))
-  // git answers 128 (cannot tell) unless a test says otherwise.
-  on('process.run', (_: any, e: any) => ({
-    value: { stdout: '', stderr: '', ...(e.argv[0] === 'git' ? opts.git?.(e.argv.slice(3)) ?? { exitCode: 128 } : { exitCode: 0 }) },
-  }))
+  on('process.run', () => ({ value: { stdout: '', stderr: '', exitCode: 0 } }))
   on('session.start', (_: any, e: any) => ({ cwd: e.cwd }))
   await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
 }
@@ -803,15 +800,6 @@ test('the Stop hook still reminds when the run holds a pending task', async ($, 
   expect(r.block).toContain('20261119-1000-wait/rev')
 })
 
-// muster/ship is open; muster/landed was rebased into origin/main, so `git cherry` finds every patch there.
-const inboxGit = (args: string[]) =>
-  args[0] === 'rev-parse' ? { exitCode: 0, stdout: args.length === 2 ? 'tip0\n' : '' }
-  : args[0] === 'status' ? { exitCode: 0, stdout: '' }
-  : args[0] === 'symbolic-ref' ? { exitCode: 0, stdout: 'origin/main\n' }
-  : args[0] === 'merge-base' ? { exitCode: 1 }
-  : args[0] === 'cherry' ? { exitCode: 0, stdout: args[2] === 'muster/landed' ? '- abc\n' : '+ def\n' }
-  : { exitCode: 128 }
-
 const inboxTree = () => {
   const sha = 'a'.repeat(64)
   const run = '20261123-1100-inbox'
@@ -819,8 +807,6 @@ const inboxTree = () => {
     [run]: {
       ask: { ...task('failed: worker reported NEEDS_CONTEXT'), title: 'Rename the section' },
       ship: { ...task('done', `cwd=/x\nchanges=2 files +5 -1\nchanges_sha256=${sha}\n`), title: 'Fix two review comments' },
-      shipped: { ...task('done', `cwd=/x\nchanges=1 files +1 -0\nchanges_sha256=${sha}\n`), title: 'Already merged' },
-      landed: { ...task('done', `cwd=/y\nbase_head=base0\nchanges=1 files +1 -0\nchanges_sha256=${sha}\n`), title: 'Merged on GitHub' },
       plain: { ...task('done'), title: 'Plain report' },
     },
   })
@@ -829,15 +815,11 @@ const inboxTree = () => {
   t[`/h/.muster/runs/${run}/ask/decision.md`] =
     'Question: Which name should the section key use?\nContext: The doc says TweakSection, the code says GenerativeUI.\nThe split task waits on this.\nOptions:\n- Keep the doc name: three call sites change\n- Keep the code name: the doc changes\nRecommend: 1, the doc is not merged yet\n'
   t[`/h/.muster/runs/${run}/ship/review.md`] = `Verdict: Approved\nchanges-sha256: ${sha}\nSummary: Removed a force unwrap and asserted the main thread.\n`
-  t[`/h/.muster/runs/${run}/shipped/review.md`] = `Verdict: Approved\nchanges-sha256: ${sha}\nSummary: Done.\nMerged: abc1234\n`
-  t['/y/.git'] = 'gitdir: /repo/.git/worktrees/y\n'
-  t['/repo/.git/worktrees/y/HEAD'] = 'ref: refs/heads/muster/landed\n'
-  t[`/h/.muster/runs/${run}/landed/review.md`] = `Verdict: Approved\nchanges-sha256: ${sha}\nSummary: Merged outside Claude.\n`
   t[`/h/.muster/runs/${run}/plain/result.md`] = 'Status: DONE\nAdded the retry table.\n'
   return t
 }
 
-test('the inbox shows a decision with its options and work ready to merge, and the buttons reach Claude', async ($, on) => {
+test('the inbox shows a decision with its options, reviewed work stays out of it, and the buttons reach Claude', async ($, on) => {
   const submitted: string[] = []
   const filled: string[] = []
   on('prompt.submit', (_: any, e: any) => {
@@ -848,29 +830,23 @@ test('the inbox shows a decision with its options and work ready to merge, and t
     filled.push(e.text)
     return { isFilled: true, text: e.text, cursor: e.text.length }
   })
-  await mountWith($, on, inboxTree(), { git: inboxGit })
+  await mountWith($, on, inboxTree())
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
-  expect((await ui.find({ type: 'Text', text: /Waiting for you/ }))?.text).toMatch(/✉ Waiting for you · 2/)
-  expect((await ui.find({ type: 'Text', text: /❓/ }))?.text).toMatch(/❓ Which name should the section key use\?/)
+  expect((await ui.find({ type: 'Text', text: /To decide/ }))?.text).toMatch(/⚖️ To decide · 1/)
+  expect((await ui.find({ type: 'Text', text: /⚖️ Which/ }))?.text).toMatch(/⚖️ Which name should the section key use\?/)
   expect((await ui.find({ type: 'Text', text: /TweakSection/ }))?.text).toMatch(/The doc says TweakSection, the code says GenerativeUI\. The split task waits on this\./)
   expect((await ui.find({ type: 'Text', text: /2\. Keep the code name/ }))?.text).toMatch(/2\. Keep the code name: the doc changes/)
   expect((await ui.find({ type: 'Text', text: /→/ }))?.text).toMatch(/→ 1, the doc is not merged yet/)
-  expect((await ui.find({ type: 'Text', text: /⇢/ }))?.text).toMatch(/⇢ Fix two review comments: ready to merge/)
-  // A task Claude recorded as merged, one git sees in trunk, and one without a recorded diff stay out of the inbox.
-  expect(await ui.find({ type: 'Text', text: /⇢ Already merged/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /⇢ Merged on GitHub/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /⇢ Plain report/ })).toBeUndefined()
+  // Approved work is Claude's to merge: no merge item, no Merge button.
+  expect(await ui.find({ type: 'Text', text: /ready to merge/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', text: /Merge/ })).toBeUndefined()
   await ui.press({ key: 'expand-all' })
   // review.md's Summary stands for the task, and a bare `Status: DONE` is not shown as one.
   expect((await ui.find({ type: 'Text', text: /↳ Removed a force/ }))?.text).toMatch(/↳ Removed a force unwrap/)
   expect((await ui.find({ type: 'Text', text: /↳ Added the retry/ }))?.text).toMatch(/↳ Added the retry table\./)
 
-  await ui.press({ key: 'merge:20261123-1100-inbox/ship' })
   await ui.press({ key: 'other:20261123-1100-inbox/ask' })
-  expect(filled).toEqual([
-    'Muster: merge 20261123-1100-inbox/ship (Fix two review comments).',
-    'Muster decision for 20261123-1100-inbox/ask, "Which name should the section key use?": ',
-  ])
+  expect(filled).toEqual(['Muster decision for 20261123-1100-inbox/ask, "Which name should the section key use?": '])
   expect(submitted).toEqual([])
 
   await ui.press({ key: 'decide:20261123-1100-inbox/ask:2' })
@@ -881,56 +857,36 @@ test('the inbox shows a decision with its options and work ready to merge, and t
 })
 
 test('a hidden item leaves the inbox', async ($, on) => {
-  await mountWith($, on, inboxTree(), { git: inboxGit })
+  await mountWith($, on, inboxTree())
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
-  await ui.press({ key: 'hide:20261123-1100-inbox/ship' })
-  expect(await ui.find({ type: 'Text', text: /⇢/ })).toBeUndefined()
-  expect((await ui.find({ type: 'Text', text: /Waiting for you/ }))?.text).toMatch(/· 1$/)
+  await ui.press({ key: 'hide:20261123-1100-inbox/ask' })
+  expect(await ui.find({ type: 'Text', text: /⚖️/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /To decide/ })).toBeUndefined()
   await ui.unmount()
 })
 
-test('a branch that has not moved since the task started is not merged', async ($, on) => {
-  const t = inboxTree()
-  const meta = '/h/.muster/runs/20261123-1100-inbox/landed/meta'
-  // Clean, but the tip is still base_head: trunk contains the branch only because nothing was committed.
-  await mountWith($, on, { ...t, [meta]: t[meta]!.replace('base_head=base0', 'base_head=tip0') }, { git: inboxGit })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
-  expect((await ui.find({ type: 'Text', text: /⇢ Merged on GitHub/ }))?.text).toMatch(/ready to merge/)
-  await ui.unmount()
+test('the band counts what waits for the user even after the run finished', async ($, on) => {
+  await mountWith($, on, inboxTree())
+  const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
+  expect((await band.find({ type: 'Text', text: /to decide/ }))?.text).toMatch(/⚖️ 1 to decide/)
+  await band.unmount()
 })
 
-test('uncommitted work in the worktree is not merged', async ($, on) => {
-  await mountWith($, on, inboxTree(), { git: args => (args[0] === 'status' ? { exitCode: 0, stdout: ' M a.swift\n' } : inboxGit(args)) })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns: 120 } })
-  expect((await ui.find({ type: 'Text', text: /⇢ Merged on GitHub/ }))?.text).toMatch(/ready to merge/)
-  await ui.unmount()
-})
-
-test('a merge branch that is gone counts as merged', async ($, on) => {
-  await mountWith($, on, inboxTree(), { git: args => (args[0] === 'rev-parse' ? { exitCode: 1 } : { exitCode: 128 }) })
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /⇢/ })).toBeUndefined()
-  await ui.unmount()
-})
-
-test('a decided question leaves the inbox, and the band counts what waits even after the run finished', async ($, on) => {
+test('a decided question leaves the inbox', async ($, on) => {
   const t = inboxTree()
   t['/h/.muster/runs/20261123-1100-inbox/ask/decision.md'] += 'Decided: 2\n'
-  await mountWith($, on, t, { git: inboxGit })
+  await mountWith($, on, t)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /❓/ })).toBeUndefined()
-  expect((await ui.find({ type: 'Text', text: /Waiting for you/ }))?.text).toMatch(/· 1$/)
+  expect(await ui.find({ type: 'Text', text: /⚖️/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /To decide/ })).toBeUndefined()
   await ui.unmount()
-  const band = await $.ui.mount({ plugin: 'muster', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false } as any })
-  expect((await band.find({ type: 'Text', text: /you ×/ }))?.text).toMatch(/✉ you ×1/)
-  await band.unmount()
 })
 
 test('CJK lines of a decision join without a space, and a wrapped line never starts with closing punctuation', async ($, on) => {
   const t = inboxTree()
-  t['/h/.muster/runs/20261123-1100-inbox/ask/decision.md'] = 'Question: \u7528\u54ea\u5957\u547d\u540d\uff1f\nContext: \u4e24\u8fb9\u5bf9\u4e0d\u4e0a\u3002\nworker \u505c\u4e0b\u6765\u4e86\nOptions:\n- \u7532\n'
-  t['/h/.muster/runs/20261123-1100-inbox/ship/review.md'] = t['/h/.muster/runs/20261123-1100-inbox/ship/review.md']!.replace(/Summary: .*/, '') + 'Summary: \u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u516b\u3002\n'
-  await mountWith($, on, t, { git: inboxGit })
+  t['/h/.muster/runs/20261123-1100-inbox/ask/decision.md'] =
+    'Question: \u7528\u54ea\u5957\u547d\u540d\uff1f\nContext: \u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u4e00\u4e8c\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u516b\u3002\nOptions:\n- \u7532\nRecommend: \u4e24\u8fb9\u5bf9\u4e0d\u4e0a\u3002\nworker \u505c\u4e0b\u6765\u4e86\n'
+  await mountWith($, on, t)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /\u4e24\u8fb9\u5bf9\u4e0d\u4e0a/ }))?.text).toMatch(/\u4e24\u8fb9\u5bf9\u4e0d\u4e0a\u3002worker \u505c\u4e0b\u6765\u4e86/)
   const lines = (await ui.findAll({ type: 'Text' })).map((r: any) => (r.text as string).trim())
