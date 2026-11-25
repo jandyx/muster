@@ -853,14 +853,16 @@ test('the inbox shows a decision with its options, reviewed work stays out of it
   expect((await ui.find({ type: 'Text', text: /↳ Removed a force/ }))?.text).toMatch(/↳ Removed a force unwrap/)
   expect((await ui.find({ type: 'Text', text: /↳ Added the retry/ }))?.text).toMatch(/↳ Added the retry table\./)
 
+  // Buttons carry the choice's name; one without a short name before a colon falls back to its number.
+  expect((await ui.find({ type: 'Button', text: /Keep the doc name/ }))?.text).toBe('Keep the doc name')
   await ui.press({ key: 'other:20261123-1100-inbox/ask' })
   expect(filled).toEqual(['Muster decision for 20261123-1100-inbox/ask, "Which name should the section key use?": '])
   expect(submitted).toEqual([])
 
   await ui.press({ key: 'decide:20261123-1100-inbox/ask:2' })
   expect(submitted).toEqual(['Muster decision for 20261123-1100-inbox/ask, "Which name should the section key use?": option 2, Keep the code name: the doc changes. (Append "Decided: option 2" to that task\'s decision.md in the muster runsDir, then carry it out as step 6 of the muster skill says.)'])
-  expect((await ui.find({ type: 'Text', text: /sent:/ }))?.text).toMatch(/✓ sent: option 2 · waiting for Claude/)
-  expect(await ui.find({ type: 'Button', text: /Option 1/ })).toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: /sent:/ }))?.text).toMatch(/✓ sent: Keep the code name · waiting for Claude/)
+  expect(await ui.find({ type: 'Button', text: /Keep the doc name/ })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -901,7 +903,43 @@ test('CJK lines of a decision join without a space, and a wrapped line never sta
   expect(lines.some(l => l.startsWith('\u3002'))).toBe(false)
   // 21 wide characters fill the 43-cell line, so the full stop falls at the break and takes the character before it down.
   expect(lines).toContain('\u516b\u3002')
+  expect((await ui.find({ type: 'Button', text: /Option 1/ }))?.text).toBe('Option 1')
   await ui.unmount()
+})
+
+// The decision buttons' labels, for a decision with these options in a pane this wide.
+const choiceButtons = async ($: any, on: any, options: string[], bodyColumns: number) => {
+  const t = inboxTree()
+  t['/h/.muster/runs/20261123-1100-inbox/ask/decision.md'] = `Question: Which?\nOptions:\n${options.map(o => `- ${o}\n`).join('')}`
+  await mountWith($, on, t)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, bodyColumns } })
+  // Every button but the pane's own controls and the run's fold row.
+  const labels = (await ui.findAll({ type: 'Button' }))
+    .map((b: any) => b.text as string)
+    .filter((l: string) => !/^(Expand all|Collapse all|Other…|Hide|[▸▾] )/.test(l))
+  await ui.unmount()
+  return labels
+}
+
+test('a button names its choice, and a colon inside the name (a time, a URL) does not end it', async ($, on) => {
+  expect(await choiceButtons($, on, ['12:30 standup: move it', 'https://x.dev: use the mirror'], 120)).toEqual(['12:30 standup', 'https://x.dev'])
+})
+
+test('a full-width colon ends a choice name', async ($, on) => {
+  expect(await choiceButtons($, on, ['\u63a5\u53d7 RUDP \u7f16\u5165\uff1a\u96f6\u4fee\u6539', '\u6253\u8865\u4e01\uff1a\u7b49\u4e0a\u6e38'], 80)).toEqual(['\u63a5\u53d7 RUDP \u7f16\u5165', '\u6253\u8865\u4e01'])
+})
+
+test('choice names that repeat number every button', async ($, on) => {
+  expect(await choiceButtons($, on, ['Fix: in place', 'Fix: upstream'], 120)).toEqual(['Option 1', 'Option 2'])
+})
+
+const LONG = ['Keep the generated name', 'Rename every call site', 'Split into two sections']
+test('choice names that do not fit the row next to Other… and Hide number every button', async ($, on) => {
+  expect(await choiceButtons($, on, LONG.map(n => `${n}: x`), 80)).toEqual(['Option 1', 'Option 2', 'Option 3'])
+})
+
+test('long choice names show when the row fits them', async ($, on) => {
+  expect(await choiceButtons($, on, LONG.map(n => `${n}: x`), 140)).toEqual(LONG)
 })
 
 const processReport = (stdout: string, exitCode = 0, stderr = '') => ({

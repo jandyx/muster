@@ -329,6 +329,18 @@ const cells = (ch: string) => {
 }
 const NO_LINE_START = '\u3002\uff0c\u3001\uff1b\uff1a\uff01\uff1f\uff09\u300d\u300f\u300b\u3011,.;:!?)'
 const width = (text: string) => [...text].reduce((a, c) => a + cells(c), 0)
+// Button labels for a decision's options: each choice's name, the text before `：` or a `: ` (so 12:30 and URLs stay
+// whole), when it is short; else "Option N". Names that repeat, or a row wider than `cols`, number every button.
+const choiceNames = (options: string[], cols: number) => {
+  const numbered = options.map((_, i) => `Option ${i + 1}`)
+  const names = options.map((o, i) => {
+    const name = o.split(/：|:\s/)[0]!.trim()
+    return name !== o.trim() && name !== '' && width(name) <= 24 ? name : numbered[i]!
+  })
+  // The row: a 4-cell lead, each button as "[ label ]", Other… and Hide, two cells between them.
+  const row = 4 + names.reduce((a, n) => a + width(n) + 4, 0) + 10 + 8 + 2 * (names.length + 2)
+  return new Set(names).size < names.length || row > cols ? numbered : names
+}
 // Splits text into lines of `width` cells, breaking at the last space when there is one; past `max` lines it
 // keeps `max` and ends the last with "…".
 const wrapCells = (text: string, cols: number, max: number) => {
@@ -925,6 +937,7 @@ export const register: Register = on => {
       const lines = (text: string, max: number, lead = '     ') => wrapCells(text, detailWidth - 1, max).map(line => <Text>{lead}{line}</Text>)
       // Self-contained, so a session that has not loaded the muster skill still knows where the answer goes.
       const ask = `Muster decision for ${key}, "${d.question}"`
+      const names = choiceNames(d.options, detailWidth - 1)
       const after = (n: string) => ` (Append "Decided: ${n}" to that task's decision.md in the muster runsDir, then carry it out as step 6 of the muster skill says.)`
       return (
         <Box flexDirection="column" marginTop={1}>
@@ -938,7 +951,7 @@ export const register: Register = on => {
             <Box flexDirection="row" gap={2}>
               <Text>{'    '}</Text>
               {d.options.map((o, i) => (
-                <Button key={`decide:${key}:${i + 1}`} onPress={choose(id, `option ${i + 1}`, `${ask}: option ${i + 1}, ${o}.${after(`option ${i + 1}`)}`)}>Option {i + 1}</Button>
+                <Button key={`decide:${key}:${i + 1}`} onPress={choose(id, names[i]!, `${ask}: option ${i + 1}, ${o}.${after(`option ${i + 1}`)}`)}>{names[i]}</Button>
               ))}
               <Button key={`other:${key}`} onPress={fill(`${ask}: `)}>Other…</Button>
               <Button key={`hide:${key}`} onPress={() => void record(id, HIDDEN)}>Hide</Button>
