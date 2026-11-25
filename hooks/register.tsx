@@ -329,12 +329,12 @@ const cells = (ch: string) => {
 }
 const NO_LINE_START = '\u3002\uff0c\u3001\uff1b\uff1a\uff01\uff1f\uff09\u300d\u300f\u300b\u3011,.;:!?)'
 const width = (text: string) => [...text].reduce((a, c) => a + cells(c), 0)
-// Button labels for a decision's options: each choice's name, the text before `：` or a `: ` (so 12:30 and URLs stay
+// Button labels for a decision's options: each choice's name, the text before a full-width colon or a `: ` (so 12:30 and URLs stay
 // whole), when it is short; else "Option N". Names that repeat, or a row wider than `cols`, number every button.
 const choiceNames = (options: string[], cols: number) => {
   const numbered = options.map((_, i) => `Option ${i + 1}`)
   const names = options.map((o, i) => {
-    const name = o.split(/：|:\s/)[0]!.trim()
+    const name = o.split(/\uff1a|:\s/)[0]!.trim()
     return name !== o.trim() && name !== '' && width(name) <= 24 ? name : numbered[i]!
   })
   // The row: a 4-cell lead, each button as "[ label ]", Other… and Hide, two cells between them.
