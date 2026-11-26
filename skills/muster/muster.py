@@ -500,7 +500,9 @@ def record_quota(runs, name, worker, line):
     until = quota_retry_at(line, current)
     if until is None or until <= current.timestamp():
         snapshot, _ = worker_quota(worker, {})
-        until = snapshot["resets_at"] if snapshot else current.timestamp() + 30 * 60
+        # A rate limit (429, "too many requests", a per-minute quota) passes in moments; a spent quota does not.
+        brief = not EXHAUSTED.search(line) or re.search(r"per.?minute|per.?second", line, re.I)
+        until = snapshot["resets_at"] if snapshot else current.timestamp() + (RATE_SKIP_S if brief else QUOTA_SKIP_S)
     with open(os.path.join(runs, ".lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         records = quota_records(runs)
@@ -542,6 +544,8 @@ PROVIDER = re.compile(r"usage limit|quota|rate.?limit|too many requests|"
                       r"resource.?exhausted", re.I)
 # Of those, the ones that say the account is out for a while, whatever the worker type: skip it until it is back.
 QUOTA = re.compile(r"usage limit|quota|rate.?limit|too many requests|\b429\b|resource.?exhausted", re.I)
+EXHAUSTED = re.compile(r"usage limit|quota", re.I)  # out for hours; the rest of QUOTA is a rate limit
+QUOTA_SKIP_S, RATE_SKIP_S = 30 * 60, 2 * 60  # how long to skip a worker whose error names no time
 ENOSPC = re.compile(r"ENOSPC|no space left on device", re.I)
 SECRET = re.compile(r"(?i)\b(bearer\s+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*)\S+"
                     r"|\b(sk-|xox[a-z]?-|ghp_|gho_|ghs_|github_pat_)[A-Za-z0-9_\-]+")

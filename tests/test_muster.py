@@ -849,6 +849,18 @@ class CodexQuota(unittest.TestCase):
         self.assertEqual(self.run_workers("a,b"), 0)
         self.assertEqual((self.root / "invoked").read_text().strip(), self.cfg["workers"]["b"]["codexHome"])
 
+    def test_a_rate_limit_skips_a_worker_briefly_and_a_spent_quota_for_long(self):
+        worker = {"type": "agy"}
+        for line, skip in (("Error 429: Too Many Requests", M.RATE_SKIP_S), ("RESOURCE_EXHAUSTED", M.RATE_SKIP_S),
+                           ("Quota exceeded for requests per minute", M.RATE_SKIP_S),
+                           ("You hit your usage limit.", M.QUOTA_SKIP_S), ("Quota exceeded for this account", M.QUOTA_SKIP_S)):
+            with self.subTest(line=line):
+                before = time.time()
+                M.record_quota(str(self.root), "a", worker, line)
+                until = json.loads(self.quota.read_text())["a"]["until"]
+                self.assertGreaterEqual(until, int(before) + skip)
+                self.assertLessEqual(until, time.time() + skip)
+
     def test_a_claude_worker_with_an_active_quota_record_is_skipped(self):
         self.cfg["workers"]["a"]["type"] = "claude"
         self.quota.write_text(json.dumps({"a": {"until": self.until, "reason": "usage limit"}}))
