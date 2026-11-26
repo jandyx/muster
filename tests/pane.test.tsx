@@ -285,6 +285,22 @@ test('a claude worker\'s progress comes from its own text, on any line, and neve
   await ui.unmount()
 })
 
+test('an agy worker shows its joined text deltas and last tool call', async ($, on) => {
+  const meta = 'worker=g1\ntype=agy\nsession=S1\nstarted=2026-11-05 11:00:00\npid=0\n'
+  const t = tree('/h/.muster/runs', { '20261105-1000-x': { A: { status: 'running\n', meta, title: 'agy worker' } } })
+  const step = (s: object) => JSON.stringify({ event: 'step_update', step_update: s })
+  t['/h/.muster/runs/20261105-1000-x/A/stream.jsonl'] = [
+    step({ step_index: 2, step_type: 'tool', tool_name: 'write_file', tool_info: { parameters: { Path: '/x/main.go' } } }),
+    step({ step_index: 3, step_type: 'agent_response', text_delta: 'Wrote the pa' }),
+    step({ step_index: 3, step_type: 'agent_response', text_delta: 'rser.\nProgress: 3/5' }),
+  ].join('\n') + '\n'
+  await mountWith($, on, t)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /▰/ }))?.text).toMatch(/▰ 3\/5 \(60%\)$/)
+  expect(await ui.find({ type: 'Text', text: /write_file \/x\/main\.go/ })).toBeTruthy()
+  await ui.unmount()
+})
+
 test('a refused task shows as failed with its reason', async ($, on) => {
   await mountWith(
     $,

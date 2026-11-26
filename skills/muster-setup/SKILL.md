@@ -17,7 +17,7 @@ python3 $MUSTER detect
 
 It prints JSON:
 - `codex_homes`: each folder with a Codex login (`codexHome`, `billing`: `subscription` for a ChatGPT login, `metered` for an API key, `logged_in`).
-- `commands`: `codex`, `claude`, and `claude-wrapper` scripts (they set `ANTHROPIC_BASE_URL` and run Claude Code on another backend, such as DeepSeek).
+- `commands`: `codex`, `claude`, `agy` (the Antigravity CLI for Gemini), and `claude-wrapper` scripts (they set `ANTHROPIC_BASE_URL` and run Claude Code on another backend, such as DeepSeek).
 - `config_exists`: when true, read the current config first. You are editing it, not starting over: keep what the user set unless they asked to change it.
 
 Also worth a look, read-only: shell aliases that set `CODEX_HOME` (`grep -n CODEX_HOME ~/.zshrc ~/.bashrc 2>/dev/null`) give each Codex home the name the user already calls it by. Use those names as worker names.
@@ -28,11 +28,12 @@ From what you found, draft workers:
 - one `codex` worker per logged-in Codex home: `{ "type": "codex", "codexHome": "<path>" }`
 - one `claude` worker per wrapper: `{ "type": "claude", "command": "<path>", "args": ["--dangerously-skip-permissions"], "billing": "metered" }` (drop the flag if the wrapper already passes it)
 - a plain `claude` worker only if the user asks for one; it bills the same account this session uses
+- one `agy` worker if `agy` is found: `{ "type": "agy", "command": "<path>" }` (billing defaults to `subscription`; it must be signed in once by running `agy`; pick a model with `"args": ["--model", "<id>"]` from `agy models`)
 
-Then draft `routing` with a `*` fallback, `caps` (`codex` 3, `claude` 5) and `runsDir` (`~/.muster/runs`, or keep the existing one).
+Then draft `routing` with a `*` fallback, `caps` (`codex` 3, `claude` 5, `agy` 3) and `runsDir` (`~/.muster/runs`, or keep the existing one).
 
 Tiers are optional; add them only when the user wants cheaper or stronger runs for some tasks. Only `low`, `standard` and `high` exist, each with:
-- `args`: extra CLI arguments keyed by worker name or type (`codex`, `claude`), the name winning; they follow the worker's own `args`. Model: `["--model", "<model>"]` for Claude Code; `["-c", "model=\"<model>\""]` for Codex, which refuses `-m` twice, so leave `-m` out of a Codex worker's own `args` when tiers should pick its model. Codex effort: `["-c", "model_reasoning_effort=\"medium\""]` (`low`, `medium`, `high`, `xhigh`).
+- `args`: extra CLI arguments keyed by worker name or type (`codex`, `claude`, `agy`), the name winning; they follow the worker's own `args`. Model: `["--model", "<model>"]` for Claude Code and agy (agy effort: `["--effort", "high"]`); `["-c", "model=\"<model>\""]` for Codex, which refuses `-m` twice, so leave `-m` out of a Codex worker's own `args` when tiers should pick its model. Codex effort: `["-c", "model_reasoning_effort=\"medium\""]` (`low`, `medium`, `high`, `xhigh`).
 - `prefer`: workers that take the task first when several have a free slot, such as a cheap metered worker for `low`.
 - `when`: one sentence replacing the skill's default rule for picking that tier. A `routing` entry may set `"tiers": { "<name>": { "when": "…" } }` for its repos; nothing else goes there.
 

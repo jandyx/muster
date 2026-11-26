@@ -236,8 +236,36 @@ const parseProgress = (log: string) => {
   return { progress: progress.replace(/[`*]/g, '').replace(/\s+/g, ' ').slice(0, 300), lastCmd: lastCmd.slice(0, 200) }
 }
 
+// An agy worker's stream: its text arrives as deltas per step, a tool call as a `tool` step with named parameters.
+type AgyStep = { step_index?: number; step_type?: string; text_delta?: string; tool_name?: string; tool_info?: { parameters?: Record<string, unknown> } }
+const agySteps = (stream: string) =>
+  stream.split('\n').slice(-2000).flatMap(line => {
+    if (!line.includes('"step_update"')) return []
+    try {
+      const step = (JSON.parse(line) as { step_update?: AgyStep }).step_update
+      return step ? [step] : []
+    } catch {
+      return []
+    }
+  })
+// Each agent_response step's text, deltas joined, oldest first.
+const agyTexts = (steps: AgyStep[]) => {
+  const texts = new Map<number, string>()
+  for (const s of steps) if (s.step_type === 'agent_response' && s.text_delta) texts.set(s.step_index ?? -1, (texts.get(s.step_index ?? -1) ?? '') + s.text_delta)
+  return [...texts.values()]
+}
+const parseAgy = (stream: string) => {
+  const steps = agySteps(stream)
+  const tool = steps.filter(s => s.step_type === 'tool' && s.tool_name).at(-1)
+  const arg = Object.values(tool?.tool_info?.parameters ?? {}).find(v => typeof v === 'string' && v !== '')
+  const progress = agyTexts(steps).filter(t => t.trim()).at(-1) ?? ''
+  const lastCmd = tool ? `${tool.tool_name} ${typeof arg === 'string' ? arg : ''}`.trim() : ''
+  return { progress: progress.replace(/[`*#]/g, '').replace(/\s+/g, ' ').slice(0, 300), lastCmd: lastCmd.replace(/\s+/g, ' ').slice(0, 200) }
+}
+
 // Live progress of a running claude-type task, from its stream-json events: last assistant text and last tool call.
 const parseStream = (stream: string) => {
+  if (stream.includes('"step_update"')) return parseAgy(stream)
   let progress = ''
   let lastCmd = ''
   const lines = stream.split('\n')
@@ -273,7 +301,7 @@ const callText = (e: Record<string, unknown>) => {
 // What a claude-type worker itself wrote, one text block after another. Tool results stay out: a file or command
 // output that says "Progress: 99%" is not the worker's progress.
 const streamText = (text: string) =>
-  text.split('\n').slice(-400).flatMap(line => {
+  text.includes('"step_update"') ? agyTexts(agySteps(text)).join('\n') : text.split('\n').slice(-400).flatMap(line => {
     try {
       const event = JSON.parse(line) as { type?: string; message?: { content?: { type?: string; text?: string }[] } }
       return event.type === 'assistant' ? (event.message?.content ?? []).filter(c => c.type === 'text' && c.text).map(c => c.text!) : []
@@ -520,8 +548,8 @@ export const register: Register = on => {
             (await $.process.run(['kill', '-0', String(pid)], { timeoutMs: 2000 }).then(r => r.exitCode !== 0, () => false))
           const isLive = status.trim() === 'running' && !isOrphan
           // shortcut: reads the whole log each poll while running; switch to a tail read if logs grow past a few MB.
-          // meta's `type` is the worker kind muster.py ran: claude writes stream.jsonl, codex a plain log.
-          const isStream = kv.type === 'claude'
+          // meta's `type` is the worker kind muster.py ran: claude and agy write stream.jsonl, codex a plain log.
+          const isStream = kv.type === 'claude' || kv.type === 'agy'
           const liveFile = `${dir}/${isStream ? 'stream.jsonl' : 'log.txt'}`
           const liveText = isLive ? await readText(liveFile) : ''
           const live = !isLive

@@ -69,6 +69,29 @@ class Run(unittest.TestCase):
             self.assertIn(u["usd"], (0.75, 1.5))  # off-peak or peak, by when the test runs
 
 
+    def test_agy_worker_gets_the_prompt_as_an_argument_and_its_usage_is_read(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = pathlib.Path(d, "fake-agy")
+            # agy reads no stdin; it echoes back its last argument, which must be the prompt.
+            fake.write_text("#!/bin/sh\nfor a; do last=$a; done\nprintf '%s' \"$*\" > " + d + "/argv\n"
+                            "echo '{\"event\":\"step_update\",\"step_update\":{\"step_index\":1,\"step_type\":\"agent_response\",\"text_delta\":\"working\"}}'\n"
+                            "echo '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"DONE\",\"usage\":"
+                            "{\"input_tokens\":100,\"output_tokens\":20,\"thinking_tokens\":5,\"cache_read_tokens\":900}}}'\n")
+            fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+            task = pathlib.Path(d, "run/A")
+            task.mkdir(parents=True)
+            (task / "prompt.md").write_text("# t\n-say DONE\n")
+            cfg = {"runsDir": d, "workers": {"g": {"type": "agy", "command": str(fake), "args": ["--model", "gemini-old", "--model", "gemini-x"]}}}
+            self.assertEqual(M.run(cfg, "g", str(task), d), 0)
+            argv = pathlib.Path(d, "argv").read_text()
+            self.assertIn("--dangerously-skip-permissions --model gemini-old --model gemini-x --print=# t\n-say DONE", argv)
+            self.assertEqual((task / "result.md").read_text(), "DONE")
+            meta = M.read_meta(str(task))
+            self.assertEqual((meta["type"], meta["model"], (task / "status").read_text().strip()), ("agy", "gemini-x", "done"))
+            u = json.loads((task / "usage").read_text())
+            self.assertEqual((u["model"], u["input"], u["cached"], u["output"], u["reasoning"], u["usd"], u["billing"]),
+                             ("gemini-x", 1000, 900, 20, 5, None, "subscription"))
+
     def test_changes_diff_holds_commits_edits_and_new_files(self):
         import subprocess
         with tempfile.TemporaryDirectory() as d:
@@ -804,12 +827,15 @@ class CodexQuota(unittest.TestCase):
         M.record_quota(str(self.root), "a", worker, line)
         self.assertEqual(json.loads(self.quota.read_text())["a"]["until"], self.until)
 
-    def test_claude_usage_limit_is_a_provider_failure_without_a_quota_record(self):
-        self.cfg["workers"]["a"].update(type="claude", command=fake_cli(
-            self.root, "fail", "echo 'You hit your usage limit.' >&2\nexit 1"))
-        self.assertEqual(self.run_workers("a"), 1)
-        self.assertEqual(M.read_meta(str(self.task))["failure"], "provider")
-        self.assertFalse(self.quota.exists())
+    def test_any_worker_type_out_of_quota_is_recorded_and_skipped_for_the_next(self):
+        for kind, err in (("claude", "You hit your usage limit."), ("agy", "Error 429: RESOURCE_EXHAUSTED")):
+            with self.subTest(kind=kind):
+                if self.quota.exists():
+                    self.quota.unlink()
+                self.cfg["workers"]["a"].update(type=kind, command=fake_cli(self.root, "fail", f"echo '{err}' >&2\nexit 1"))
+                self.assertEqual(self.run_workers("a"), 1)
+                self.assertEqual(M.read_meta(str(self.task))["failure"], "provider")
+                self.assertIn("a", json.loads(self.quota.read_text()))
 
     def test_auth_failure_does_not_record_exhaustion(self):
         self.cfg["workers"]["a"]["command"] = fake_cli(self.root, "fail", "echo 'Error: 401 Unauthorized' >&2\nexit 1")
@@ -823,11 +849,11 @@ class CodexQuota(unittest.TestCase):
         self.assertEqual(self.run_workers("a,b"), 0)
         self.assertEqual((self.root / "invoked").read_text().strip(), self.cfg["workers"]["b"]["codexHome"])
 
-    def test_claude_worker_can_start_with_an_active_quota_record(self):
+    def test_a_claude_worker_with_an_active_quota_record_is_skipped(self):
         self.cfg["workers"]["a"]["type"] = "claude"
         self.quota.write_text(json.dumps({"a": {"until": self.until, "reason": "usage limit"}}))
-        self.assertEqual(self.run_workers("a"), 0)
-        self.assertTrue((self.root / "invoked").exists())
+        self.assertEqual(self.run_workers("a,b"), 0)
+        self.assertEqual((self.root / "invoked").read_text().strip(), self.cfg["workers"]["b"]["codexHome"])
 
     def test_all_out_fails_with_earliest_return_without_launching(self):
         self.rollout.write_text(self.event(99, self.until, reached="usage_limit"))
