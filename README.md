@@ -153,13 +153,14 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
     "codex":      { "type": "codex",  "codexHome": "~/.codex" },
     "codex-work": { "type": "codex",  "codexHome": "~/.codex-homes/work", "args": ["-m", "gpt-6-astra"] },
     "deepseek":   { "type": "claude", "command": "~/.local/bin/deepseek-claude",
-                    "args": ["--dangerously-skip-permissions"], "billing": "metered" }
+                    "args": ["--dangerously-skip-permissions"], "billing": "metered" },
+    "gemini":     { "type": "agy",    "command": "~/.local/bin/agy", "args": ["--model", "gemini-4-neon-high"] }
   },
   "routing": [                                  // first match on the task's cwd wins
-    { "match": "~/workspace/work-*", "workers": ["codex-work", "codex", "deepseek"],
+    { "match": "~/workspace/work-*", "workers": ["gemini", "codex-work", "codex", "deepseek"],   // tried in this order
       "preamble": ["Open pull requests with the repo's pr.sh."],     // added to prompts for these repos only
       "tiers": { "high": { "when": "Anything that touches billing/." } } },   // these repos' rule for a tier
-    { "match": "*",                  "workers": ["codex", "deepseek"] }
+    { "match": "*",                  "workers": ["gemini", "codex", "deepseek"] }
   ],
   "only":  { "codex-work": ["~/workspace/work-*"] },   // this worker refuses any other repo
   "caps":  { "codex": 3, "claude": 5, "agy": 3 },     // tasks at once per worker (by type or by name)
@@ -191,6 +192,8 @@ Claude picks each task's tier; the runner applies `prefer` and `args`. `stats` s
 | `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox` with `CODEX_HOME=codexHome` | the agent's notes and `exec` lines in `log.txt` | the session rollout in `codexHome/sessions/` |
 | `claude` | `<command> -p --output-format stream-json --verbose <args>` | the last text and tool call in `stream.jsonl` | the final `result` event's `modelUsage` |
 | `agy` | `<command> --output-format stream-json --dangerously-skip-permissions <args> --print=<prompt>` (agy reads no stdin, so the prompt is an argument) | the last text and tool call in `stream.jsonl` | the final `result` event's `usage`; the model is the `--model` in `args`, and `billing` defaults to `subscription` |
+
+**Gemini through `agy`.** Install the Antigravity CLI (`curl -fsSL https://antigravity.google/cli/install.sh | bash`, which puts `agy` in `~/.local/bin`), run `agy` once to sign in with Google, and list model ids with `agy models`. agy reads the repo's `AGENTS.md`; your Claude Code or Codex skills and MCP servers are not loaded (add servers with `agy mcp add`). agy keeps its sign-in in the macOS keychain under one fixed entry, so several `agy` workers share one Google account and its quota; split them only to give them different models or caps.
 
 </details>
 
