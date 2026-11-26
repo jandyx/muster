@@ -72,7 +72,7 @@ Muster turns that into a habit Claude already knows and a screen you can glance 
 ## Features
 
 - **A `muster` skill.** Plan → isolate → self-contained prompts → launch in the background → run the done check itself (`--check`) → review the whole diff (`changes.diff`, written by the runner) into `review.md`; the pane marks unreviewed tasks → one report table. The same loop every time.
-- **Any number of workers.** Each Codex account is a `codex` worker with its own `CODEX_HOME`; any Claude Code compatible CLI is a `claude` worker. Several tasks can run on one account at once.
+- **Any number of workers.** Each Codex account is a `codex` worker with its own `CODEX_HOME`; any Claude Code compatible CLI is a `claude` worker; the Antigravity CLI (`agy`, Gemini) is an `agy` worker. Several tasks can run on one account at once.
 - **Routing you write once.** Per-repo worker priority with quota fallbacks, workers fenced to certain repos, parallel caps. The fences and caps are enforced by the runner, not left to Claude's memory.
 - **Evidence, not claims.** Around each task the runner snapshots the repo and writes `changes.diff` with only that worker's changes, runs the done check itself (`--check`), and flags edits to tests (`tests_touched`) and other tasks in the same repo (`shared_with`). Claude reviews against the brief and records `review.md`.
 - **A live pane and band.** Task title, worker, the model it runs on, elapsed time, the worker's latest note and command, a red warning after 2 minutes of silence, the done check while it runs, a one-line result, separate `Needs review` and `Needs fixes` sections so only accepted work counts as Done, foldable runs — and the session's own Claude subagents, running first, finished ones folded.
@@ -140,7 +140,7 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
 4. Never print auth files or API keys. Tell me to run /reload-plugins when done.
 ```
 
-**Requirements:** Claude Code with plugin support, Python 3.10+, and the worker CLIs you use (`codex`, `claude`, or a Claude-compatible wrapper).
+**Requirements:** Claude Code with plugin support, Python 3.10+, and the worker CLIs you use (`codex`, `claude`, a Claude-compatible wrapper, or `agy`).
 
 ## Configure
 
@@ -162,7 +162,7 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
     { "match": "*",                  "workers": ["codex", "deepseek"] }
   ],
   "only":  { "codex-work": ["~/workspace/work-*"] },   // this worker refuses any other repo
-  "caps":  { "codex": 3, "claude": 5 },               // tasks at once per worker (by type or by name)
+  "caps":  { "codex": 3, "claude": 5, "agy": 3 },     // tasks at once per worker (by type or by name)
   "tiers": {                                         // optional: one setting per task, cheapest that suffices
     "low":      { "prefer": ["deepseek"], "args": { "codex": ["-c", "model_reasoning_effort=\"medium\""] } },
     "standard": { "args": { "codex": ["-c", "model_reasoning_effort=\"high\""] } },
@@ -175,7 +175,7 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
 
 **Tiers** are optional; without them every task runs with its worker's own settings. `low`, `standard` and `high` are the only names, each with up to three keys:
 
-- `args`: extra CLI arguments by worker name or type (`codex`, `claude`), added after the worker's own `args`. When both keys fit a worker, only the name's list is used; the two are not merged. Change the model with `["--model", "opus"]` for Claude Code, or `["-c", "model=\"<model>\""]` for Codex. Codex refuses `-m` twice, and `doctor` flags a tier that adds `-m` to a worker that already sets it.
+- `args`: extra CLI arguments by worker name or type (`codex`, `claude`, `agy`), added after the worker's own `args`. When both keys fit a worker, only the name's list is used; the two are not merged. Change the model with `["--model", "opus"]` for Claude Code, `["--model", "gemini-4-neon-high"]` for agy (`agy models` lists them), or `["-c", "model=\"<model>\""]` for Codex. Codex refuses `-m` twice, and `doctor` flags a tier that adds `-m` to a worker that already sets it.
 - `prefer`: workers that take the task first when several have a free slot.
 - `when`: one sentence that replaces the skill's rule for picking this tier. A `routing` entry's `tiers.<name>.when` replaces it for those repos.
 
@@ -190,6 +190,7 @@ Claude picks each task's tier; the runner applies `prefer` and `args`. `stats` s
 |---|---|---|---|
 | `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox` with `CODEX_HOME=codexHome` | the agent's notes and `exec` lines in `log.txt` | the session rollout in `codexHome/sessions/` |
 | `claude` | `<command> -p --output-format stream-json --verbose <args>` | the last text and tool call in `stream.jsonl` | the final `result` event's `modelUsage` |
+| `agy` | `<command> --output-format stream-json --dangerously-skip-permissions <args> --print=<prompt>` (agy reads no stdin, so the prompt is an argument) | the last text and tool call in `stream.jsonl` | the final `result` event's `usage`; the model is the `--model` in `args`, and `billing` defaults to `subscription` |
 
 </details>
 
@@ -205,7 +206,7 @@ Claude picks each task's tier; the runner applies `prefer` and `args`. `stats` s
 | `preamble` | adds the lines to every prompt, then the first matching `routing` entry's `preamble` | only its shape (`doctor`) |
 | `--check` | writes a done check for each task and passes it | runs it after the worker, one at a time per `runsDir`; a failing check fails the task |
 
-When a worker fails, `status` reads `failed: <reason>`: the last error line of its log (secrets such as `sk-…` or `Bearer …` masked, cut to 160 characters), or `exit <code>` when there is none. `meta` keeps it as `last_error`, with the log's path as `log_path`, and the pane shows both. A worker that ran out of disk shows `failed: disk full (ENOSPC), …` and its `result.md` ends with the command to rerun it. A worker that exits 0 but opens its report with `Status: BLOCKED` or `Status: NEEDS_CONTEXT` shows `failed: worker reported BLOCKED` (or `NEEDS_CONTEXT`): its done check is skipped and tasks waiting on it with `--after` are canceled. A failed task records `failure=provider` when the worker's own error line names a provider problem (usage limit, quota, rate limit, too many requests, HTTP 429/401/403/529, overloaded, billing, credits, access token, unauthorized, authentication, `codex_login`). Retry on another worker at the same tier. Any other non-zero worker exit (disk full, a dropped connection, a server error, a crash) records `failure=infra`, and a runner stopped by an outside signal records `failure=interrupted`: retry both at the same tier on the same or another worker. After two such failures in a row on one piece of work, Claude stops and asks instead of rerunning again; a context or turn limit counts as the task's failure. A `BLOCKED` or `NEEDS_CONTEXT` report records `failure=blocked`: answer it or split the task; a stronger tier does not help. A failed done check records `failure=task`. Canceled tasks have no `failure` key.
+When a worker fails, `status` reads `failed: <reason>`: the last error line of its log (secrets such as `sk-…` or `Bearer …` masked, cut to 160 characters), or `exit <code>` when there is none. `meta` keeps it as `last_error`, with the log's path as `log_path`, and the pane shows both. A worker that ran out of disk shows `failed: disk full (ENOSPC), …` and its `result.md` ends with the command to rerun it. A worker that exits 0 but opens its report with `Status: BLOCKED` or `Status: NEEDS_CONTEXT` shows `failed: worker reported BLOCKED` (or `NEEDS_CONTEXT`): its done check is skipped and tasks waiting on it with `--after` are canceled. A failed task records `failure=provider` when the worker's own error line names a provider problem (usage limit, quota, rate limit, too many requests, HTTP 429/401/403/529, overloaded, billing, credits, access token, unauthorized, authentication, `codex_login`, `RESOURCE_EXHAUSTED`). Retry on another worker at the same tier. Any other non-zero worker exit (disk full, a dropped connection, a server error, a crash) records `failure=infra`, and a runner stopped by an outside signal records `failure=interrupted`: retry both at the same tier on the same or another worker. After two such failures in a row on one piece of work, Claude stops and asks instead of rerunning again; a context or turn limit counts as the task's failure. A `BLOCKED` or `NEEDS_CONTEXT` report records `failure=blocked`: answer it or split the task; a stronger tier does not help. A failed done check records `failure=task`. Canceled tasks have no `failure` key.
 
 </details>
 
@@ -220,7 +221,7 @@ Your words in the conversation win over the config ("run this on deepseek", "mak
 | Fences | `only` removes workers fenced away from the cwd, even ones you named; none left is a refusal (exit 3) | runner |
 | Tier | the tier you name; otherwise the matching `routing` entry's `tiers.<name>.when`, then `tiers.<name>.when`, then the skill's default rule | Claude |
 | Order | the tier's `prefer` moves listed workers to the front; it never adds a worker | runner |
-| Start | the first listed worker under its cap takes the task; `caps.<name>` wins over `caps.<type>`, default 3 for `codex` and 5 for `claude`; on a full worker, higher `--priority` starts first, then launch order | runner |
+| Start | the first listed worker under its cap takes the task; `caps.<name>` wins over `caps.<type>`, default 3 for `codex` and `agy` and 5 for `claude`; on a full worker, higher `--priority` starts first, then launch order | runner |
 | Arguments | later wins: the CLI's own settings (a Codex home's `config.toml`, a wrapper's defaults), then the worker's `args`, then the tier's `args`. Codex refuses `-m` twice, so `doctor` flags it | runner |
 | Prompt rules | added, never replaced: global `preamble`, then the matching `routing` entry's `preamble`, then repo rules from your own instructions, which Claude copies into the brief | Claude |
 | Prices | `~/.muster/prices.json` replaces the plugin's `prices.json` model by model | runner |
@@ -317,9 +318,9 @@ Muster deletes nothing on its own. `python3 <plugin>/skills/muster/muster.py cle
 ## Safety
 
 > [!WARNING]
-> Workers run with approvals and sandboxing off: they can run any command in the folder you give them. Use Muster in repos you trust, keep secrets out of prompts, and read the diffs before merging. Claude merges an approved task's `muster/*` worktree branch into the local branch it was made from without asking, committing the worker's leftover changes on that branch first and stashing your uncommitted edits around the merge if git needs it; it never pushes, force-pushes or opens a pull request unless you ask. `muster.py cancel` sends SIGTERM only to the runner pid in that task's `meta`, and only while that task is queued or running. Around each task the runner snapshots the cwd's repo with `git add -A` into a throwaway copy of the index and `git write-tree`, before and after, to write `changes.diff`: that adds objects to the repo's `.git` (unreferenced, so git's automatic gc removes them once they are about two weeks old; with Git LFS, `git add` also copies tracked large files into `.git/lfs/objects`), but never touches the real index, a branch or a working file. `--check` runs the given command in the cwd with `sh -c`, with the same rights as the worker, one check at a time per `runsDir`, and is skipped when the worker reports `BLOCKED` or `NEEDS_CONTEXT`; `muster.py watch` only reads a run and records in each task's `meta` which silence it has reported, and never stops a task; stopping a task stops every process its worker or check started. The runner does not merge and does not police merges: the pane keeps each finished task out of Done, under `Needs review` or `Needs fixes`, until its `review.md` approves the current `changes.diff`; use your repo's branch protection if merges need a hard gate.
+> Workers run with approvals and sandboxing off (`agy` workers with `--dangerously-skip-permissions`): they can run any command in the folder you give them. An `agy` worker gets its prompt as a command-line argument, so other local users can read it in the process list. Use Muster in repos you trust, keep secrets out of prompts, and read the diffs before merging. Claude merges an approved task's `muster/*` worktree branch into the local branch it was made from without asking, committing the worker's leftover changes on that branch first and stashing your uncommitted edits around the merge if git needs it; it never pushes, force-pushes or opens a pull request unless you ask. `muster.py cancel` sends SIGTERM only to the runner pid in that task's `meta`, and only while that task is queued or running. Around each task the runner snapshots the cwd's repo with `git add -A` into a throwaway copy of the index and `git write-tree`, before and after, to write `changes.diff`: that adds objects to the repo's `.git` (unreferenced, so git's automatic gc removes them once they are about two weeks old; with Git LFS, `git add` also copies tracked large files into `.git/lfs/objects`), but never touches the real index, a branch or a working file. `--check` runs the given command in the cwd with `sh -c`, with the same rights as the worker, one check at a time per `runsDir`, and is skipped when the worker reports `BLOCKED` or `NEEDS_CONTEXT`; `muster.py watch` only reads a run and records in each task's `meta` which silence it has reported, and never stops a task; stopping a task stops every process its worker or check started. The runner does not merge and does not police merges: the pane keeps each finished task out of Done, under `Needs review` or `Needs fixes`, until its `review.md` approves the current `changes.diff`; use your repo's branch protection if merges need a hard gate.
 
-Before dispatch, the runner checks quota by reading the newest rollout in each candidate Codex home's `sessions/` directory. It opens session files read-only and records usage-limit failures in `<runsDir>/.quota.json` so queued tasks can skip exhausted accounts until their reset time.
+Before dispatch, the runner checks quota by reading the newest rollout in each candidate Codex home's `sessions/` directory. It opens session files read-only. When any worker, whatever its type, fails on a usage limit, quota, rate limit, HTTP 429 or `RESOURCE_EXHAUSTED`, the runner records it in `<runsDir>/.quota.json` until the time the error names (for Codex, the rollout's reset time; otherwise 30 minutes), so tasks start on the next listed worker in the meantime.
 
 ## FAQ
 
@@ -333,7 +334,7 @@ Workers run plain `codex exec`, which still loads the worker's `codexHome` (its 
 <details>
 <summary><b>Can I use it without Codex?</b></summary>
 
-Yes. Configure only `claude` workers: Claude Code on another backend, or any CLI that accepts `-p --output-format stream-json`.
+Yes. Configure only `claude` workers (Claude Code on another backend, or any CLI that accepts `-p --output-format stream-json`) or `agy` workers (Gemini through the Antigravity CLI; sign in once by running `agy`).
 
 </details>
 

@@ -296,6 +296,29 @@ def usage_claude(task, prices, billing, started_utc):
                 billing=billing, peak=peak, is_error=bool(d.get("is_error")))
 
 
+def usage_agy(task, prices, billing, model):
+    # Reads `agy --output-format stream-json`: the final {"event": "result"} line. agy's input_tokens leave out cache reads.
+    d = None
+    for line in read_text(os.path.join(task, "stream.jsonl")).splitlines():
+        try:
+            o = json.loads(line) if line.startswith("{") else {}
+        except ValueError:
+            continue
+        if o.get("event") == "result" and isinstance(o.get("result"), dict):
+            d = o["result"]
+    if d is None:
+        return None
+    with open(os.path.join(task, "result.md"), "w") as f:
+        f.write(d.get("response") or "")
+    u = d.get("usage") or {}
+    cached = u.get("cache_read_tokens", 0)
+    tot = dict(input=u.get("input_tokens", 0) + cached, cached=cached, output=u.get("output_tokens", 0),
+               reasoning=u.get("thinking_tokens", 0))
+    p = price_for(prices, model)
+    return dict(model=model or "?", **tot, usd=round(cost(p, tot["input"], cached, tot["output"]), 4) if p else None,
+                billing=billing, peak=False, is_error=d.get("status") != "SUCCESS")
+
+
 def record_model(task, kind):
     """meta `model` and `effort`, from the worker's own log: codex prints `model:` and `reasoning effort:`
     in a header after its banner (MCP errors can precede it, and no banner means no header); a claude worker names its model in the stream's init event."""
@@ -330,6 +353,8 @@ def write_usage(task, cfg):
     if meta.get("type") == "codex":
         home = expand(worker.get("codexHome", "~/.codex"))
         u = usage_codex(task, home, prices, worker.get("billing") or codex_billing(home))
+    elif meta.get("type") == "agy":
+        u = usage_agy(task, prices, worker.get("billing", "subscription"), meta.get("model", ""))
     else:
         u = usage_claude(task, prices, worker.get("billing", "metered"), started)
     if u:
@@ -340,7 +365,9 @@ def write_usage(task, cfg):
 
 # ---------- guards ----------
 
-DEFAULT_CAPS = {"codex": 3, "claude": 5}
+DEFAULT_CAPS = {"codex": 3, "claude": 5, "agy": 3}
+TYPES = ("codex", "claude", "agy")
+STREAM_TYPES = ("claude", "agy")  # workers that write stream.jsonl
 
 
 def allowed_here(cfg, name, cwd):
@@ -486,9 +513,9 @@ def record_quota(runs, name, worker, line):
 
 
 def worker_quota(worker, record):
-    if worker["type"] != "codex":
-        return None, 0
-    snapshot = codex_quota(expand(worker.get("codexHome", "~/.codex")))
+    """(Codex usage snapshot or None, epoch until which the worker is out of quota or 0). Any worker type can carry a
+    record from a failed run; only Codex also has a live snapshot to read."""
+    snapshot = codex_quota(expand(worker.get("codexHome", "~/.codex"))) if worker["type"] == "codex" else None
     until = record.get("until", 0)
     if snapshot and snapshot["reached"]:
         until = max(until, snapshot["resets_at"])
@@ -511,7 +538,10 @@ ERROR_LINE = re.compile(r"ENOSPC|no space left on device|error|panic|traceback|q
 PROVIDER = re.compile(r"usage limit|quota|rate.?limit|too many requests|"
                       r"\b(?:HTTP|status|code)\W{0,3}(?:429|401|403|529)\b|"
                       r"\b(?:429|401|403|529)\s+(?:too many|unauthori|forbidden|overloaded)|"
-                      r"overloaded|billing|credits|access token|unauthorized|authentication|codex_login", re.I)
+                      r"overloaded|billing|credits|access token|unauthorized|authentication|codex_login|"
+                      r"resource.?exhausted", re.I)
+# Of those, the ones that say the account is out for a while, whatever the worker type: skip it until it is back.
+QUOTA = re.compile(r"usage limit|quota|rate.?limit|too many requests|\b429\b|resource.?exhausted", re.I)
 ENOSPC = re.compile(r"ENOSPC|no space left on device", re.I)
 SECRET = re.compile(r"(?i)\b(bearer\s+|(?:api[_-]?key|token|secret|password)\s*[=:]\s*)\S+"
                     r"|\b(sk-|xox[a-z]?-|ghp_|gho_|ghs_|github_pat_)[A-Za-z0-9_\-]+")
@@ -590,7 +620,7 @@ def detect():
             name = os.path.basename(f)
             if name in seen or not os.access(f, os.X_OK) or os.path.isdir(f):
                 continue
-            if name in ("codex", "claude"):
+            if name in TYPES:
                 kind = name
             elif "." in name:
                 continue  # backups such as tool.bak-2026...
@@ -651,8 +681,8 @@ def doctor(cfg):
                 probs.append(f"workers.{name}.{key}: expected a path string")
                 w = {k: v for k, v in w.items() if k != key}
         kind = w.get("type")
-        if kind not in ("codex", "claude"):
-            probs.append(f"workers.{name}.type: {kind!r}, expected 'codex' or 'claude'")
+        if kind not in TYPES:
+            probs.append(f"workers.{name}.type: {kind!r}, expected one of {', '.join(TYPES)}")
             continue
         cmd = expand(w.get("command", kind))
         if shutil.which(cmd) is None:
@@ -708,7 +738,7 @@ def doctor(cfg):
         if not globs or not strings(globs):
             probs.append(f"only.{w}: expected a non-empty list of globs")
     for k, v in caps.items():
-        if k not in workers and k not in ("codex", "claude"):
+        if k not in workers and k not in TYPES:
             probs.append(f"caps.{k}: not a worker name or type")
         elif not isinstance(v, int) or isinstance(v, bool) or v < 1:
             probs.append(f"caps.{k}: {v!r}, expected a whole number of at least 1")
@@ -739,7 +769,7 @@ def doctor(cfg):
             probs.append(f"tiers.{name}.args: expected an object of worker or type -> arguments")
         elif args:
             for k, v in args.items():
-                if k not in workers and k not in ("codex", "claude"):
+                if k not in workers and k not in TYPES:
                     probs.append(f"tiers.{name}.args.{k}: not a worker name or type")
                 if not (isinstance(v, list) and strings(v)):
                     probs.append(f"tiers.{name}.args.{k}: expected a list of strings")
@@ -1440,7 +1470,7 @@ def stalled_log(task, m, stall_min):
     not been reported yet. After the worker exits (saving results, done check) the log is meant to be quiet."""
     if "worker_exited" in m or "started" not in m:
         return None
-    log = os.path.join(task, "stream.jsonl" if m.get("type") == "claude" else "log.txt")
+    log = os.path.join(task, "stream.jsonl" if m.get("type") in STREAM_TYPES else "log.txt")
     try:
         mtime = os.path.getmtime(log)
     except OSError:
@@ -1601,8 +1631,17 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None, 
             cmd = [expand(worker.get("command", "claude")), "-p", "--output-format", "stream-json", "--verbose", *extra]
             with open(os.path.join(task, "stream.jsonl"), "w") as out:
                 rc = supervise(task, cmd, stdin=stdin, stdout=out, stderr=log, cwd=cwd, env=env)
+        elif kind == "agy":
+            # agy reads no prompt from stdin: `-p -` is taken as the prompt itself. It names no model in its stream.
+            model = next((b for a, b in reversed(list(zip(extra, extra[1:]))) if a == "--model"), "")  # the last one wins
+            if model:
+                append_meta(task, model=model)
+            cmd = [expand(worker.get("command", "agy")), "--output-format", "stream-json",
+                   "--dangerously-skip-permissions", *extra, "--print=" + read_text(prompt)]
+            with open(os.path.join(task, "stream.jsonl"), "w") as out:
+                rc = supervise(task, cmd, stdin=subprocess.DEVNULL, stdout=out, stderr=log, cwd=cwd, env=env)
         else:
-            sys.exit(f"muster: worker {name!r} has unknown type {kind!r} (codex or claude)")
+            sys.exit(f"muster: worker {name!r} has unknown type {kind!r} ({', '.join(TYPES)})")
     append_meta(task, worker_exited=now())
     try:
         write_changes(task, check)
@@ -1637,8 +1676,8 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None, 
     if rc == 0:
         finish(task, 0, "done")
         return 0
-    main_log = os.path.join(task, "stream.jsonl" if kind == "claude" else "log.txt")
-    logs = [main_log] + ([os.path.join(task, "log.txt")] if kind == "claude" else [])
+    main_log = os.path.join(task, "stream.jsonl" if kind in STREAM_TYPES else "log.txt")
+    logs = [main_log] + ([os.path.join(task, "log.txt")] if kind in STREAM_TYPES else [])
     line, where = last_error(logs, read_text(prompt).splitlines())
     reason = short(line) if line else f"exit {rc}"
     status = f"failed: {reason}"
@@ -1652,7 +1691,7 @@ def run(cfg, names, task, cwd, after=(), priority=0, check=None, retry_of=None, 
     # A worker that exits non-zero failed itself (disk, network, server error, crash), not the task: a task
     # failure shows as a failed check, a BLOCKED report or a review.
     failure = "provider" if line and PROVIDER.search(line) else "infra"
-    if kind == "codex" and failure == "provider" and "usage limit" in line.lower():
+    if failure == "provider" and QUOTA.search(line):
         try:
             record_quota(runs, name, worker, line)
         except OSError as e:

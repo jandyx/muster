@@ -13,10 +13,10 @@ Talk to the user in the language of the user's own messages for the whole run. B
 
 Read `~/.muster/config.json` (or `MUSTER_CONFIG`) at the start of every run. Before launching, run `python3 $MUSTER workers`. If a large batch would land on a worker at 80% quota usage or higher, mention its usage in the plan. No config, or `python3 $MUSTER doctor` reports problems: run the `muster-setup` skill first; never guess workers.
 
-- `workers.<name>.type`: `codex` (`codex exec` with its `codexHome`) or `claude` (a Claude Code compatible command run with `-p`).
+- `workers.<name>.type`: `codex` (`codex exec` with its `codexHome`) `claude` (a Claude Code compatible command run with `-p`) or `agy` (the Antigravity CLI, Gemini; the prompt goes in as an argument).
 - `routing`: `{ match, workers, preamble? }` list. The first `match` glob (`~` allowed) that fits the cwd gives its workers, first choice first; `*` is the fallback.
 - `only.<worker>`: the only globs that worker may work in; never route elsewhere, not even as a quota fallback. The runner refuses outside them (exit 3).
-- `caps.<worker>` or `caps.<type>`: tasks at once per worker (default codex 3, claude 5). The runner queues over the cap.
+- `caps.<worker>` or `caps.<type>`: tasks at once per worker (default codex 3, claude 5, agy 3). The runner queues over the cap.
 - `tiers.<low|standard|high>`: optional. `prefer` lists workers moved to the front of a task's worker list (after `only` has filtered it), so they win when several have a free slot; a busy preferred worker does not hold the task back; `args` maps a worker name or type to extra CLI arguments, passed after the worker's own `args`, with a worker name winning over its type; `when` describes which tasks get the tier. A `routing` entry may set `tiers.<name>.when` for its repos. Give a task one with `--tier`.
 - `preamble` and the matching `routing` entry's `preamble`: lines added to every prompt's rules block.
 - The user's explicit choice always wins over the config.
@@ -129,5 +129,5 @@ Then, in the user's language:
 
 ## Notes
 
-- Codex workers run `codex exec --dangerously-bypass-approvals-and-sandbox`; claude workers run their configured `command` and `args`, usually with permissions skipped. Workers can run any command: keep them in repos the user trusts, and never put secrets in prompts.
+- Codex workers run `codex exec --dangerously-bypass-approvals-and-sandbox`; claude workers run their configured `command` and `args`, usually with permissions skipped; agy workers always run with `--dangerously-skip-permissions`. Workers can run any command: keep them in repos the user trusts, and never put secrets in prompts.
 - Codex workers still load their `codexHome`'s `AGENTS.md`, config and skills; wrappers such as oh-my-codex add hooks that plain `codex exec` does not run.
