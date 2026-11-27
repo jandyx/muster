@@ -154,7 +154,8 @@ Install and configure Muster (https://github.com/jandyx/muster) for me:
     "codex-work": { "type": "codex",  "codexHome": "~/.codex-homes/work", "args": ["-m", "gpt-6-astra"] },
     "deepseek":   { "type": "claude", "command": "~/.local/bin/deepseek-claude",
                     "args": ["--dangerously-skip-permissions"], "billing": "metered" },
-    "gemini":     { "type": "agy",    "command": "~/.local/bin/agy", "args": ["--model", "gemini-4-neon-high"] }
+    "gemini":     { "type": "agy",    "command": "~/.local/bin/agy", "args": ["--model", "gemini-4-neon-high"],
+                    "role": "Main implementer: features and multi-file changes." }   // optional: the work Claude gives it
   },
   "routing": [                                  // first match on the task's cwd wins
     { "match": "~/workspace/work-*", "workers": ["gemini", "codex-work", "codex", "deepseek"],   // tried in this order
@@ -203,6 +204,7 @@ Claude picks each task's tier; the runner applies `prefer` and `args`. `stats` s
 | Setting | Claude, when planning | `muster.py`, when launching |
 |---|---|---|
 | `routing` | picks workers in that order, falls back on quota errors | not checked |
+| `role` | puts a worker whose role fits the task first in that task's list; a fallback-only worker last | only its shape (`doctor`) |
 | `only` | never plans a fenced worker elsewhere | refuses outside its globs (exit 3) |
 | `caps` | passes each task its whole worker list | queues while every listed worker is full, starts on the first to free a slot (priority, then launch order); counts live processes only |
 | `tiers` | picks each task's tier by its `when` (the matching `routing` entry's first) or the skill's default rule, and passes `--tier` | moves `prefer` workers to the front of the task's list (after `only` has filtered it), so they win when several have a free slot; appends the tier's `args` after the worker's own |
@@ -212,6 +214,10 @@ Claude picks each task's tier; the runner applies `prefer` and `args`. `stats` s
 When a worker fails, `status` reads `failed: <reason>`: the last error line of its log (secrets such as `sk-…` or `Bearer …` masked, cut to 160 characters), or `exit <code>` when there is none. `meta` keeps it as `last_error`, with the log's path as `log_path`, and the pane shows both. A worker that ran out of disk shows `failed: disk full (ENOSPC), …` and its `result.md` ends with the command to rerun it. A worker that exits 0 but opens its report with `Status: BLOCKED` or `Status: NEEDS_CONTEXT` shows `failed: worker reported BLOCKED` (or `NEEDS_CONTEXT`): its done check is skipped and tasks waiting on it with `--after` are canceled. A failed task records `failure=provider` when the worker's own error line names a provider problem (usage limit, quota, rate limit, too many requests, HTTP 429/401/403/529, overloaded, billing, credits, access token, unauthorized, authentication, `codex_login`, `RESOURCE_EXHAUSTED`). Retry on another worker at the same tier. Any other non-zero worker exit (disk full, a dropped connection, a server error, a crash) records `failure=infra`, and a runner stopped by an outside signal records `failure=interrupted`: retry both at the same tier on the same or another worker. After two such failures in a row on one piece of work, Claude stops and asks instead of rerunning again; a context or turn limit counts as the task's failure. A `BLOCKED` or `NEEDS_CONTEXT` report records `failure=blocked`: answer it or split the task; a stronger tier does not help. A failed done check records `failure=task`. Canceled tasks have no `failure` key.
 
 </details>
+
+**Staying on.** Once you ask for muster in a conversation, Claude keeps sending implementation work through it until you say stop; small edits and questions it still handles itself. After an automatic compaction the pane reminds the session of this, and of the language you write in, as long as the session has muster tasks on disk. Saying stop writes `<runsDir>/.off-<session id>`, which keeps the reminder off.
+
+**Stalls and waiting tasks.** The pane wakes the session that launched a task when the task needs it: once when it ended 3 minutes ago and still waits for review or a rerun, and when its worker has written nothing for 20 minutes, again at 40 and 80 minutes of the same silence, so neither a finished nor a hung task sits for hours. The notice asks Claude to act; the pane stops nothing itself.
 
 ### How settings combine
 
