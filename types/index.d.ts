@@ -99,6 +99,7 @@ declare module 'claude-code' {
       agents: Shaped<Agent[]>
       notified: Shaped<string[]>
       reminded: Shaped<string[]>
+      nudged: Shaped<string[]>
       sent: Shaped<Record<string, string>>
       folds: Shaped<Record<string, boolean>>
     }

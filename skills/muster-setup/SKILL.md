@@ -43,6 +43,7 @@ Map plain requests onto these: "high uses opus" → `tiers.high.args.claude: ["-
 
 Use AskUserQuestion, at most one round of up to four questions, each with a recommended default first. Typical:
 - Which repos or folders should each worker prefer? (Offer the folders under the user's usual workspace, such as `~/workspace/*`, grouped by prefix.)
+- What kind of work should each worker take (`role`, one sentence each, for example main implementer, code review and fix loops, fallback only)? A fallback-only worker also goes last in every `routing` list and stays out of `prefer`.
 - Should any worker be limited to certain repos only (`only`)? Mention that the runner enforces it.
 - Parallel caps per account: keep 3 / 5, or change?
 - Tiers: one setting for every task (recommended unless the user mentioned cost or model choice), or a cheaper `low` and a stronger `high`? If tiers, which model or effort for each?

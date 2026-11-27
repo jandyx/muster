@@ -657,7 +657,8 @@ class Queue(unittest.TestCase):
 class Setup(unittest.TestCase):
     def test_doctor_names_each_problem(self):
         self.assertIn("only: expected", "\n".join(M.doctor({"workers": {}, "only": ["x"], "caps": [1]})))
-        odd = "\n".join(M.doctor({"workers": {"x": {"type": "claude", "command": 5, "args": None}}}))
+        odd = "\n".join(M.doctor({"workers": {"x": {"type": "claude", "command": 5, "args": None, "role": ""}}}))
+        self.assertIn("workers.x.role: expected a sentence", odd)
         self.assertIn("workers.x.command: expected a path string", odd)
         self.assertIn("workers.x.args: expected a list of strings", odd)
         cfg = {"workers": {"a": {"type": "codex", "codexHome": "/nonexistent", "command": sys.executable},
@@ -681,7 +682,7 @@ class Setup(unittest.TestCase):
         self.assertNotIn("_note", probs)
 
     def test_doctor_passes_a_good_config(self):
-        cfg = {"workers": {"c": {"type": "claude", "command": sys.executable}},
+        cfg = {"workers": {"c": {"type": "claude", "command": sys.executable, "role": "Reviews and fix loops."}},
                "routing": [{"match": "~/w/*", "workers": ["c"], "preamble": ["Open PRs with pr.sh."]},
                            {"match": "*", "workers": ["c"]}],
                "caps": {"claude": 2}, "preamble": ["No secrets."]}

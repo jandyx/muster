@@ -644,7 +644,7 @@ def detect():
 
 
 KEYS = {"": {"runsDir", "workers", "routing", "only", "caps", "tiers", "preamble"},
-        "worker": {"type", "command", "args", "codexHome", "billing"},
+        "worker": {"type", "command", "args", "codexHome", "billing", "role"},
         "route": {"match", "workers", "preamble", "tiers"}}
 
 
@@ -680,6 +680,8 @@ def doctor(cfg):
             probs.append(f"workers.{name}.args: expected a list of strings")
         if w.get("billing") not in (None, "metered", "subscription"):
             probs.append(f"workers.{name}.billing: {w['billing']!r}, expected 'metered' or 'subscription'")
+        if "role" in w and not (isinstance(w["role"], str) and w["role"].strip()):
+            probs.append(f"workers.{name}.role: expected a sentence")
         for key in ("command", "codexHome"):
             if key in w and not isinstance(w[key], str):
                 probs.append(f"workers.{name}.{key}: expected a path string")

@@ -21,6 +21,16 @@ const notifiedAtom = atom({ plugin: 'muster', key: 'notified' } as const, [], { 
 const remindedAtom = atom({ plugin: 'muster', key: 'reminded' } as const, [], { shape: 'reminded-1' })
 // Inbox choices already sent to Claude, by item key, with what was sent; the row shows that instead of its buttons.
 const sentAtom = atom({ plugin: 'muster', key: 'sent' } as const, {}, { shape: 'sent-1' })
+// Notices already sent to the session: `<run>/<task>@<log mtime>#<round>` per round of one silence, `<run>/<task>@done`
+// per finished task left waiting, so each goes out once.
+const nudgedAtom = atom({ plugin: 'muster', key: 'nudged' } as const, [], { shape: 'nudged-1' })
+// A silent worker wakes its session after this long, then again each time the silence doubles. Later than `watch`'s
+// default 10 minutes, so it is the net for a session that never started `watch` or judged one stall and forgot it.
+const STALL_MS = 20 * 60_000
+// A finished task still waiting for review this long wakes its session: one launched outside a background Bash call
+// sends no notice of its own, and the Stop hook waits for the whole run.
+const WAITING_MS = 3 * 60_000
+const WAITING_UNTIL_MS = 24 * 3_600_000
 
 // Cells in the band's overall progress bar.
 const BAND_BAR = 8
@@ -453,6 +463,8 @@ export const register: Register = on => {
 
   // runsAtom lags by up to POLL_MS; the Stop hook refreshes it so a review.md written just before the turn ended counts.
   let refreshRuns = async () => {}
+  let stickyOff = async (_session: string) => false
+  let lastSaid = ''
 
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'muster-panel', description: 'Open the Muster pane' })
@@ -670,6 +682,8 @@ export const register: Register = on => {
         if (fresh.length) await update($, notifiedAtom, old => [...old, ...fresh.map(({ r, t }) => key(r, t))].slice(-500))
       }
 
+      if (sessionId !== '') await nudge(all)
+
       const active = shown.filter(r => r.tasks.some(isActive))
       const unseen = active.filter(r => !opened.has(r.name))
       if (unseen.length) {
@@ -677,7 +691,40 @@ export const register: Register = on => {
         void $.ui.open({ id: PANE, title: TITLE })
       }
     }
+    const nudge = async (runs: Run[]) => {
+      const attempts = lineage(runs)
+      const mine = runs.flatMap(r => r.tasks.filter(t => t.session === sessionId).map(t => ({ r, t })))
+      const silent = mine.filter(({ t }) => isRunning(t) && t.phase === '' && t.logMs > 0)
+      const waiting = mine.filter(({ t }) => attempts.latest.has(t) && (needsReview(t) || isFailed(t)) && t.finishedMs > 0)
+      if (silent.length === 0 && waiting.length === 0) return
+      const now = await $.clock.now()
+      const sent = new Set(await read($, nudgedAtom))
+      const notices: [string, string][] = []
+      for (const { r, t } of silent) {
+        if (now - t.logMs < STALL_MS) continue
+        const round = Math.floor(Math.log2((now - t.logMs) / STALL_MS))
+        const last =
+          round >= 2 ? ' This is the third notice for this silence: unless you can name the command still running and why it takes this long, cancel it now.' : ''
+        notices.push([
+          `${r.name}/${t.id}@${t.logMs}#${round}`,
+          `Muster: task ${r.name}/${t.id} ("${t.title}") on ${t.worker} has written nothing to its log for ${fmtElapsed(now - t.logMs)} (${t.logPath}). Read the log tail and check whether its process is still doing work. If a command you expect to take this long is running, say so in one line and leave it; otherwise cancel it with \`muster.py cancel\` and relaunch it or ask the user.${last}`,
+        ])
+      }
+      for (const { r, t } of waiting) {
+        if (now - t.finishedMs < WAITING_MS || now - t.finishedMs > WAITING_UNTIL_MS) continue
+        notices.push([
+          `${r.name}/${t.id}@done`,
+          `Muster: task ${r.name}/${t.id} ("${t.title}") on ${t.worker} ended ${fmtElapsed(now - t.finishedMs)} ago (${t.review || t.status}) and is waiting for you. Handle it now as step 6 of the muster skill says: review it, launch its fix, or rerun it. Launch every \`muster.py run\` as its own Bash call with run_in_background, never detached, so its end reaches you.`,
+        ])
+      }
+      const fresh = notices.filter(([key]) => !sent.has(key))
+      if (fresh.length === 0) return
+      await update($, nudgedAtom, old => [...old, ...fresh.map(([key]) => key)].slice(-500))
+      const text = `${fresh.map(([, line]) => line).join('\n\n')}\n\nAnswer in the language the user writes in, not the language of this notice.`
+      void $.prompt.submit({ text }).catch(() => undefined)
+    }
     refreshRuns = poll
+    stickyOff = session => $.fs.exists(`${root}/.off-${session}`).catch(() => false)
 
     // The band above the prompt replaced the status line; clear what an older version pinned.
     $.ui.status(undefined)
@@ -711,9 +758,32 @@ export const register: Register = on => {
     return { ...result, block: result.block ? `${result.block}\n\n${text}` : text }
   })
 
+  // Compaction can drop the user's "use muster" from the conversation; this session's tasks on disk still carry it.
+  // `<runsDir>/.off-<session>`, written when the user turns muster off, keeps it from coming back.
+  on('classic.SessionStart', async ($, e, next) => {
+    const result = await next(e)
+    if (e.source !== 'compact' || !e.session_id) return result
+    // A reminder is not worth failing the session start over.
+    const runs = await refreshRuns().then(() => read($, runsAtom)).catch(() => [] as Run[])
+    if (!runs.some(r => r.tasks.some(t => t.session === e.session_id))) return result
+    // The summary tends to retell the user in English, which pulled answers into English after a compaction.
+    const said = lastSaid === '' ? '' : ` The user's last own message began: "${lastSaid}".`
+    const texts = [
+      `Answer in the language the user writes in, not the language of this summary, worker reports or muster's reminders.${said}`,
+      ...((await stickyOff(e.session_id))
+        ? []
+        : ['Muster is active in this session: the user asked for it before the conversation was compacted. Keep routing implementation work through the muster skill as its "Staying on" section says, until the user says to stop.']),
+    ]
+    return { ...result, additionalContext: [...(result.additionalContext ?? []), ...texts] }
+  })
+
   // Starting a batch ("/muster …", "muster: …") opens the pane too. Opened from the person's own prompt,
   // it is placed at any terminal width; without focus, so typing goes on in the prompt.
   on('prompt.submit', async ($, e, next) => {
+    const typed = (e.text ?? '').trim()
+    // shortcut: kept in memory, so a reload forgets it until the user's next message.
+    // Only the person's own words: an inbox choice or a stall notice is a plugin's English, sent asUser or not.
+    if (typed !== '' && !typed.startsWith('/') && e.origin?.kind !== 'plugin') lastSaid = typed.slice(0, 80)
     if (/^\s*(\/muster(?!-stats(?:\s|$))(:muster)?\b|muster\s*:)/i.test(e.text ?? '')) void $.ui.open({ id: PANE, title: TITLE })
     return next(e)
   })
@@ -966,7 +1036,7 @@ export const register: Register = on => {
       // Self-contained, so a session that has not loaded the muster skill still knows where the answer goes.
       const ask = `Muster decision for ${key}, "${d.question}"`
       const names = choiceNames(d.options, detailWidth - 1)
-      const after = (n: string) => ` (Append "Decided: ${n}" to that task's decision.md in the muster runsDir, then carry it out as step 6 of the muster skill says.)`
+      const after = (n: string) => ` (Append "Decided: ${n}" to that task's decision.md in the muster runsDir, then carry it out as step 6 of the muster skill says. The pane wrote this message in English; reply in the language of my own earlier messages.)`
       return (
         <Box flexDirection="column" marginTop={1}>
           <Text bold color="warning">{'  '}⚖️ {d.question}</Text>

@@ -714,6 +714,57 @@ test('the toast names the review state of a task that finishes unreviewed', asyn
   expect(toasts.join('\n')).toMatch(/Toasted \(w1\): needs review/)
 })
 
+test('a silent worker wakes its own session, again as the silence doubles, once per round', async ($, on) => {
+  const start = new Date('2026-11-05T11:00:00').getTime()
+  const clock = mock.clock(on, { now: start + 21 * 60_000 })
+  const notices: string[] = []
+  on('prompt.submit', (_: any, e: any) => {
+    notices.push(e.text)
+    return { text: e.text }
+  })
+  on('fs.stat', () => ({ value: { kind: 'file', size: 0, isLink: false, mtimeMs: start } }))
+  const other = { ...task('running', 'pid=0\n'), title: 'Not mine' }
+  other.meta = other.meta.replace('session=S1', 'session=S2')
+  await mountWith($, on, tree('/h/.muster/runs', {
+    '20261118-1250-other': { foreign: other },
+    '20261118-1300-stall': { hung: { ...task('running', 'pid=0\n'), title: 'Hung build' } },
+  }), { clock: true })
+  await clock.settle()
+  expect(notices).toHaveLength(1)
+  expect(notices[0]).toContain('task 20261118-1300-stall/hung ("Hung build") on w1 has written nothing to its log for 21m')
+  expect(notices[0]).not.toContain('third notice')
+  await clock.advance(5000)
+  expect(notices).toHaveLength(1)
+  await clock.advance(20 * 60_000)
+  expect(notices).toHaveLength(2)
+  await clock.advance(40 * 60_000)
+  expect(notices).toHaveLength(3)
+  expect(notices[2]).toContain('third notice')
+})
+
+test('a finished task left unreviewed wakes its session once, after a grace period', async ($, on) => {
+  const clock = mock.clock(on, { now: new Date('2026-11-05T11:02:00').getTime() })
+  const notices: string[] = []
+  on('prompt.submit', (_: any, e: any) => {
+    notices.push(e.text)
+    return { text: e.text }
+  })
+  const meta = `finished=2026-11-05 11:00:00\nchanges=1 files +1 -0\nchanges_sha256=${'d'.repeat(64)}\n`
+  const t = tree('/h/.muster/runs', {
+    '20261118-1400-left': { a: { ...task('done', meta), title: 'Left alone' }, b: { ...task('done', meta), title: 'Reviewed' }, c: task('running') },
+  })
+  t['/h/.muster/runs/20261118-1400-left/b/review.md'] = `Verdict: Approved\nchanges-sha256: ${'d'.repeat(64)}\n`
+  await mountWith($, on, t, { clock: true })
+  await clock.settle()
+  expect(notices).toHaveLength(0)
+  await clock.advance(60_000)
+  expect(notices).toHaveLength(1)
+  expect(notices[0]).toContain('task 20261118-1400-left/a ("Left alone") on w1 ended 3m00s ago (needs review)')
+  expect(notices[0]).not.toContain('Reviewed')
+  await clock.advance(10 * 60_000)
+  expect(notices).toHaveLength(1)
+})
+
 test('a running task past its worker shows the done check instead of a silence warning', async ($, on) => {
   on('fs.stat', () => ({ value: { kind: 'file', size: 0, isLink: false, mtimeMs: new Date('2026-11-05T11:20:00').getTime() } }))
   await mountWith($, on, tree('/h/.muster/runs', {
@@ -777,6 +828,27 @@ test('the Stop hook sends the session back once per waiting task, and only for i
   expect(second.block).not.toMatch(/ok:|foreign|busy|redo/)
   const third: any = await $.classic.Stop({ stop_hook_active: false, session_id: 'S1' } as any)
   expect(third.block).toBeUndefined()
+})
+
+test("after compaction the session is told the user's language, and that muster is still on unless turned off", async ($, on) => {
+  on('classic.SessionStart', () => ({ additionalContext: ['lower hook context'] }))
+  const t = tree('/h/.muster/runs', { '20261119-1000-sticky': { a: task('running') } })
+  on('prompt.submit', (_: any, e: any) => e)
+  await mountWith($, on, t)
+  await $.prompt.submit({ text: 'also rework the retry logic', origin: { kind: 'composer' } } as any)
+  await $.prompt.submit({ text: 'Muster decision for x/y, "Which?": option 1, A.', origin: { kind: 'plugin', name: 'muster', asUser: true } } as any)
+  const compacted: any = await $.classic.SessionStart({ source: 'compact', session_id: 'S1' } as any)
+  expect(compacted.additionalContext[0]).toBe('lower hook context')
+  expect(compacted.additionalContext[1]).toContain('last own message began: "also rework the retry logic"')
+  expect(compacted.additionalContext[2]).toMatch(/^Muster is active in this session/)
+  const startup: any = await $.classic.SessionStart({ source: 'startup', session_id: 'S1' } as any)
+  expect(startup.additionalContext).toEqual(['lower hook context'])
+  const other: any = await $.classic.SessionStart({ source: 'compact', session_id: 'S2' } as any)
+  expect(other.additionalContext).toEqual(['lower hook context'])
+  t['/h/.muster/runs/.off-S1'] = ''
+  const off: any = await $.classic.SessionStart({ source: 'compact', session_id: 'S1' } as any)
+  expect(off.additionalContext).toHaveLength(2)
+  expect(off.additionalContext.join()).not.toContain('Muster is active')
 })
 
 const waitingTree = (extra: Record<string, string> = {}) => {
@@ -876,7 +948,7 @@ test('the inbox shows a decision with its options, reviewed work stays out of it
   expect(submitted).toEqual([])
 
   await ui.press({ key: 'decide:20261123-1100-inbox/ask:2' })
-  expect(submitted).toEqual(['Muster decision for 20261123-1100-inbox/ask, "Which name should the section key use?": option 2, Keep the code name: the doc changes. (Append "Decided: option 2" to that task\'s decision.md in the muster runsDir, then carry it out as step 6 of the muster skill says.)'])
+  expect(submitted).toEqual(['Muster decision for 20261123-1100-inbox/ask, "Which name should the section key use?": option 2, Keep the code name: the doc changes. (Append "Decided: option 2" to that task\'s decision.md in the muster runsDir, then carry it out as step 6 of the muster skill says. The pane wrote this message in English; reply in the language of my own earlier messages.)'])
   expect((await ui.find({ type: 'Text', text: /sent:/ }))?.text).toMatch(/✓ sent: Keep the code name · waiting for Claude/)
   expect(await ui.find({ type: 'Button', text: /Keep the doc name/ })).toBeUndefined()
   await ui.unmount()
